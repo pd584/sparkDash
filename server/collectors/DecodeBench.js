@@ -14,7 +14,6 @@ import {
   applyThinkingFlags,
   mean,
   median,
-  pollServerGenerationRates,
   round2,
   runStreamingRequest,
   sleep,
@@ -66,7 +65,7 @@ const BENCH_PROMPTS = [
   "Write only valid HTML5 (no markdown fences). Create a multi-chapter tutorial with <h1>–<h3>, code samples in <pre>, and notes. Keep writing chapters.",
 ];
 
-const ALLOWED_CONCURRENCIES = new Set([1, 2, 3, 4, 6, 8, 16, 32]);
+const ALLOWED_CONCURRENCIES = new Set([1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32]);
 const DEFAULT_MAX_TOKENS = 500;
 const MIN_MAX_TOKENS = 64;
 const MAX_MAX_TOKENS = 2048;
@@ -159,7 +158,7 @@ function emptyWaveResult(concurrency, waveMs, results, modelId, error, prompts =
      * Server-side generation tok/s (same basis as live Generation tok/s panel).
      * Null when the backend does not expose counters.
      */
-    serverGenerationTps: null,
+
     totalDecodeTokens: 0,
     totalCompletionTokens: 0,
     durationMs: round2(waveMs),
@@ -223,6 +222,7 @@ async function runConcurrencyWave({
   abortSignal,
   sampleHardware = null,
   debug = false,
+  apiKey = null,
 }) {
   const url = `${baseUrl}/v1/chat/completions`;
   const prompts = pickDistinctPrompts(concurrency);
@@ -231,17 +231,14 @@ async function runConcurrencyWave({
   const wallStart = performance.now();
 
   // Poll /metrics like the live panel while streams run (steady-state gen tok/s)
-  const ratePollAbort = new AbortController();
   const hwPollAbort = new AbortController();
   const onParentForPoll = () => {
-    ratePollAbort.abort();
     hwPollAbort.abort();
   };
   if (abortSignal) {
     if (abortSignal.aborted) onParentForPoll();
     else abortSignal.addEventListener("abort", onParentForPoll, { once: true });
   }
-  const ratePollPromise = pollServerGenerationRates(baseUrl, ratePollAbort.signal, 400);
   const hwPollPromise = debug
     ? pollHardwareSamples(sampleHardware, hwPollAbort.signal, HARDWARE_SAMPLE_MS)
     : Promise.resolve([]);
@@ -275,6 +272,7 @@ async function runConcurrencyWave({
     return runStreamingRequest(url, body, ctrl.signal, {
       debug,
       retryOnThinking400: true,
+      apiKey,
     }).finally(() => {
       clearTimeout(timeout);
       if (abortSignal) abortSignal.removeEventListener("abort", onParentAbort);
@@ -294,14 +292,12 @@ async function runConcurrencyWave({
   } finally {
     clearTimeout(waveTimer);
     // Stop metrics / hardware polling as soon as streams finish
-    ratePollAbort.abort();
     hwPollAbort.abort();
     if (abortSignal) abortSignal.removeEventListener("abort", onParentForPoll);
   }
 
   const wallEnd = performance.now();
   const waveMs = wallEnd - wallStart;
-  const rateStats = await ratePollPromise;
   const hardwareSamples = await hwPollPromise;
 
   if (waveTimedOut && results.every((r) => r.error)) {
@@ -336,13 +332,6 @@ async function runConcurrencyWave({
     }
   }
 
-  // Primary server number: median of live-style poll samples (matches dashboard)
-  let serverGenerationTps = rateStats.median;
-  // Fallback: total completion tokens / client decode window if no metrics endpoint
-  if (serverGenerationTps == null && aggregateDecodeTps > 0) {
-    serverGenerationTps = round2(aggregateDecodeTps);
-  }
-
   const model = results.find((r) => r.model)?.model || modelId || null;
 
   /** @type {Record<string, unknown>} */
@@ -357,9 +346,7 @@ async function runConcurrencyWave({
     meanTtftMs: round2(mean(ttftList)),
     medianTtftMs: round2(median(ttftList)),
     aggregateDecodeTps: round2(aggregateDecodeTps),
-    serverGenerationTps,
-    serverGenerationTpsMax: rateStats.max,
-    serverGenerationSamples: rateStats.samples,
+
     totalDecodeTokens,
     totalCompletionTokens,
     durationMs: round2(waveMs),
@@ -519,6 +506,7 @@ export class DecodeBenchManager {
    *   maxTokens?: number,
    *   debug?: boolean,
    *   sampleHardware?: (() => Promise<object | null> | object | null) | null,
+   *   apiKey?: string | null,
    * }} opts
    */
   start(opts) {
@@ -531,6 +519,7 @@ export class DecodeBenchManager {
       maxTokens: rawMax,
       debug = false,
       sampleHardware = null,
+      apiKey = null,
     } = opts;
 
     if (this.activeBySpark.has(sparkId)) {
@@ -541,7 +530,7 @@ export class DecodeBenchManager {
 
     const concurrencies = normalizeConcurrencies(rawConc);
     if (!concurrencies.length) {
-      const err = new Error("Select at least one concurrency level (1, 2, 3, 4, 6, 8, 16, or 32)");
+      const err = new Error("Select at least one concurrency level (1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, or 32)");
       err.status = 400;
       throw err;
     }
@@ -588,6 +577,7 @@ export class DecodeBenchManager {
       error: null,
       _abort: abort,
       _debug: debugOn,
+      _apiKey: apiKey != null && String(apiKey).trim() ? String(apiKey).trim() : null,
       _sampleHardware:
         debugOn && typeof sampleHardware === "function" ? sampleHardware : null,
     };
@@ -636,6 +626,7 @@ export class DecodeBenchManager {
           abortSignal: job._abort.signal,
           sampleHardware: job._sampleHardware,
           debug,
+          apiKey: job._apiKey,
         });
 
         if (job._abort.signal.aborted) {

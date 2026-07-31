@@ -24,6 +24,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, "..");
 
+const BIND_HOST = process.env.BIND_HOST || "0.0.0.0";
 const PORT = parseInt(process.env.PORT || "5555", 10);
 const LLM_PORT = parseInt(process.env.LLM_PORT || "8888", 10);
 
@@ -45,6 +46,15 @@ function resolveLlmPort(sparkOrPort) {
   const n = typeof raw === "string" ? parseInt(raw, 10) : Number(raw);
   if (Number.isInteger(n) && n >= 1 && n <= 65535) return n;
   return LLM_PORT;
+}
+
+/** Optional Bearer token for a Spark LLM port (from encrypted secrets). */
+function resolveLlmApiKey(spark, port) {
+  const keys = spark?.llmApiKeys;
+  if (!keys || typeof keys !== "object") return null;
+  const raw = keys[String(port)] ?? keys[port];
+  const key = raw != null ? String(raw).trim() : "";
+  return key || null;
 }
 
 // Rate-limit ephemeral + registered connectivity tests (per client IP)
@@ -404,14 +414,21 @@ app.put("/api/sparks/:id/llm-ports", (req, res) => {
       return res.status(400).json({ error: "llmPorts must contain at least one valid port 1–65535" });
     }
 
+    const prevPorts = Array.isArray(spark.llmPorts) ? [...spark.llmPorts] : [];
     const updated = registry.updateSpark(req.params.id, { llmPorts: unique });
+    registry.syncLlmApiKeysToPorts(req.params.id, prevPorts, unique);
+    const withSecrets = registry.getSpark(req.params.id);
     const monitor = monitors.get(req.params.id);
     if (monitor) {
-      monitor.updateConfig(updated);
+      monitor.updateConfig(withSecrets);
     } else {
-      startMonitor(updated);
+      startMonitor(withSecrets);
     }
-    res.json({ success: true, llmPorts: updated.llmPorts });
+    res.json({
+      success: true,
+      llmPorts: updated.llmPorts,
+      llmApiKeyPorts: registry.llmApiKeyPorts(req.params.id),
+    });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -429,15 +446,23 @@ app.put("/api/sparks/:id/llm-port", (req, res) => {
       return res.status(400).json({ error: "llmPort must be an integer 1–65535" });
     }
 
+    const prevPorts = Array.isArray(spark.llmPorts) ? [...spark.llmPorts] : [];
     // Replace the ports list with just this single port
     const updated = registry.updateSpark(req.params.id, { llmPorts: [n] });
+    registry.syncLlmApiKeysToPorts(req.params.id, prevPorts, [n]);
+    const withSecrets = registry.getSpark(req.params.id);
     const monitor = monitors.get(req.params.id);
     if (monitor) {
-      monitor.updateConfig(updated);
+      monitor.updateConfig(withSecrets);
     } else {
-      startMonitor(updated);
+      startMonitor(withSecrets);
     }
-    res.json({ success: true, llmPort: n, llmPorts: updated.llmPorts });
+    res.json({
+      success: true,
+      llmPort: n,
+      llmPorts: updated.llmPorts,
+      llmApiKeyPorts: registry.llmApiKeyPorts(req.params.id),
+    });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -498,13 +523,54 @@ app.delete("/api/sparks/:id/llm-ports/:port", (req, res) => {
     }
 
     const updated = registry.updateSpark(req.params.id, { llmPorts: newPorts });
+    registry.clearLlmApiKey(req.params.id, port);
+    const withSecrets = registry.getSpark(req.params.id);
     const monitor = monitors.get(req.params.id);
     if (monitor) {
-      monitor.updateConfig(updated);
+      monitor.updateConfig(withSecrets);
     } else {
-      startMonitor(updated);
+      startMonitor(withSecrets);
     }
-    res.json({ success: true, llmPorts: updated.llmPorts });
+    res.json({
+      success: true,
+      llmPorts: updated.llmPorts,
+      llmApiKeyPorts: registry.llmApiKeyPorts(req.params.id),
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Set / clear optional LLM API key for one port (encrypted secrets store)
+app.put("/api/sparks/:id/llm-ports/:port/api-key", (req, res) => {
+  try {
+    const spark = registry.getSpark(req.params.id);
+    if (!spark) return res.status(404).json({ error: "Spark not found" });
+
+    const port = parseInt(req.params.port, 10);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return res.status(400).json({ error: "port must be an integer 1–65535" });
+    }
+
+    if (!Object.prototype.hasOwnProperty.call(req.body || {}, "apiKey")) {
+      return res.status(400).json({ error: "apiKey is required (use \"\" to clear)" });
+    }
+
+    const apiKey = req.body.apiKey == null ? "" : String(req.body.apiKey);
+    const publicSpark = registry.setLlmApiKey(req.params.id, port, apiKey);
+    const withSecrets = registry.getSpark(req.params.id);
+    const monitor = monitors.get(req.params.id);
+    if (monitor) {
+      monitor.updateConfig(withSecrets);
+    } else {
+      startMonitor(withSecrets);
+    }
+    res.json({
+      success: true,
+      spark: publicSpark,
+      hasApiKey: registry.hasLlmApiKey(req.params.id, port),
+      llmApiKeyPorts: registry.llmApiKeyPorts(req.params.id),
+    });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -562,6 +628,7 @@ app.post("/api/sparks/:id/llm/bench", (req, res) => {
       concurrencies: req.body?.concurrencies,
       maxTokens: req.body?.maxTokens,
       debug: benchDebug,
+      apiKey: resolveLlmApiKey(spark, port),
       sampleHardware:
         benchDebug && monitor
           ? async () => {
@@ -664,10 +731,11 @@ app.delete("/api/sparks/:id/llm/bench/:benchId", (req, res) => {
 });
 
 /**
- * LLM Prompt Showcase — concurrent streaming demos (ephemeral).
+ * LLM Prompt Showcase — concurrent streaming demos.
  *
- * POST body: { port, modelId?, maxTokens?, prompts: string[] }
- * Returns 202 { sessionId }; poll GET for deltas; DELETE to cancel.
+ * POST body: { port, modelId?, maxTokens?, temperature?, thinking?, promptType?, prompts: string[] }
+ * Returns 202 { sessionId }; poll GET for deltas; DELETE :sessionId to cancel.
+ * Finished runs are archived; GET collection lists history; DELETE collection clears it.
  */
 app.post("/api/sparks/:id/llm/showcase", (req, res) => {
   const spark = registry.getSpark(req.params.id);
@@ -714,14 +782,51 @@ app.post("/api/sparks/:id/llm/showcase", (req, res) => {
       port,
       modelId,
       maxTokens: req.body?.maxTokens,
+      temperature: req.body?.temperature,
       thinking: req.body?.thinking,
+      promptType: req.body?.promptType,
       prompts: req.body?.prompts,
+      apiKey: resolveLlmApiKey(spark, port),
     });
     res.status(202).json(result);
   } catch (err) {
     const status = err.status || 500;
     res.status(status).json({ error: err.message });
   }
+});
+
+/** Active session + finished history summaries (no stream bodies). */
+app.get("/api/sparks/:id/llm/showcase", (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  if (!spark) return res.status(404).json({ error: "Spark not found" });
+  if (spark.workerNode) {
+    return res.status(403).json({ error: "Worker nodes do not expose a local LLM API" });
+  }
+  if (spark.llmMonitoring === false) {
+    return res.status(403).json({ error: "LLM monitoring is disabled for this Spark" });
+  }
+
+  res.json({
+    active: showcaseManager.getActive(spark.id),
+    history: showcaseManager.getHistory(spark.id),
+  });
+});
+
+/** Clear finished showcase history for a Spark. Does not cancel a running session. */
+app.delete("/api/sparks/:id/llm/showcase", (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  if (!spark) return res.status(404).json({ error: "Spark not found" });
+  if (spark.workerNode) {
+    return res.status(403).json({ error: "Worker nodes do not expose a local LLM API" });
+  }
+  if (spark.llmMonitoring === false) {
+    return res.status(403).json({ error: "LLM monitoring is disabled for this Spark" });
+  }
+  if (showcaseManager.getActive(spark.id)) {
+    return res.status(409).json({ error: "Cannot clear history while a showcase is running" });
+  }
+  showcaseManager.clearHistory(spark.id);
+  res.json({ success: true });
 });
 
 app.get("/api/sparks/:id/llm/showcase/:sessionId", (req, res) => {
@@ -1055,9 +1160,9 @@ function restartBroadcast() {
 loadSettings();
 startBroadcast();
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`[sparkDash] server listening on http://0.0.0.0:${PORT}`);
-  console.log(`[sparkDash] WebSocket endpoint ws://0.0.0.0:${PORT}/ws`);
+server.listen(PORT, BIND_HOST, () => {
+  console.log(`[sparkDash] server listening on http://${BIND_HOST}:${PORT}`);
+  console.log(`[sparkDash] WebSocket endpoint ws://${BIND_HOST}:${PORT}/ws`);
   startAllMonitors();
 });
 

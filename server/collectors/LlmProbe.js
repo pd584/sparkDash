@@ -5,9 +5,31 @@
  * Ported from legacy `probeLlamaServerType` and `_getLlamaMetricsFor`.
  */
 import { LLM_PROBE_TIMEOUT_MS } from "../config.js";
+import { classifyHostScope } from "../validate.js";
 
 const FAIL_RESET_THRESHOLD = 3;
 const REDETECT_INTERVAL_MS = 60_000;
+
+/**
+ * Prefer a short model id when the server returns a Hugging Face hub cache path.
+ * e.g. /root/.cache/huggingface/models--org--Name/snapshots/<hash>
+ *   → org/Name
+ * @param {unknown} id
+ * @returns {string | null}
+ */
+export function normalizeModelId(id) {
+  if (id == null) return null;
+  const s = String(id).trim();
+  if (!s) return null;
+
+  const hub = s.match(/(?:^|\/)models--([^/]+?)(?:\/snapshots\/[^/]+)?\/?$/);
+  if (hub) return hub[1].replace(/--/g, "/");
+
+  const mid = s.match(/models--([^/]+)\/snapshots\//);
+  if (mid) return mid[1].replace(/--/g, "/");
+
+  return s;
+}
 
 export class LlmProbe {
   constructor(spark, port = 8888) {
@@ -18,6 +40,8 @@ export class LlmProbe {
     // State
     this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | null
     this.serverIsOpenAI = null; // true = OpenAI-compatible
+    /** Whether /v1/models (or /slots) answered without credentials. null = unknown. */
+    this.authOpen = null;
     this.stepId = 0;
     this.modelId = null;
     this.modelPath = null;
@@ -118,6 +142,7 @@ export class LlmProbe {
   _resetDetection() {
     this.serverIsOpenAI = null;
     this.backendType = null;
+    this.authOpen = null;
     this.modelId = null;
     this.modelPath = null;
     this.generationTps = 0;
@@ -140,6 +165,19 @@ export class LlmProbe {
     this.lastTokenCounts = { input: 0, output: 0 };
   }
 
+  /** Note auth from an HTTP status on an unauthenticated probe request. */
+  _noteAuthStatus(status) {
+    if (status >= 200 && status < 300) {
+      this.authOpen = true;
+      return "ok";
+    }
+    if (status === 401 || status === 403) {
+      this.authOpen = false;
+      return "auth";
+    }
+    return "other";
+  }
+
   // ─── Server type detection ───────────────────────────────
   async _detectServerType() {
     // Skip the llama.cpp /slots probe once we've positively identified an
@@ -151,23 +189,45 @@ export class LlmProbe {
       const slotUrl = `${this.baseUrl}/slots`;
       try {
         const slotRes = await this._fetch(slotUrl);
-        if (slotRes.ok) {
+        const auth = this._noteAuthStatus(slotRes.status);
+        if (auth === "ok") {
           const slots = await slotRes.json();
           if (Array.isArray(slots)) {
             this.serverIsOpenAI = false;
             this.backendType = "llama.cpp";
             return;
           }
+        } else if (auth === "auth") {
+          // Authenticated llama.cpp — treat as protected OpenAI-style for posture
+          this.serverIsOpenAI = false;
+          this.backendType = "llama.cpp";
+          return;
         }
       } catch {}
     }
 
-    // Try OpenAI-compatible
+    // Try OpenAI-compatible (vLLM or SGLang)
     try {
       const modelRes = await this._fetch(`${this.baseUrl}/v1/models`);
-      if (modelRes.ok) {
+      const auth = this._noteAuthStatus(modelRes.status);
+      if (auth === "ok" || auth === "auth") {
         this.serverIsOpenAI = true;
-        this.backendType = "vllm";
+        let isSglang = false;
+        if (auth === "ok") {
+          try {
+            const modelsData = await modelRes.json();
+            const owned = modelsData?.data?.[0]?.owned_by;
+            if (typeof owned === "string" && /sglang/i.test(owned)) {
+              isSglang = true;
+            }
+          } catch {
+            /* body optional for detection */
+          }
+        }
+        if (!isSglang) {
+          isSglang = await this._probeIsSglang();
+        }
+        this.backendType = isSglang ? "sglang" : "vllm";
         return;
       }
     } catch {}
@@ -176,22 +236,50 @@ export class LlmProbe {
     this.backendType = null;
   }
 
+  /** True when SGLang native server-info endpoints respond. */
+  async _probeIsSglang() {
+    for (const path of ["/get_server_info", "/server_info"]) {
+      try {
+        const res = await this._fetch(`${this.baseUrl}${path}`);
+        if (!res.ok) continue;
+        const data = await res.json().catch(() => null);
+        if (data && typeof data === "object" && !Array.isArray(data)) return true;
+      } catch {
+        /* try next */
+      }
+    }
+    return false;
+  }
+
   // ─── OpenAI-compatible path (vLLM/sglang) ────────────────
   async _probeOpenAICompatible() {
     const now = Date.now();
     const dtSec = (now - this.lastProbeTime) / 1000;
     this.lastProbeTime = now;
 
-    // Model info from /v1/models — failure means server is down
+    // Model info from /v1/models — 401/403 means protected; other failure = down
     let modelsOk = false;
     try {
       const modelsRes = await this._fetch(`${this.baseUrl}/v1/models`);
-      if (modelsRes.ok) {
+      const auth = this._noteAuthStatus(modelsRes.status);
+      if (auth === "auth") {
+        return this._getSnapshot();
+      }
+      if (auth === "ok") {
         modelsOk = true;
         const modelsData = await modelsRes.json();
         const model = modelsData?.data?.[0];
-        this.modelId = model?.id || null;
+        this.modelId = normalizeModelId(model?.id || null);
         this.contextLength = model?.max_model_len || null;
+        // Cheap SGLang hint if detection still says vLLM (self-heal before redetect)
+        const owned = model?.owned_by;
+        if (
+          this.backendType === "vllm" &&
+          typeof owned === "string" &&
+          /sglang/i.test(owned)
+        ) {
+          this.backendType = "sglang";
+        }
       }
     } catch {}
 
@@ -199,15 +287,16 @@ export class LlmProbe {
       throw new Error("OpenAI-compatible /v1/models unreachable");
     }
 
-    // Skip SGLang probe when we already know the backend is vLLM
-    let isSglang = false;
+    // SGLang: native info endpoints. Skip on known vLLM to avoid 404 spam.
+    let isSglang = this.backendType === "sglang";
     if (this.backendType !== "vllm") {
       try {
         const sgRes = await this._fetch(`${this.baseUrl}/get_server_info`);
         if (sgRes.ok) {
           isSglang = true;
           const sgData = await sgRes.json();
-          this.contextLength = sgData.max_total_tokens || sgData.context_length || this.contextLength;
+          this.contextLength =
+            sgData.max_total_tokens || sgData.context_length || this.contextLength;
           if (sgData.total_input_tokens != null && sgData.total_output_tokens != null) {
             const deltaIn = sgData.total_input_tokens - this.lastTokenCounts.input;
             const deltaOut = sgData.total_output_tokens - this.lastTokenCounts.output;
@@ -219,8 +308,17 @@ export class LlmProbe {
               this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
             }
           }
+          // Prefer model_path from CLI args when /v1/models id is a cache path
+          if (sgData.model_path) {
+            this.modelPath = String(sgData.model_path);
+            this.modelId = normalizeModelId(sgData.model_path);
+          }
         }
       } catch {}
+    }
+
+    if (isSglang) {
+      await this._enrichSglangModelInfo();
     }
 
     // Single /metrics fetch: tok/s + slots/sleep (vLLM exposes max_model_len via /v1/models)
@@ -296,6 +394,24 @@ export class LlmProbe {
     return this._getSnapshot();
   }
 
+  /** Prefer SGLang /get_model_info (or /model_info) over raw HF cache paths. */
+  async _enrichSglangModelInfo() {
+    for (const path of ["/get_model_info", "/model_info"]) {
+      try {
+        const res = await this._fetch(`${this.baseUrl}${path}`);
+        if (!res.ok) continue;
+        const data = await res.json();
+        const raw = data?.model_path || data?.tokenizer_path;
+        if (!raw) continue;
+        this.modelPath = String(raw);
+        this.modelId = normalizeModelId(raw);
+        return;
+      } catch {
+        /* try next */
+      }
+    }
+  }
+
   // ─── llama.cpp native path ────────────────────────────────
   async _probeLlamaCpp() {
     const now = Date.now();
@@ -306,7 +422,11 @@ export class LlmProbe {
     let slotsOk = false;
     try {
       const slotsRes = await this._fetch(`${this.baseUrl}/slots`);
-      if (slotsRes.ok) {
+      const auth = this._noteAuthStatus(slotsRes.status);
+      if (auth === "auth") {
+        return this._getSnapshot();
+      }
+      if (auth === "ok") {
         const slots = await slotsRes.json();
         if (Array.isArray(slots)) {
           slotsOk = true;
@@ -449,9 +569,70 @@ export class LlmProbe {
     return slot.n_prompt_tokens_processed || slot.n_prompt_tokens || 0;
   }
 
+  /**
+   * Observational exposure hint from probe target + unauthenticated reachability.
+   * Does not claim process bind address (0.0.0.0 vs interface).
+   */
+  _buildPosture() {
+    if (this.authOpen == null) return null;
+
+    const host = this.spark?.lanIp || "";
+    const scope = classifyHostScope(host);
+    const keyed = Boolean(this._apiKey());
+    /** @type {"open" | "protected" | "keyed"} */
+    let auth;
+    if (keyed) {
+      // Key configured: success → keyed; 401/403 → protected (rejected)
+      auth = this.authOpen === false ? "protected" : "keyed";
+    } else {
+      auth = this.authOpen ? "open" : "protected";
+    }
+
+    let level = "ok";
+    if (auth === "open") {
+      if (scope === "public") level = "danger";
+      else if (scope === "local") level = "ok";
+      else level = "warn"; // lan or unknown hostname
+    } else if (keyed && auth === "protected") {
+      level = "danger";
+    }
+
+    const scopeWords = {
+      local: "loopback",
+      lan: "LAN",
+      public: "public",
+      unknown: "unknown-host",
+    };
+    const shortScope = {
+      local: "Local",
+      lan: "LAN",
+      public: "Public",
+      unknown: "Host",
+    };
+    const label =
+      auth === "protected"
+        ? keyed
+          ? "Bad API key"
+          : "Auth required"
+        : auth === "keyed"
+          ? `API key · ${shortScope[scope]}`
+          : `Open · ${shortScope[scope]}`;
+    const detail =
+      auth === "protected"
+        ? keyed
+          ? `Configured API key was rejected (401/403) · ${scopeWords[scope]} target (${host || "—"}).`
+          : `API key required · ${scopeWords[scope]} target (${host || "—"}). Based on the configured probe host, not the process bind address.`
+        : auth === "keyed"
+          ? `Using configured API key · ${scopeWords[scope]} target (${host || "—"}). Based on the configured probe host, not the process bind address.`
+          : `Unauthenticated · ${scopeWords[scope]} target (${host || "—"}). Based on the configured probe host, not the process bind address.`;
+
+    return { level, auth, scope, label, detail };
+  }
+
   _getSnapshot() {
+    const metricsLive = this.serverIsOpenAI !== null && this.authOpen !== false;
     return {
-      available: this.serverIsOpenAI !== null,
+      available: metricsLive,
       backend: this.backendType,
       modelId: this.modelId || null,
       modelPath: this.modelPath || null,
@@ -471,6 +652,7 @@ export class LlmProbe {
       e2eP95Seconds: this.e2eP95Seconds,
       itlP95Seconds: this.itlP95Seconds,
       mtpAcceptanceRate: this.mtpAcceptanceRate,
+      posture: this._buildPosture(),
       error: this.error,
     };
   }
@@ -478,7 +660,7 @@ export class LlmProbe {
   _defaultLlm() {
     return {
       available: false,
-      backend: null,
+      backend: this.backendType,
       modelId: null,
       modelPath: null,
       contextLength: null,
@@ -497,12 +679,24 @@ export class LlmProbe {
       e2eP95Seconds: null,
       itlP95Seconds: null,
       mtpAcceptanceRate: null,
+      posture: this._buildPosture(),
       error: this.error,
     };
   }
 
   // ─── HTTP helpers ────────────────────────────────────────
+  _apiKey() {
+    const keys = this.spark?.llmApiKeys;
+    if (!keys || typeof keys !== "object") return null;
+    const raw = keys[String(this.port)] ?? keys[this.port];
+    const key = raw != null ? String(raw).trim() : "";
+    return key || null;
+  }
+
   async _fetch(url) {
-    return fetch(url, { signal: AbortSignal.timeout(LLM_PROBE_TIMEOUT_MS) });
+    const headers = {};
+    const apiKey = this._apiKey();
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    return fetch(url, { signal: AbortSignal.timeout(LLM_PROBE_TIMEOUT_MS), headers });
   }
 }

@@ -6,7 +6,9 @@ services:
       platforms:
         - linux/arm64
     container_name: sparkDash
-    restart: unless-stopped
+    # always: come back after host reboot even if the container was stopped
+    # before shutdown (unlike unless-stopped, which stays down after a manual stop).
+    restart: always
     # Auto-restart Node when ./server files change (no image rebuild)
     command: ["node", "--watch", "server/index.js"]
     ports:
@@ -28,6 +30,7 @@ services:
       # Config + encrypted secrets (passwords survive restarts)
       - ./config:/app/config
     environment:
+      - BIND_HOST=0.0.0.0
       - PORT=5555
       - LLM_PORT=8888
       - NODE_ENV=production

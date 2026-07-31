@@ -29,6 +29,11 @@ export interface SparkConfig {
   /** HTTP ports for LLM servers on this Spark (default [8888]) */
   llmPorts?: number[];
   /**
+   * Ports that have an encrypted LLM API key stored server-side.
+   * The key itself is never returned by the API.
+   */
+  llmApiKeyPorts?: number[];
+  /**
    * Cluster role for overview + worker behavior.
    * - head / standalone: local LLM API probed
    * - worker: no local API (LLM card hidden, ports not probed)
@@ -190,7 +195,25 @@ export interface LlmMetrics {
   itlP95Seconds?: number | null;
   /** vLLM speculative/MTP acceptance rate (accepted/drafted, 0–1). null when unavailable. */
   mtpAcceptanceRate?: number | null;
+  /**
+   * Observational exposure hint from unauthenticated probe reachability +
+   * configured target host scope. null when auth status is unknown.
+   * Does not claim process bind address.
+   */
+  posture?: LlmPosture | null;
   error: string | null;
+}
+
+/** Security posture badge payload from LlmProbe. */
+export interface LlmPosture {
+  /** ok = green, warn = amber, danger = red */
+  level: "ok" | "warn" | "danger";
+  auth: "open" | "protected" | "keyed";
+  scope: "local" | "lan" | "public" | "unknown";
+  /** Short badge text */
+  label: string;
+  /** Tooltip / title detail */
+  detail: string;
 }
 
 // ─── Full metrics snapshot ────────────────────────────────
@@ -229,6 +252,8 @@ export interface SparkSnapshot {
   llmPort: number;
   /** All LLM server ports configured for this Spark */
   llmPorts: number[];
+  /** Ports with a stored LLM API key (key itself never exposed) */
+  llmApiKeyPorts?: number[];
   hardware: HardwareInfo;
   metrics: SparkMetrics;
 }
@@ -329,15 +354,6 @@ export interface DecodeBenchLevelResult {
   medianTtftMs: number;
   /** Client: total post-first-token tokens / concurrent decode window */
   aggregateDecodeTps: number;
-  /**
-   * Median server-side generation tok/s from live-style /metrics polls during the wave.
-   * Null when the backend does not expose counters.
-   */
-  serverGenerationTps: number | null;
-  /** Peak sample of server generation tok/s during the wave */
-  serverGenerationTpsMax?: number | null;
-  /** Number of positive rate samples collected from the engine */
-  serverGenerationSamples?: number;
   totalDecodeTokens: number;
   totalCompletionTokens: number;
   durationMs: number;
@@ -401,12 +417,18 @@ export interface StartDecodeBenchRequest {
 }
 
 // ─── LLM Prompt Showcase ─────────────────────────────────
+export type ShowcasePromptType = "structural" | "text" | "mixed";
+
 export interface ShowcaseStartRequest {
   port: number;
   modelId?: string | null;
   maxTokens?: number;
+  /** Sampling temperature (0–2). Defaults to 0.7 on the server. */
+  temperature?: number;
   /** When true, enable model thinking/reasoning flags (UI defaults to off). */
   thinking?: boolean;
+  /** Catalog mode used to seed prompts (structural / text / mixed). */
+  promptType?: ShowcasePromptType | null;
   prompts: string[];
 }
 
@@ -426,6 +448,7 @@ export interface ShowcaseStreamState {
   ttftMs: number | null;
   decodeTps: number;
   liveTokPerSec: number;
+  peakTokPerSec?: number;
   model: string | null;
   error: string | null;
 }
@@ -437,13 +460,51 @@ export interface ShowcaseSessionState {
   rev: number;
   port: number;
   modelId?: string | null;
+  maxTokens?: number | null;
+  temperature?: number;
+  thinking?: boolean;
+  promptType?: ShowcasePromptType | null;
   startedAt?: number;
+  completedAt?: number | null;
   /** Median server generation tok/s from /metrics during the run (null if unavailable). */
   serverGenerationTps?: number | null;
   serverGenerationTpsMax?: number | null;
   serverGenerationSamples?: number;
+  totalTokens?: number;
+  meanDecodeTps?: number;
+  peakStreamTps?: number;
+  streamCount?: number;
   streams: ShowcaseStreamState[];
   error?: string | null;
+  /** True when loaded from disk history (not a live poll session). */
+  fromHistory?: boolean;
+}
+
+/** List-row for finished showcase runs (no stream bodies). */
+export interface ShowcaseHistorySummary {
+  sessionId: string;
+  sparkId: string;
+  status: "completed" | "cancelled" | "error" | string;
+  port: number;
+  modelId?: string | null;
+  maxTokens?: number | null;
+  temperature?: number;
+  thinking?: boolean;
+  promptType?: ShowcasePromptType | null;
+  startedAt?: number | null;
+  completedAt?: number | null;
+  serverGenerationTps?: number | null;
+  serverGenerationTpsMax?: number | null;
+  totalTokens: number;
+  meanDecodeTps: number;
+  peakStreamTps: number;
+  streamCount: number;
+  error?: string | null;
+}
+
+export interface ShowcaseListResponse {
+  active: { sessionId: string; status: string } | null;
+  history: ShowcaseHistorySummary[];
 }
 
 export interface ShowcaseStartResponse {

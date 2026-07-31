@@ -3,6 +3,7 @@ import type {
   DecodeBenchListResponse,
   LlmMetrics,
   Settings,
+  ShowcaseListResponse,
   ShowcaseSessionState,
   ShowcaseStartRequest,
   ShowcaseStartResponse,
@@ -188,6 +189,11 @@ export function startShowcase(
   });
 }
 
+/** Active session + finished history summaries. */
+export function listShowcase(id: string): Promise<ShowcaseListResponse> {
+  return apiFetch(`/api/sparks/${id}/llm/showcase`);
+}
+
 export function getShowcase(
   id: string,
   sessionId: string,
@@ -207,6 +213,13 @@ export function cancelShowcase(
   return apiFetch(`/api/sparks/${id}/llm/showcase/${sessionId}`, {
     method: "DELETE",
   });
+}
+
+/** Clear finished showcase history for a Spark. */
+export function clearShowcaseHistory(
+  id: string
+): Promise<{ success: boolean }> {
+  return apiFetch(`/api/sparks/${id}/llm/showcase`, { method: "DELETE" });
 }
 
 // ─── LLM probe ports (per Spark) ─────────────────────────
@@ -250,6 +263,25 @@ export function updateLlmPort(
   return apiFetch(`/api/sparks/${id}/llm-port`, {
     method: "PUT",
     body: JSON.stringify({ llmPort }),
+  });
+}
+
+/**
+ * Set or clear an optional LLM API key for one port.
+ * Pass apiKey "" to clear. Key is stored encrypted server-side and never returned.
+ */
+export function setLlmApiKey(
+  id: string,
+  port: number,
+  apiKey: string
+): Promise<{
+  success: boolean;
+  hasApiKey: boolean;
+  llmApiKeyPorts: number[];
+}> {
+  return apiFetch(`/api/sparks/${id}/llm-ports/${port}/api-key`, {
+    method: "PUT",
+    body: JSON.stringify({ apiKey }),
   });
 }
 

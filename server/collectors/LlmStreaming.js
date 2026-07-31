@@ -48,13 +48,20 @@ export function sleep(ms, signal) {
 /**
  * Read cumulative generation (output) token counters from the server —
  * same sources as LlmProbe live tok/s.
+ * @param {string} baseUrl
+ * @param {{ apiKey?: string | null }} [opts]
  * @returns {Promise<number | null>}
  */
-export async function readServerGenerationTokens(baseUrl) {
+export async function readServerGenerationTokens(baseUrl, opts = {}) {
+  const headers = {};
+  const apiKey = opts?.apiKey != null ? String(opts.apiKey).trim() : "";
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
   // vLLM Prometheus
   try {
     const res = await fetch(`${baseUrl}/metrics`, {
       signal: AbortSignal.timeout(5_000),
+      headers,
     });
     if (res.ok) {
       const txt = await res.text();
@@ -80,6 +87,7 @@ export async function readServerGenerationTokens(baseUrl) {
   try {
     const res = await fetch(`${baseUrl}/get_server_info`, {
       signal: AbortSignal.timeout(5_000),
+      headers,
     });
     if (res.ok) {
       const data = await res.json();
@@ -109,6 +117,18 @@ export function pickDebugHeaders(headers) {
 }
 
 /**
+ * Rough completion-token estimate from visible text.
+ * SSE deltas often carry multiple tokens; counting events under-reports live tok/s.
+ * Final metrics still prefer server `usage.completion_tokens` when present.
+ * @param {string} text
+ */
+export function estimateTokenCount(text) {
+  if (!text || typeof text !== "string" || text.length === 0) return 0;
+  // ~4 chars/token for Latin / code; never less than 1 for non-empty text
+  return Math.max(1, Math.round(text.length / 4));
+}
+
+/**
  * Extract visible text pieces from an OpenAI-compatible delta (or choice.text).
  * Counts content + reasoning / reasoning_content so thinking models stay "alive".
  * Separates answer (`content`/`text`) from reasoning for display styling.
@@ -123,25 +143,25 @@ function extractDeltaPieces(choice) {
   if (delta && typeof delta === "object") {
     if (typeof delta.content === "string" && delta.content.length > 0) {
       answer = delta.content;
-      tokenChunks += 1;
+      tokenChunks += estimateTokenCount(delta.content);
     }
     // Prefer delta.reasoning; fall back to reasoning_content (don't double-count)
     if (typeof delta.reasoning === "string" && delta.reasoning.length > 0) {
       reasoning = delta.reasoning;
-      tokenChunks += 1;
+      tokenChunks += estimateTokenCount(delta.reasoning);
     } else if (
       typeof delta.reasoning_content === "string" &&
       delta.reasoning_content.length > 0
     ) {
       reasoning = delta.reasoning_content;
-      tokenChunks += 1;
+      tokenChunks += estimateTokenCount(delta.reasoning_content);
     }
   }
 
   // Non-delta fallbacks (some backends)
   if (!answer && !reasoning && typeof choice?.text === "string" && choice.text.length > 0) {
     answer = choice.text;
-    tokenChunks = 1;
+    tokenChunks = estimateTokenCount(choice.text);
   }
 
   return { answer, reasoning, tokenChunks };
@@ -196,7 +216,7 @@ export function stripThinkingFlags(body) {
  * @param {string} baseUrl
  * @param {AbortSignal} signal
  * @param {number} [intervalMs=400]
- * @param {{ onSample?: (info: { rate: number, median: number | null, max: number | null, samples: number }) => void }} [opts]
+ * @param {{ onSample?: (info: { rate: number, median: number | null, max: number | null, samples: number }) => void, apiKey?: string | null }} [opts]
  * @returns {Promise<{ median: number | null, mean: number | null, max: number | null, samples: number }>}
  */
 export async function pollServerGenerationRates(
@@ -207,7 +227,8 @@ export async function pollServerGenerationRates(
 ) {
   /** @type {number[]} */
   const rates = [];
-  let lastTokens = await readServerGenerationTokens(baseUrl);
+  const apiKey = opts?.apiKey != null ? String(opts.apiKey).trim() : "";
+  let lastTokens = await readServerGenerationTokens(baseUrl, { apiKey: apiKey || null });
   let lastT = performance.now();
   const onSample = typeof opts.onSample === "function" ? opts.onSample : null;
 
@@ -218,7 +239,7 @@ export async function pollServerGenerationRates(
       break;
     }
     const now = performance.now();
-    const tokens = await readServerGenerationTokens(baseUrl);
+    const tokens = await readServerGenerationTokens(baseUrl, { apiKey: apiKey || null });
     if (tokens == null || lastTokens == null) {
       if (tokens != null) {
         lastTokens = tokens;
@@ -268,6 +289,7 @@ export async function pollServerGenerationRates(
  * - collectContent: accumulate full visible text (showcase)
  * - onDelta: live callback `{ text?, answer?, reasoning?, tokenCount, tFirst, tLast, … }`
  * - retryOnThinking400: if HTTP 400 and body had thinking flags, retry once stripped
+ * - apiKey: optional Bearer token for OpenAI-compatible gateways
  */
 export async function runStreamingRequest(
   url,
@@ -278,12 +300,14 @@ export async function runStreamingRequest(
     collectContent = false,
     onDelta = null,
     retryOnThinking400 = false,
+    apiKey = null,
   } = {}
 ) {
   const result = await runStreamingRequestOnce(url, body, signal, {
     debug,
     collectContent,
     onDelta,
+    apiKey,
   });
 
   if (
@@ -299,6 +323,7 @@ export async function runStreamingRequest(
       debug,
       collectContent,
       onDelta,
+      apiKey,
     });
   }
 
@@ -309,13 +334,13 @@ export async function runStreamingRequest(
  * @param {string} url
  * @param {Record<string, unknown>} body
  * @param {AbortSignal} signal
- * @param {{ debug?: boolean, collectContent?: boolean, onDelta?: Function | null }} opts
+ * @param {{ debug?: boolean, collectContent?: boolean, onDelta?: Function | null, apiKey?: string | null }} opts
  */
 async function runStreamingRequestOnce(
   url,
   body,
   signal,
-  { debug = false, collectContent = false, onDelta = null } = {}
+  { debug = false, collectContent = false, onDelta = null, apiKey = null } = {}
 ) {
   const t0 = performance.now();
   /** @type {number | null} */
@@ -345,12 +370,17 @@ async function runStreamingRequestOnce(
   const deltaCb = typeof onDelta === "function" ? onDelta : null;
 
   try {
+    /** @type {Record<string, string>} */
+    const headers = {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    };
+    const key = apiKey != null ? String(apiKey).trim() : "";
+    if (key) headers.Authorization = `Bearer ${key}`;
+
     const response = await fetch(url, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "text/event-stream",
-      },
+      headers,
       body: JSON.stringify(body),
       signal,
     });

@@ -46,10 +46,17 @@ sparkDash is a real-time web dashboard for one or more **NVIDIA DGX Spark (GB10)
 
 ## Latest version changelog
 
-### Version 1.3.0 — major feature release
-- **LLM Prompt Showcase** — full-page multi-terminal streaming demo (up to 32 concurrent prompts) from the LLM panel
-- Aggregate server tok/s during runs, copy one/all terminals, collapsible reasoning, thinking-flag adapter
-- Shared streaming path for Showcase + DecodeBench; mutual exclusion between the two
+### Version 1.4.5 — SGLang detect, model wrap, decode concurrencies
+- **SGLang detection** — correct backend badge; HF cache paths shortened to `org/name` ([#29](https://github.com/MiaAI-Lab/sparkDash/pull/29))
+- **Model name wrap** — overview / LLM panel show full model id (wrap, no ellipsis trim)
+- **Decode concurrencies** — 5, 10, 12, 24 ([#27](https://github.com/MiaAI-Lab/sparkDash/pull/27))
+- **API key port renames** — migrate/prune keys; “Bad API key” on reject ([#26](https://github.com/MiaAI-Lab/sparkDash/pull/26))
+
+Full history: [CHANGELOG.md](./CHANGELOG.md)
+
+### Version 1.4.4 — Optional LLM API key
+- **Per-port API key** — optional Bearer token in LLM Settings for authenticated OpenAI-compatible gateways; encrypted at rest ([#21](https://github.com/MiaAI-Lab/sparkDash/issues/21))
+- **Settings version** — footer shows the real `package.json` version
 
 Full history: [CHANGELOG.md](./CHANGELOG.md)
 
@@ -218,6 +225,7 @@ Copy `.env.example` to `.env` if needed:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `BIND_HOST` | `0.0.0.0` | HTTP and WebSocket listen address |
 | `PORT` | `5555` | HTTP + WebSocket listen port |
 | `LLM_PORT` | `8888` | Default LLM probe port |
 | `POLL_INTERVAL_GPU` | `2000` | GPU poll (ms) |
@@ -231,6 +239,9 @@ Copy `.env.example` to `.env` if needed:
 | `HOST_PROC_PATH` | `/host/proc` | Host proc mount inside container |
 | `HOST_SYS_PATH` | `/host/sys` | Host sys mount |
 | `HOST_ROOT_PATH` | `/host/root` | Host root mount |
+
+> When using Docker's default bridge network, keep `BIND_HOST=0.0.0.0`.  
+> With `network_mode: host`, use `BIND_HOST=127.0.0.1` to restrict access to the local host or a reverse proxy.
 
 ### Adding a Spark
 
