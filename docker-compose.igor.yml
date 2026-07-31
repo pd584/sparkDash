@@ -1,0 +1,33 @@
+services:
+  sparkdash:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # NOTE: no `platforms:` pin — igor is x86_64, not a Spark. node:22-bookworm-slim
+      # is multi-arch so this builds natively here.
+    container_name: sparkDash
+    restart: unless-stopped
+    command: ["node", "--watch", "server/index.js"]
+    ports:
+      - "5555:5555"
+    # NOTE: upstream runs privileged + pid:host + nvidia-smi/driver mounts because it
+    # expects to run ON a Spark and read local GPU metrics. igor has no GPU and monitors
+    # ltd-1/2/3 REMOTELY over SSH, so all of that is dropped on purpose.
+    volumes:
+      - ./server:/app/server
+      - ./config:/app/config
+      # read-only SSH key so the container can reach the Sparks as prescott
+      - /home/prescott/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro
+      - /home/prescott/.ssh/known_hosts:/root/.ssh/known_hosts:ro
+    environment:
+      - PORT=5555
+      - NODE_ENV=production
+      # vLLM on the Sparks serves on 8000 (per the qwen3.5-397b recipe).
+      # igor's own :8888 is searxng and is unrelated to this.
+      - LLM_PORT=8000
+    networks:
+      - sparkdash-net
+
+networks:
+  sparkdash-net:
+    driver: bridge
