@@ -184,6 +184,14 @@ function SparkCard({
               color={tempBarColor}
               caption={tempLabel}
             />
+            {gpu?.throttle?.thermal && (
+              <div
+                className="rounded border border-danger/40 bg-danger/10 px-2 py-1 text-[11px] font-medium text-danger"
+                title={gpu.throttle.detail || "GPU thermal slowdown engaged"}
+              >
+                Thermal throttle
+              </div>
+            )}
             <MetricBar
               label="Usage"
               value={usage}
@@ -251,7 +259,15 @@ function SparkCard({
               if (!llm) return null;
               return (
                 <MiniStat
-                  label={llm.backend === "vllm" ? "vLLM" : llm.backend ?? "LLM"}
+                  label={
+                    llm.backend === "vllm"
+                      ? "vLLM"
+                      : llm.backend === "ds4"
+                        ? "ds4"
+                        : llm.backend === "sglang"
+                          ? "sgLang"
+                          : llm.backend ?? "LLM"
+                  }
                   value={llm.modelId ?? "unknown"}
                   tone="accent"
                   title={llm.modelId ?? undefined}

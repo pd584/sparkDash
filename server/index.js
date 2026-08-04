@@ -17,6 +17,7 @@ import {
   DECODE_BENCH_DEFAULTS,
 } from "./collectors/DecodeBench.js";
 import { showcaseManager } from "./collectors/ShowcaseManager.js";
+import { llmProbeHost } from "./collectors/llmHost.js";
 
 dotenv.config();
 
@@ -622,7 +623,7 @@ app.post("/api/sparks/:id/llm/bench", (req, res) => {
     const benchDebug = Boolean(getSettings().benchDebugTraces);
     const job = decodeBenchManager.start({
       sparkId: spark.id,
-      lanIp: spark.lanIp,
+      lanIp: llmProbeHost(spark),
       port,
       modelId,
       concurrencies: req.body?.concurrencies,
@@ -778,7 +779,7 @@ app.post("/api/sparks/:id/llm/showcase", (req, res) => {
   try {
     const result = showcaseManager.start({
       sparkId: spark.id,
-      lanIp: spark.lanIp,
+      lanIp: llmProbeHost(spark),
       port,
       modelId,
       maxTokens: req.body?.maxTokens,

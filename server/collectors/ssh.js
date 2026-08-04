@@ -9,6 +9,7 @@ import { execFile } from "child_process";
 import fs from "fs";
 import { SSH_CONNECT_TIMEOUT } from "../config.js";
 import { isAllowedTargetHost, isValidSshUser } from "../validate.js";
+import { llmProbeHost } from "./llmHost.js";
 
 // Detect sshpass without shelling out to `which` on every cold call —
 // checking PATH entries directly is faster and avoids spawning a shell.
@@ -164,9 +165,9 @@ export async function sshTest(spark) {
  */
 export async function llmTest(spark, port) {
   try {
-    const host = spark.lanIp;
+    const host = llmProbeHost(spark);
     if (!isAllowedTargetHost(host)) {
-      return { ok: false, message: `Invalid or disallowed lanIp: ${host}` };
+      return { ok: false, message: `Invalid or disallowed LLM host: ${host}` };
     }
     const resolvedPort =
       Number.isInteger(port) && port >= 1 && port <= 65535

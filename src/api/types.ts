@@ -77,6 +77,24 @@ export interface HardwareInfo {
 }
 
 // ─── GPU metrics ─────────────────────────────────────────
+export interface GpuThrottle {
+  /** HW or SW thermal slowdown engaged. */
+  thermal: boolean;
+  /** HW slowdown (may include thermal or power brake). */
+  hwSlowdown: boolean;
+  /** SW power-cap scaling limiting clocks. */
+  powerCap: boolean;
+  /** Any limiting reason above. */
+  active: boolean;
+  reason: "ok" | "thermal" | "power" | "hw" | "unknown";
+  smClockMHz: number | null;
+  smClockMaxMHz: number | null;
+  /** Current SM clock as % of max (0–100). null when clocks unavailable. */
+  smClockPct: number | null;
+  /** Human-readable active reasons (tooltip). */
+  detail: string;
+}
+
 export interface GpuMetrics {
   temperature: number;
   usage: number;
@@ -95,6 +113,8 @@ export interface GpuMetrics {
   };
   /** Top GPU processes by VRAM usage (sorted descending, max 5). */
   processes?: Array<{ pid: number; name: string; vramMB: number }>;
+  /** NVIDIA clock throttle / thermal slowdown state from nvidia-smi. */
+  throttle?: GpuThrottle | null;
 }
 
 // ─── CPU metrics ─────────────────────────────────────────
@@ -165,7 +185,7 @@ export interface UnifiedMemoryMetrics {
 // ─── LLM metrics ─────────────────────────────────────────
 export interface LlmMetrics {
   available: boolean;
-  backend: "vllm" | "llama.cpp" | "sglang" | null;
+  backend: "vllm" | "llama.cpp" | "sglang" | "ds4" | null;
   modelId: string | null;
   modelPath: string | null;
   contextLength: number | null;

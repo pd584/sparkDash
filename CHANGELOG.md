@@ -7,6 +7,33 @@ Format: version sections are listed newest first.
 
 ---
 
+## [1.5.0] — 2026-08-03
+
+### Added
+- **GPU thermal throttle meter** — collect NVIDIA `clocks_throttle_reasons` (HW/SW thermal, HW slowdown, SW power cap) plus SM current/max clocks via `nvidia-smi` (local and remote)
+- **GPU panel Throttle row** — status chip (`OK` / `Thermal` / `Power` / `HW`) with SM clock bar and tooltip of active reasons
+- **Overview thermal hint** — compact red “Thermal throttle” banner when any Spark reports thermal slowdown
+
+---
+
+## [1.4.7] — 2026-08-02
+
+### Added
+- **SGLang and DwarfStar (ds4-server) properly supported in LLM probes** — correct backend detection, model/context, and live tok/s for both engines alongside vLLM and llama.cpp
+- **ds4-server / DwarfStar LLM probe** — auto-detect Entrpi/ds4-on-spark via `owned_by: ds4.c` or Prometheus `ds4_*` series; model/`context_length` from `/v1/models`; live tok/s from `ds4_tokens_*` counter diffs
+- **`llmProbeHost`** — local Sparks probe `127.0.0.1` so loopback-bound servers (ds4 `start.sh` default `--host 127.0.0.1`) are reachable; Showcase / Decode bench / connectivity test use the same host
+- **Docker host networking** — compose uses `network_mode: host` so the container can reach host loopback LLM ports
+
+### Fixed
+- **SGLang tok/s stuck at 0** — modern SGLang without `total_*_tokens` / `--enable-metrics` now reads `internal_states[].last_gen_throughput`
+- **SGLang sticky ~30 tok/s when idle** — only treat `last_gen_throughput` as live after it changes between polls; expire to 0 when it stops moving
+- **ds4 window-gauge idle bleed** — do not use `ds4_decode_tok_s` / `ds4_prefill_tok_s` (~60s averages) for the live panel
+
+### Changed
+- Backend badge / types include **ds4**; overview labels distinguish ds4 / sgLang / vLLM
+
+---
+
 ## [1.4.5] — 2026-07-31
 
 ### Fixed

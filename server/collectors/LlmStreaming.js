@@ -57,7 +57,7 @@ export async function readServerGenerationTokens(baseUrl, opts = {}) {
   const apiKey = opts?.apiKey != null ? String(opts.apiKey).trim() : "";
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
-  // vLLM Prometheus
+  // Prometheus (vLLM or ds4-server) — prefer whichever series is present
   try {
     const res = await fetch(`${baseUrl}/metrics`, {
       signal: AbortSignal.timeout(5_000),
@@ -65,19 +65,35 @@ export async function readServerGenerationTokens(baseUrl, opts = {}) {
     });
     if (res.ok) {
       const txt = await res.text();
-      const re =
-        /^vllm:generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm;
-      let sum = 0;
-      let found = false;
-      let m;
-      while ((m = re.exec(txt)) !== null) {
-        const v = parseFloat(m[1]);
-        if (Number.isFinite(v)) {
-          sum += v;
-          found = true;
+      const fromSeries = (re) => {
+        let sum = 0;
+        let found = false;
+        let m;
+        while ((m = re.exec(txt)) !== null) {
+          const v = parseFloat(m[1]);
+          if (Number.isFinite(v)) {
+            sum += v;
+            found = true;
+          }
         }
-      }
-      if (found) return sum;
+        return found ? sum : null;
+      };
+      const ds4 = fromSeries(
+        /^ds4_tokens_decoded_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
+      );
+      if (ds4 != null) return ds4;
+      const vllm = fromSeries(
+        /^vllm:generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
+      );
+      if (vllm != null) return vllm;
+      const sglang =
+        fromSeries(
+          /^sglang:generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
+        ) ??
+        fromSeries(
+          /^sglang_generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
+        );
+      if (sglang != null) return sglang;
     }
   } catch {
     /* try next */
