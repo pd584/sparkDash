@@ -26,6 +26,8 @@ function placeholderSnapshot(
     workerLabel?: string | null;
     workerHeadId?: string | null;
     llmMonitoring?: boolean;
+    comfyMonitoring?: boolean;
+    comfyPort?: number;
   }
 ): SparkSnapshot {
   const role =
@@ -56,6 +58,8 @@ function placeholderSnapshot(
         : role === "head"
           ? true
           : roleFields?.llmMonitoring !== false,
+    comfyMonitoring: Boolean(roleFields?.comfyMonitoring),
+    comfyPort: roleFields?.comfyPort ?? 8188,
     hardware: {
       device: "NVIDIA DGX Spark",
       cpuModel: "…",
@@ -73,6 +77,7 @@ function placeholderSnapshot(
       network: null,
       unifiedMemory: null,
       llm: [],
+      comfy: null,
     },
   };
 }
@@ -158,6 +163,8 @@ function DashboardApp() {
               workerLabel: c.workerLabel ?? existing.workerLabel,
               workerHeadId: c.workerHeadId ?? existing.workerHeadId,
               llmMonitoring: c.llmMonitoring ?? existing.llmMonitoring,
+              comfyMonitoring: c.comfyMonitoring ?? existing.comfyMonitoring,
+              comfyPort: c.comfyPort ?? existing.comfyPort,
               disabledDevices: c.disabledDevices || existing.disabledDevices,
               disabledInterfaces: c.disabledInterfaces || existing.disabledInterfaces,
               llmPorts: c.llmPorts ?? existing.llmPorts,
@@ -176,6 +183,8 @@ function DashboardApp() {
               workerLabel: c.workerLabel,
               workerHeadId: c.workerHeadId,
               llmMonitoring: c.llmMonitoring,
+              comfyMonitoring: c.comfyMonitoring,
+              comfyPort: c.comfyPort,
             }
           );
         })
