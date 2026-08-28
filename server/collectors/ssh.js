@@ -127,7 +127,12 @@ export async function sshExec(spark, cmd, options = {}) {
   } else {
     // Key-based SSH (default) — BatchMode prevents hanging on missing keys
     file = "ssh";
-    args = [...baseOpts, "-o", "BatchMode=yes", "--", remote, cmd];
+    args = [...baseOpts, "-o", "BatchMode=yes"];
+    const identityFile = process.env.SSH_IDENTITY_FILE;
+    if (identityFile) {
+      args.push("-i", identityFile);
+    }
+    args.push("--", remote, cmd);
   }
 
   return new Promise((resolve, reject) => {

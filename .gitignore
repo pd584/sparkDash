@@ -5,7 +5,9 @@ sparks.json
 config/sparks-secrets.json
 config/.secrets-key
 config/bench-history.json
+config/bench-active.json
 config/showcase-history.json
+config/llm-daily.json
 config/gpu-memory.json
 config/gpu-memory.json.*
 config/bench-exports/
@@ -19,5 +21,6 @@ PLAN.md
 tetris.html
 .zcode/
 HANDOFF.md
+HANDOFF-HERMES.md
 handoff.md
 test/

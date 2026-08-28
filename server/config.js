@@ -15,10 +15,14 @@ const SPARKS_SECRETS_PATH =
 /** AES key file (auto-generated if SPARKDASH_SECRETS_KEY unset). */
 const SECRETS_KEY_PATH =
   process.env.SECRETS_KEY_PATH || path.join(ROOT, "config", ".secrets-key");
+/** Daily LLM tok/s rollups (gitignored). */
+const LLM_DAILY_JSON_PATH =
+  process.env.LLM_DAILY_JSON_PATH || path.join(ROOT, "config", "llm-daily.json");
 
 // ─── LLM / Comfy probe timeouts ──────────────────────────
 const LLM_PROBE_TIMEOUT_MS = 3000;
 const COMFY_PROBE_TIMEOUT_MS = parseInt(process.env.COMFY_PROBE_TIMEOUT_MS || "3000", 10);
+const TAILSCALE_PROBE_TIMEOUT_MS = parseInt(process.env.TAILSCALE_PROBE_TIMEOUT_MS || "8000", 10);
 const SSH_CONNECT_TIMEOUT = 5; // seconds
 
 // ─── Poll intervals (milliseconds) ───────────────────────
@@ -28,10 +32,20 @@ const POLL_INTERVAL_NETWORK = parseInt(process.env.POLL_INTERVAL_NETWORK || "200
 const POLL_INTERVAL_STORAGE = parseInt(process.env.POLL_INTERVAL_STORAGE || "5000", 10);
 const POLL_INTERVAL_LLM = parseInt(process.env.POLL_INTERVAL_LLM || "2000", 10);
 const POLL_INTERVAL_COMFY = parseInt(process.env.POLL_INTERVAL_COMFY || "2000", 10);
+// Tailnet membership changes slowly; each poll is an SSH round-trip.
+const POLL_INTERVAL_TAILSCALE = parseInt(process.env.POLL_INTERVAL_TAILSCALE || "30000", 10);
 // dmon -c 1 -d 1 blocks ~1s; default 2s avoids stacking with in-flight guards
 const POLL_INTERVAL_BANDWIDTH = parseInt(process.env.POLL_INTERVAL_BANDWIDTH || "2000", 10);
 // Dedicated liveness (sshTest / local ping) cadence — not a metric domain.
 const POLL_INTERVAL_LIVENESS = parseInt(process.env.POLL_INTERVAL_LIVENESS || "5000", 10);
+// Hermes Agent update check cadence. `hermes update --check` runs `git fetch`
+// on the target every time, so keep it slow (default 10 min).
+const POLL_INTERVAL_HERMES = parseInt(process.env.POLL_INTERVAL_HERMES || "600000", 10);
+// Hard cap while running `hermes update` over SSH (repo pull + dep reinstall).
+const HERMES_UPDATE_TIMEOUT_MS = parseInt(
+  process.env.HERMES_UPDATE_TIMEOUT_MS || "600000",
+  10
+);
 
 // ─── Port ────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || "5555", 10);
@@ -80,8 +94,10 @@ export {
   GPU_MEMORY_JSON_PATH,
   SPARKS_SECRETS_PATH,
   SECRETS_KEY_PATH,
+  LLM_DAILY_JSON_PATH,
   LLM_PROBE_TIMEOUT_MS,
   COMFY_PROBE_TIMEOUT_MS,
+  TAILSCALE_PROBE_TIMEOUT_MS,
   SSH_CONNECT_TIMEOUT,
   POLL_INTERVAL_GPU,
   POLL_INTERVAL_CPU,
@@ -89,8 +105,11 @@ export {
   POLL_INTERVAL_STORAGE,
   POLL_INTERVAL_LLM,
   POLL_INTERVAL_COMFY,
+  POLL_INTERVAL_TAILSCALE,
   POLL_INTERVAL_BANDWIDTH,
   POLL_INTERVAL_LIVENESS,
+  POLL_INTERVAL_HERMES,
+  HERMES_UPDATE_TIMEOUT_MS,
   PORT,
   LLM_PORT,
   COMFY_PORT,

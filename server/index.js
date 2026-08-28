@@ -19,6 +19,8 @@ import {
 } from "./collectors/DecodeBench.js";
 import { showcaseManager } from "./collectors/ShowcaseManager.js";
 import { llmProbeHost } from "./collectors/llmHost.js";
+import { llmDaily } from "./collectors/LlmDaily.js";
+import { compareSemver, getLatestRelease } from "./collectors/HermesReleases.js";
 
 dotenv.config();
 
@@ -26,7 +28,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, "..");
 
-const BIND_HOST = process.env.BIND_HOST || "0.0.0.0";
+// Default to loopback: the dashboard exposes SSH and remote power controls, so it
+// should not be reachable on the LAN unless explicitly opted in. Set BIND_HOST to the
+// host's LAN IP (or 0.0.0.0) to expose it; docker-compose.yml already sets 0.0.0.0.
+const BIND_HOST = process.env.BIND_HOST || "127.0.0.1";
 const PORT = parseInt(process.env.PORT || "5555", 10);
 const LLM_PORT = parseInt(process.env.LLM_PORT || "8888", 10);
 const COMFY_PORT = parseInt(process.env.COMFY_PORT || "8188", 10);
@@ -94,6 +99,8 @@ function startMonitor(spark) {
         if (mon) mon.updateConfig(registry.getSpark(id));
       }
     },
+    // Hermes check / update results must not wait for the next broadcast tick.
+    onHermesChange: () => forceBroadcast(),
   });
   monitors.set(spark.id, monitor);
   monitor.start();
@@ -372,11 +379,129 @@ app.post("/api/sparks/:id/refresh/:domain", async (req, res) => {
       return res.status(400).json({ error: "Only 'storage' domain is supported" });
     }
     await monitor.refreshDomain(domain);
-    // Broadcast updated snapshot immediately (force, ignoring the diff cache)
-    const payload = buildSnapshotPayload();
-    _lastBroadcastPayload = payload;
-    broadcastPayload(payload);
+    forceBroadcast();
     res.json({ success: true, domain });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Hermes Agent ───────────────────────────────────
+// Batch route first (like shutdown-all/wake-all): a plain Sparks-suffixed
+// path (3 segments) that cannot be captured by /api/sparks/:id/hermes/* (4).
+/** One-click `hermes update` on every Spark with hermes monitoring enabled. */
+app.post("/api/sparks/hermes/update-all", async (_req, res) => {
+  const results = [];
+  for (const spark of registry.sparks) {
+    const monitor = monitors.get(spark.id);
+    const entry = { id: spark.id, name: spark.name, ok: false, started: false, skipped: false };
+    if (!spark.hermesMonitoring || !monitor) {
+      entry.skipped = true;
+      entry.reason = spark.hermesMonitoring
+        ? "monitor not running"
+        : "Hermes Agent monitoring is disabled (enable it in Edit Spark)";
+      results.push(entry);
+      continue;
+    }
+    const result = monitor.runHermesUpdate();
+    entry.started = Boolean(result.started);
+    entry.ok = Boolean(result.started);
+    if (!result.started) {
+      entry.skipped = true;
+      entry.reason = result.reason || "update already running";
+    }
+    results.push(entry);
+  }
+  res.json({ success: true, results });
+});
+
+/** Re-check for a hermes update now (bypasses the poll cadence). */
+app.post("/api/sparks/:id/hermes/check", async (req, res) => {
+  try {
+    const spark = registry.getSpark(req.params.id);
+    if (!spark) return res.status(404).json({ error: "Spark not found" });
+    if (!spark.hermesMonitoring) {
+      return res.status(400).json({
+        error: "Hermes Agent monitoring is disabled for this Spark (enable it in Edit Spark)",
+      });
+    }
+    const monitor = monitors.get(req.params.id);
+    if (!monitor) return res.status(404).json({ error: "Spark not found" });
+    const result = await monitor.hermesProbe.check();
+    monitor.applyHermesCheck(result);
+    res.json({ success: true, hermes: monitor.snapshot().hermes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** One-click `hermes update` via SSH. Returns 202; progress via snapshot. */
+app.post("/api/sparks/:id/hermes/update", async (req, res) => {
+  try {
+    const spark = registry.getSpark(req.params.id);
+    if (!spark) return res.status(404).json({ error: "Spark not found" });
+    if (!spark.hermesMonitoring) {
+      return res.status(400).json({
+        error: "Hermes Agent monitoring is disabled for this Spark (enable it in Edit Spark)",
+      });
+    }
+    const monitor = monitors.get(req.params.id);
+    if (!monitor) return res.status(404).json({ error: "Spark not found" });
+    const result = await monitor.runHermesUpdate();
+    res.status(result.started ? 202 : 200).json({
+      success: result.started,
+      reason: result.reason,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Per-Spark Hermes update preview: the latest release (cached globally), the
+// installed version, the actual pending commits on this Spark (HEAD..origin/main)
+// and a resolved `view` so the dialog shows the commit list for minor /
+// no-bump updates and the full release changelog only when a real version bump
+// is pending.
+app.get("/api/sparks/:id/hermes/updates", async (req, res) => {
+  try {
+    const spark = registry.getSpark(req.params.id);
+    if (!spark) return res.status(404).json({ error: "Spark not found" });
+    if (!spark.hermesMonitoring) {
+      return res.status(400).json({
+        error: "Hermes Agent monitoring is disabled for this Spark (enable it in Edit Spark)",
+      });
+    }
+    const monitor = monitors.get(req.params.id);
+    if (!monitor) return res.status(404).json({ error: "Spark not found" });
+
+    const installedVersion = monitor.snapshot().hermes?.version || null;
+    const pending = await monitor.hermesProbe.pendingCommits();
+
+    let release = null;
+    let releaseError = null;
+    try {
+      release = await getLatestRelease();
+    } catch (err) {
+      releaseError = err instanceof Error ? err.message : String(err);
+    }
+
+    // Resolve which content the dialog should lead with. A version bump exists
+    // only when the latest tagged release is newer than what is installed;
+    // otherwise the pending update is commits on main and those are the honest
+    // changelog. Without both versions, fall back to the release when available.
+    const hasPending = Boolean(pending && pending.commits && pending.commits.length > 0);
+    const releaseNewer =
+      release?.semver && installedVersion && compareSemver(release.semver, installedVersion) > 0;
+    const view = releaseNewer ? "release" : hasPending ? "commits" : "release";
+
+    res.json({
+      success: true,
+      view,
+      release,
+      releaseError,
+      installedVersion,
+      pending,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -630,9 +755,30 @@ app.put("/api/sparks/:id/llm-ports/:port/api-key", (req, res) => {
 });
 
 /**
+ * Daily decode / prefill tok/s rollups (busy samples, last 14 UTC days by default).
+ * Query: port (required for multi-port), days (1–30).
+ */
+app.get("/api/sparks/:id/llm/daily", (req, res) => {
+  const spark = registry.getSpark(req.params.id);
+  if (!spark) return res.status(404).json({ error: "Spark not found" });
+  const ports =
+    Array.isArray(spark.llmPorts) && spark.llmPorts.length
+      ? spark.llmPorts
+      : [resolveLlmPort(spark)];
+  let port = req.query.port != null ? Number(req.query.port) : ports[0];
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return res.status(400).json({ error: "Invalid port" });
+  }
+  let days = req.query.days != null ? Number(req.query.days) : 14;
+  if (!Number.isFinite(days)) days = 14;
+  res.json(llmDaily.getSeries(spark.id, port, { days }));
+});
+
+/**
  * Decode throughput benchmark (streaming, post-first-token tok/s).
  *
- * POST body: { port?, concurrencies: number[], maxTokens? }
+ * POST body: { port?, concurrencies: number[], maxTokens?, promptType? }
+ * promptType is structured | prose | code | json (default structured).
  * Returns immediately with a bench job; poll GET for progress/results.
  */
 app.post("/api/sparks/:id/llm/bench", (req, res) => {
@@ -657,6 +803,9 @@ app.post("/api/sparks/:id/llm/bench", (req, res) => {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     return res.status(400).json({ error: "Invalid port" });
   }
+  if (!ports.includes(port)) {
+    return res.status(400).json({ error: "port is not configured for this Spark" });
+  }
 
   // Resolve model id for this port from live snapshot when possible
   let modelId = req.body?.modelId || null;
@@ -680,6 +829,7 @@ app.post("/api/sparks/:id/llm/bench", (req, res) => {
       modelId,
       concurrencies: req.body?.concurrencies,
       maxTokens: req.body?.maxTokens,
+      promptType: req.body?.promptType,
       debug: benchDebug,
       apiKey: resolveLlmApiKey(spark, port),
       sampleHardware:
@@ -1188,6 +1338,17 @@ function broadcastPayload(payload) {
   });
 }
 
+/**
+ * Force an immediate broadcast, ignoring the diff cache.
+ * Used after a user action (manual refresh / hermes check / update) so the
+ * UI reflects the result right away instead of on the next poll tick.
+ */
+function forceBroadcast() {
+  const payload = buildSnapshotPayload();
+  _lastBroadcastPayload = payload;
+  broadcastPayload(payload);
+}
+
 function startBroadcast() {
   const interval = getSettings().pollIntervalMs;
   broadcastTimer = setInterval(() => {
@@ -1216,6 +1377,15 @@ startBroadcast();
 server.listen(PORT, BIND_HOST, () => {
   console.log(`[sparkDash] server listening on http://${BIND_HOST}:${PORT}`);
   console.log(`[sparkDash] WebSocket endpoint ws://${BIND_HOST}:${PORT}/ws`);
+  const isLoopback =
+    BIND_HOST === "localhost" || BIND_HOST === "::1" || /^127\./.test(BIND_HOST);
+  if (isLoopback) {
+    console.log("[sparkDash] localhost-only; set BIND_HOST=0.0.0.0 (or a LAN IP) to allow remote access");
+  } else {
+    console.warn(
+      `[sparkDash] WARNING: bound to ${BIND_HOST} — reachable on the LAN. This dashboard is unauthenticated and can SSH into and power off your Sparks; restrict access at the network/firewall layer.`
+    );
+  }
   startAllMonitors();
 });
 
@@ -1225,6 +1395,20 @@ function shutdown(signal) {
   if (_shuttingDown) return;
   _shuttingDown = true;
   console.log(`[sparkDash] ${signal} received, shutting down…`);
+  try {
+    // Finalize in-flight benches before the process dies so clients polling
+    // GET /llm/bench/:id do not hit "Benchmark not found" after --watch reload.
+    decodeBenchManager.interruptAll(
+      "Interrupted — server restarted while the benchmark was running"
+    );
+  } catch (err) {
+    console.error("[sparkDash] failed to finalize benchmarks:", err.message);
+  }
+  try {
+    llmDaily.flush();
+  } catch (err) {
+    console.error("[sparkDash] failed to flush LLM daily history:", err.message);
+  }
   try {
     if (broadcastTimer) {
       clearInterval(broadcastTimer);

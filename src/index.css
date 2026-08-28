@@ -703,7 +703,7 @@ input[type="checkbox"] {
 
 /* ─── Online chip (overview welcome row) ──────────────── */
 .online-chip {
-  display: inline-flex;
+  display: none; /* hidden on mobile; shown at sm via media query below */
   align-items: center;
   gap: 6px;
   padding: 6px 16px;
@@ -714,6 +714,11 @@ input[type="checkbox"] {
   color: var(--color-muted-strong);
   box-shadow: var(--shadow-card);
   white-space: nowrap;
+}
+@media (min-width: 640px) {
+  .online-chip {
+    display: inline-flex;
+  }
 }
 .online-chip .dot {
   width: 7px;
@@ -977,6 +982,10 @@ input[type="checkbox"] {
     box-shadow: var(--shadow-shell);
   }
 }
+.modal-sheet--wide {
+  max-width: 40rem;
+}
+
 .modal-sheet__header {
   flex-shrink: 0;
   padding: 0.9rem 1.1rem 0.75rem;
@@ -1191,6 +1200,16 @@ input[type="checkbox"] {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 0.45rem;
+}
+.bench-type-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.45rem;
+}
+.bench-type-grid .bench-conc-btn {
+  font-variant-numeric: normal;
+  font-size: 0.75rem;
+  padding: 0 0.35rem;
 }
 .bench-conc-btn {
   min-height: 2.25rem;

@@ -7,6 +7,115 @@ Format: version sections are listed newest first.
 
 ---
 
+## [Unreleased]
+
+---
+
+## [1.8.5] — 2026-08-28
+
+### Fixed
+- **Decode type picker defaults to Structured** — opening the sheet (or loading a previous run) no longer leaves Prose/Code/JSON selected. A still-running job still shows its type.
+- **Code workload was prose-speed** — the LRU + "thorough comments" prompt is English with `def` sprinkled in, so DFlash2 accept matched Prose. Code is now `clamp_00`…`clamp_49` identical-shape Python helpers, no comments.
+
+---
+
+## [1.8.4] — 2026-08-28
+
+### Added
+- **Decode benchmark type picker** — choose **Structured** (default, count 1→200), **Prose** (lab hash-map explanation), **Code** (fixed LRU-cache Python prompt), or **JSON** (GPU-metrics catalog) before Run. Labels are output types only — no `response_format`, grammars, or guided JSON. Same lab protocol for every type: temp 0, `top_p` 1, thinking off, 32-token warmup, default 400 tokens. The selected type is shown on results and in copied summaries.
+
+---
+
+## [1.8.3] — 2026-08-28
+
+### Changed
+- **Decode benchmark uses the lab structured protocol** — count 1→200 (numbers only) instead of the Showcase JSON/YAML catalog + fill-to-max. Temperature **0**, `top_p` **1**, thinking **off**, 32-token warmup, default max tokens **400**. Concurrency 1 is the same prompt as glm-5.3-flash-sm120 `tests/bench_decode.py --structured`; concurrent streams get a unique suffix so they do not share a prefix-cache block.
+- **Thinking flags default off** — GLM / Qwen / MiniMax think unless the request disables it. `applyThinkingFlags` now defaults to off and always sends `enable_thinking`, `thinking`, and `thinking_mode`. HTTP 400 retries keep an explicit off payload instead of stripping flags (stripping lets hybrid models think by default). Showcase treats a missing thinking flag as off.
+
+---
+
+## [1.8.2] — 2026-08-23
+
+### Added
+- **EXL3 live tok/s** — detect ExLlamaV3 `tools/serve_openai.py` (`owned_by: exl3` or `/health` `{ok, busy}`) instead of mislabeling it as vLLM. Generation and prefill tok/s come from `/health` cumulative token counters (no Prometheus `/metrics`).
+- **Tailnet monitoring** — opt-in per unit (`tailscaleMonitoring`, default **off**); `tailscale status --json` on the host and a Tailnet card under Resources. Flags a unit that is healthy on the LAN but off its tailnet. ([#43](https://github.com/MiaAI-Lab/sparkDash/pull/43))
+
+### Security
+- **`BIND_HOST` now defaults to `127.0.0.1` (loopback) instead of `0.0.0.0`** — the dashboard is unauthenticated and can SSH into and power off Sparks, so it is no longer reachable on the LAN by default. Set `BIND_HOST` to the host's LAN IP (or `0.0.0.0`) to opt in to remote access. **Migration:** if you access sparkDash from another machine via bare-metal `npm start`, set `BIND_HOST` explicitly. Production and dev Compose both set `BIND_HOST=0.0.0.0` (`network_mode: host`). Startup now also warns when bound to a non-loopback address. ([#35](https://github.com/MiaAI-Lab/sparkDash/pull/35))
+
+### Fixed
+- Decode bench `POST /api/sparks/:id/llm/bench` rejects LLM ports that are not in the Spark's configured list (same allowlist as showcase). ([#45](https://github.com/MiaAI-Lab/sparkDash/pull/45))
+- **Host CPU temperature** — dedicated GPU hosts (`kind: host`) show CPU temp on the RAM panel and Overview (hidden at 0°C / no sensor). Remote hosts now read hwmon/thermal over SSH. DGX Sparks still do not display CPU temp (remote Sparks still skip the extra sensor SSH). ([#34](https://github.com/MiaAI-Lab/sparkDash/pull/34))
+
+### Changed
+- Docker Node base image pulls from `public.ecr.aws/docker/library/node` so Spark builds do not fail on Docker Hub IPv6 `auth.docker.io` / “network is unreachable”. `deploy.sh` prints that workaround if a build still fails.
+- README architecture diagram top border aligned with the box. ([#39](https://github.com/MiaAI-Lab/sparkDash/pull/39))
+
+---
+
+## [1.8.1] — 2026-08-16
+
+### Added
+- **Daily LLM tok/s history** — busy-sample rollups (peak + mean) for decode and prefill, persisted in `config/llm-daily.json` (30 UTC days). 14-day peak chart on the LLM card; `GET /api/sparks/:id/llm/daily`.
+- **Cached vs uncached prefill tok/s** — live rows when the backend splits kinds: ds4 labeled prefill counters, llama.cpp `/slots` `n_prompt_tokens_cache`, SGLang `sglang:cached_tokens_total` (L1 `cache_source="device"`). Combined Prefill stays computed/uncached. vLLM is unchanged (combined prefill + prefix-cache hit rate).
+
+### Changed
+- **Docker SSH key auth** — compose comments + README: key auth runs inside the container (`/root/.ssh`), not the host user’s `~/.ssh`. Custom-named keys must be mounted as `id_ed25519` (or set `SSH_IDENTITY_FILE`). LAN IPs are from the sparkDash host. Add/Edit Spark hint when auth is Key.
+
+### Fixed
+- SGLang `/metrics` no longer overwrites `/get_server_info` tok/s when both are present.
+- llama.cpp `n_prompt_tokens_processed: 0` is not treated as missing (fully cached prompts).
+
+---
+
+## [1.8.0] — 2026-08-15
+
+### Added
+- **Non-Spark unit support** (`kind: "host"`) — dedicated GPU hosts (any Linux box with an NVIDIA GPU, e.g. a workstation with an RTX card) are first-class units: added from the **+** button (choose **Dedicated GPU host**), monitored via SSH + `nvidia-smi` exactly like a Spark, but never labeled as a DGX Spark.
+- **Detected host hardware** — for `kind: "host"`, the header shows real hardware detected once when online (GPU model, CUDA driver, CPU model/cores, system RAM) instead of fixed GB10 specs.
+- **Separate system RAM vs discrete VRAM** — for host units, VRAM comes straight from `nvidia-smi` (`memory.used` / `memory.total`, free = total − used) while system RAM is read from `/proc/meminfo`. Spark behavior is unchanged (GB10 unified HBM pool).
+- **RAM panel + Overview RAM bar** — host unit pages get a dedicated RAM panel, and Overview cards show a RAM bar under VRAM for hosts.
+- **Host Resources layout** — host unit pages stack **RAM → Network → Storage** in the right column with **GPU** filling the left column (Sparks keep the original layout). CX7 IP is hidden for hosts (Spark-specific NIC).
+- **Prefill tok/s** (moved from Unreleased) — live LLM panel sparkline, Overview cards as two columns (**tok/s** | **prefill**), decode-bench **Prefill** column (`prompt_tokens` ÷ TTFT).
+- **Live prefill measurement** — vLLM uses engine-step `iteration_tokens_total` surplus over generation (so a short/cached prefill that lands in the same poll as the first decode tokens still counts); prompt/TTFT counters are the fallback because they often only move at first token. ds4 uses computed (not cached) prefill token diffs. Idle returns to 0. Opening a saved chat in the UI does not hit the GPU; prefill is the prompt/KV pass when you send or regenerate.
+
+### Changed
+- **Decode benchmark matches Showcase structural** — same prompt catalog and fill-to-max shaping (`min_tokens` / `ignore_eos` / fill suffix); no 4k unique prefill prefix. Temperature **0**, thinking **off** (Showcase defaults are temp 0.7 and thinking off). Default max tokens 512.
+- **Update Hermes button is now a permanent, neutral control** — no more toast notifications for Hermes updates. It turns warning-yellow and shows a commit-count badge **only when an update is actually available**; clicking it opens the update dialog (status / pending commits / release notes) as before.
+- **Overview "Update Hermes" button** (formerly "Update All") follows the same rule — neutral by default, warning-yellow with a pending-count badge only when ≥1 monitored Spark has an update available. Pressing it now shows a **live progress bar** (x/y Sparks settled, driven by WS per-Spark update status) until every started update finishes.
+
+### Fixed
+- **Decode benchmark "Benchmark not found" mid-run** — running jobs lived only in memory, so a `node --watch` / SIGTERM reload dropped them and the dialog poll hit 404. Active benches are now checkpointed to `config/bench-active.json`, finalized on shutdown, and recovered as interrupted on boot; the dialog also recovers via the list endpoint instead of showing a bare 404.
+
+### Removed
+- **Toast system** (`useToasts.ts`, `useHermesAlerts.ts`, `components/ui/Toaster.tsx`) — Hermes notifications now live entirely on the header button instead of pop-up toasts.
+
+---
+
+## [1.7.0] — 2026-08-08
+
+### Added
+- **Hermes Agent service per Spark** — opt-in `hermesMonitoring` toggle in Edit Spark; when on, sparkDash treats the Hermes Agent CLI (nousresearch/hermes-agent) as installed on that machine
+- **Update notifications** — background `hermes update --check` poll (10 min) per monitored Spark; a toast alerts when an update is available
+- **One-click update** — `Update Hermes` button in the Spark header and in the update alert toast; runs `hermes update` over SSH (non-interactive), with running/success/error state streamed over WS
+- **Hermes status in snapshot** — installed / version / updateAvailable / behindCommits / checkedAt / job status per Spark (`snapshot.hermes`)
+- **Toast system** — minimal built-in toast store + Toaster component (no new dependency), reused for Hermes alerts
+- **Update confirmation dialog with real content** — clicking Update Hermes (header button or alert toast) opens a modal with **Update now** / **Cancel**. When the update is only commits on `main` (no newer tagged release than what is installed), it shows the **actual pending commits** from git (`HEAD..origin/main`) instead of the latest-release changelog — the full release changelog is shown only when a real version bump exists
+- **`GET /api/sparks/:id/hermes/updates`** — update preview: latest release (cached) + installed version + **real pending commits** from git on the Spark + a resolved view; the old `/api/hermes/releases/latest` is superseded
+- **Update All** — `POST /api/sparks/hermes/update-all` + Overview button runs `hermes update` on every Spark with Hermes Agent enabled (per-spark start/skip/fail summary; per-spark progress still streamed over WS)
+- **`POST /api/sparks/:id/hermes/check`** (force check now) and **`POST /api/sparks/:id/hermes/update`** (background job, 202)
+
+### Changed
+- `hermesMonitoring` normalized in Spark config; server boots HermesProbe only when enabled (all roles, local + remote)
+- Toast stack renders above modals at `z-index: 10000`
+
+### Fixed
+- **Local Spark Hermes runs as the wrong user (root), corrupting the install** — hermes + its git repo belong to the host user, but the local path executed hermes as the container root. That produced git "dubious ownership" failures and, once worked around, wrote root-owned files into the user's tree (tools/*.py, uv.lock, …) and ran `uv pip install` as root — which failed and left `venv/bin/hermes` missing, breaking the `hermes` CLI entirely. The local path now resolves the host user from the host passwd bind mount and drops to that user via `setpriv` (`nsenter` + host mount ns so host git is visible), with a self-healing root-owned-file repair step. Remote SSH already ran as the real user.
+- **Broken launcher detection + auto-repair** — when the `hermes` launcher exists but cannot execute (e.g. missing venv entry point), sparkDash now reports "broken install" instead of a false "no update" and the one-click update automatically rebuilds the venv entry point (`uv pip install -e .`), then retries.
+- **Stale git lock bricks later updates** — an interrupted `hermes update` can leave `.git/shallow.lock` (or any `*.lock`) behind, making every later fetch fail; leftover `*.lock` files are cleared before each check/update.
+
+---
+
 ## [1.6.0] — 2026-08-07
 
 ### Added

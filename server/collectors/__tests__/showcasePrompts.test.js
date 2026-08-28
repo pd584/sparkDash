@@ -18,10 +18,18 @@ const managerSrc = readFileSync(
   "utf8"
 );
 const promptsSrc = readFileSync(
+  path.join(__dirname, "../../../src/shared/llmPrompts.js"),
+  "utf8"
+);
+const showcaseUiSrc = readFileSync(
   path.join(
     __dirname,
     "../../../src/components/ShowcasePage/showcasePrompts.ts"
   ),
+  "utf8"
+);
+const benchSrc = readFileSync(
+  path.join(__dirname, "../DecodeBench.js"),
   "utf8"
 );
 
@@ -78,6 +86,17 @@ test("catalog prompts exist for text, structural, and mixed pickers", () => {
   assert.match(promptsSrc, /export const TEXT_PROMPTS/);
   assert.match(promptsSrc, /export const STRUCTURAL_PROMPTS/);
   assert.match(promptsSrc, /export function pickShowcasePrompts/);
+  assert.match(showcaseUiSrc, /from \"\.\.\/\.\.\/shared\/llmPrompts\.js\"/);
   const textCount = (promptsSrc.match(/TEXT_PROMPTS/g) || []).length;
   assert.ok(textCount >= 2);
+});
+
+test("DecodeBench uses Showcase structural prompts at temperature 0, thinking off", () => {
+  assert.match(benchSrc, /pickShowcasePrompts\("structural"/);
+  assert.match(benchSrc, /withFillToMaxInstruction/);
+  assert.match(benchSrc, /temperature:\s*0/);
+  assert.match(benchSrc, /applyThinkingFlags\(body,\s*modelId,\s*false\)/);
+  assert.match(benchSrc, /min_tokens:\s*maxTokens/);
+  assert.doesNotMatch(benchSrc, /uniquePrefillPrefix/);
+  assert.doesNotMatch(benchSrc, /BENCH_PROMPTS/);
 });

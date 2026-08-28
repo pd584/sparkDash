@@ -13,6 +13,8 @@
 
 sparkDash is a real-time web dashboard for one or more **NVIDIA DGX Spark (GB10)** machines in a single browser window. It streams GPU, CPU, unified memory, storage, network, and local LLM metrics — and lets you add, edit, reorder, or remove Sparks from the UI without restarts or code changes.
 
+It also supports **non-Spark units**: any Linux machine with an NVIDIA GPU (e.g. a workstation with a dedicated RTX/L-series card) can be added as a **dedicated GPU host** and monitored the same way via SSH and `nvidia-smi`. For these units the dashboard correctly separates **RAM** (system memory) from **VRAM** (discrete GPU memory).
+
 <img src="./assets/screenshot.jpg" alt="sparkDash Overview page with multiple DGX Spark units, GPU metrics, and LLM status">
 
 ### LLM Prompt Showcase
@@ -30,6 +32,8 @@ sparkDash is a real-time web dashboard for one or more **NVIDIA DGX Spark (GB10)
 - [Latest version changelog](#latest-version-changelog)
 - [Features](#features)
 - [ComfyUI monitoring](#comfyui-monitoring)
+- [Hermes Agent monitoring](#hermes-agent-monitoring)
+- [Tailnet monitoring](#tailnet-monitoring)
 - [Full changelog](./CHANGELOG.md)
 - [Quick start](#quick-start)
 - [Architecture](#architecture)
@@ -47,11 +51,9 @@ sparkDash is a real-time web dashboard for one or more **NVIDIA DGX Spark (GB10)
 
 ## Latest version changelog
 
-### Version 1.6.0 — ComfyUI monitoring & compact default
-- **ComfyUI** — opt-in per Spark (port 8188): live jobs, progress, last run, cancel, queue ETA, Open on LAN IP, model inventory
-- **Overview** — Comfy status chip (`idle` / `run` / `Nq`)
-- **Layout** — collapsible Resources / Services; LLM + Comfy side-by-side; multi-LLM row rules
-- **Compact UI** — default density (comfortable still in Settings)
+### Version 1.8.5 — decode Structured default + code prompt
+- **Decode picker defaults to Structured** even after a Prose/Code/JSON run. A live running job still shows its type.
+- **Code type** is `clamp_00`…`clamp_49` Python helpers (no comments). The old LRU + comments prompt was prose-speed.
 
 Full history: [CHANGELOG.md](./CHANGELOG.md)
 
@@ -61,12 +63,15 @@ Full history: [CHANGELOG.md](./CHANGELOG.md)
 
 | Area | What you get |
 |------|----------------|
-| **Multi-unit** | Any number of Sparks; each has a tabbed detail page plus a shared Overview |
+| **Multi-unit** | Any number of units; each has a tabbed detail page plus a shared Overview |
+| **Non-Spark GPU hosts** | Linux boxes with a dedicated NVIDIA GPU are first-class units: same `nvidia-smi` collectors over SSH, detected hardware summary, and separate **RAM** / **VRAM** panels. Detail page: GPU (left) + **RAM → Network → Storage** (right column); Overview cards show RAM and VRAM bars |
 | **Live streaming** | WebSocket metrics with configurable poll intervals; central history store for sparklines across tab switches |
 | **Local + remote** | Host metrics via sysfs/proc/`nvidia-smi`; remotes over SSH (key or password) |
-| **LLM probe** | Auto-detects llama.cpp, vLLM, sglang, or ds4-server; live tok/s per server |
+| **LLM probe** | Auto-detects llama.cpp, vLLM, sglang, ds4-server, or EXL3; live decode/prefill tok/s; cached vs uncached prefill on ds4, llama.cpp, and SGLang; **daily peak** history on the LLM card |
 | **ComfyUI** | Opt-in probe: queue/jobs, progress, cancel, Open link, inventory, overview chip |
-| **Decode benchmark** | Multi-concurrency streaming decode tok/s (server + per-stream), persisted last run |
+| **Hermes Agent** | Opt-in per unit: background update check (10 min), status badges, one-click or batch `hermes update` |
+| **Tailnet** | Opt-in probe: flags a unit that is healthy on the LAN but off its tailnet |
+| **Decode benchmark** | Multi-concurrency streaming decode tok/s; type picker (Structured / Prose / Code / JSON); lab protocol (temp 0, thinking off); persisted last run |
 | **Prompt Showcase** | Full-page multi-terminal LLM streaming demo (up to 32 prompts) with live tok/s and copy-out |
 | **vLLM health** | KV cache %, run/wait queue, TTFT/E2E/ITL p95, preemptions, prefix cache, MTP accept from Prometheus `/metrics` |
 | **Multiple LLM ports** | Monitor several LLM servers on different ports simultaneously — each gets its own panel with independent backend detection and metrics |
@@ -74,7 +79,7 @@ Full history: [CHANGELOG.md](./CHANGELOG.md)
 | **Spark uptime** | System uptime displayed inline on each Spark header for at-a-glance availability |
 | **Power controls** | Graceful shutdown (SSH host script) and Wake-on-LAN; batch actions on Overview |
 | **Spark roles** | **Head** / **Worker** / **Standalone** — worker label + head link; standalone can disable LLM monitoring |
-| **Unified memory** | GB10 128 GB LPDDR5X pool (~273 GB/s), GPU/CPU split, bandwidth via `nvidia-smi dmon` |
+| **Unified memory** | GB10 128 GB LPDDR5X pool (~273 GB/s), GPU/CPU split, bandwidth via `nvidia-smi dmon`. Non-Spark hosts show discrete **VRAM** (nvidia-smi) and system **RAM** separately |
 | **Themes** | Dark, light, cool white, OLED — neutral palettes, persisted in `localStorage` |
 | **Secrets** | SSH passwords AES-256-GCM encrypted; never in `sparks.json` or API responses |
 | **Docker-first** | Single privileged container for host metrics; prod and dev Compose files |
@@ -140,6 +145,93 @@ Env (optional): `COMFY_PORT` (default `8188`), `COMFY_PROBE_TIMEOUT_MS`, `POLL_I
 
 ---
 
+## Hermes Agent monitoring
+
+sparkDash can **optionally** monitor [Hermes Agent](https://github.com/nousresearch/hermes-agent) (nousresearch/hermes-agent) on each unit and run one-click updates for you over SSH.
+
+### What is supported
+
+| Capability | Details |
+|------------|---------|
+| **Opt-in per Spark** | `hermesMonitoring` (default **off**) in **Edit Spark** |
+| **Auto update check** | Background `hermes update --check` over SSH (default every 10 min) — returns update availability + pending commits |
+| **Status badges** | In the Spark header: `Hermes` (installed version), `Hermes not found` if the binary is missing |
+| **One-click update** | **Update Hermes** button opens a dialog with live status, real pending commits, and release notes; **Update now** runs `hermes update` via SSH (non-interactive go) |
+| **Update state** | Running / success / error surfaced live (button turns into a “Hermes updating… / failed” state) |
+| **Batch update** | **Update Hermes** on Overview runs `hermes update` on every monitored unit, with a live per-unit progress bar |
+
+### How to enable (per Spark)
+
+1. Open the Spark tab → **Edit** (pencil).
+2. Enable **Hermes Agent**.
+3. **Save** — background checks start immediately.
+
+The **Update Hermes** button appears in the Spark header/mobile action row; it turns warning-yellow with a commit-count badge only when an update is actually available. It also appears on Overview (batch) when at least one unit has Hermes enabled.
+
+**Connectivity check note:** local units run the check as the **host user** (via `setpriv`/`nsenter`, never as container root); remote units run it over SSH. Either way, the logged-in user needs permission to read the Hermes repo.
+
+### Side requirements
+
+- **Hermes Agent must be installed on the target machine** — sparkDash only checks & updates; it does not install it. The binary is looked up in `~/.local/bin` and `/usr/local/bin`.
+- SSH user must be able to run `hermes update --check` / `hermes update` non-interactively (key auth recommended).
+- An update can take a few minutes (repo pull + dependency reinstall); a stale `*.lock` file from a crashed run is cleared before each attempt.
+
+### Config fields (persisted on the Spark)
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `hermesMonitoring` | `false` | Check/update Hermes Agent on this machine |
+
+### Related API
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/sparks/hermes/update-all` | Batch `hermes update` on every monitored Spark (Overview button) |
+| POST | `/api/sparks/:id/hermes/check` | Force `hermes update --check` now |
+| POST | `/api/sparks/:id/hermes/update` | Run `hermes update` in the background (202) |
+| GET | `/api/sparks/:id/hermes/updates` | Update preview: latest release + installed version + real pending commits + resolved view |
+
+Env (optional): `POLL_INTERVAL_HERMES` (default `600000` ms), `HERMES_UPDATE_TIMEOUT_MS` (default `600000` ms).
+
+---
+
+## Tailnet monitoring
+
+Opt-in per unit (default **off**). Runs `tailscale status --json` on the host and shows a **Tailnet** card under Resources.
+
+This closes a blind spot every LAN-based check shares, including sparkDash's own SSH liveness. When `tailscaled` loses its session with the coordination server, SSH/GPU/LLM can all stay healthy while the box is unreachable from off-LAN.
+
+### What is supported
+
+| Capability | Details |
+|------------|---------|
+| **Opt-in per unit** | `tailscaleMonitoring` (default **off**) in **Edit Spark** |
+| **Off-tailnet detection** | `Self.Online` — the node's *own* view of the coordination server |
+| **Reason, not just state** | Tailscale `Health` messages, backend state, tailnet IP, DERP relay, version, expired-key warning |
+
+Asked of **each node about itself**. Peer state is never the verdict. The probe is read-only (`tailscale up` / `down` / `login` are never run).
+
+### How to enable
+
+1. Open **Edit Spark**.
+2. Tick **Tailnet monitoring**.
+3. Save. The Tailnet card appears under Resources.
+
+### Host requirements
+
+- `tailscale` CLI on the monitored host, and `tailscaled` running.
+- Remote units: existing SSH. Local Docker: `nsenter` into the host mount namespace (same as `nvidia-smi`; `/host/proc` is already bind-mounted).
+
+### Config fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `tailscaleMonitoring` | `false` | Run `tailscale status --json` and show the Tailnet card |
+
+Env (optional): `POLL_INTERVAL_TAILSCALE` (default `30000`), `TAILSCALE_PROBE_TIMEOUT_MS` (default `8000`).
+
+---
+
 ## Quick start
 
 ```bash
@@ -162,14 +254,22 @@ For development with Docker (source-mounted, HMR):
 docker compose -f docker-compose.dev.yml up --build
 ```
 
+**Remote units + SSH keys (Docker):** SSH is executed *inside* the container on the sparkDash host (typically the head DGX). Configured LAN IPs are from **that** host’s point of view, not your laptop. OpenSSH looks for keys under `/root/.ssh` in the container — the host user’s `~/.ssh` is not used unless you bind-mount it. Uncomment this volume in `docker-compose.yml` (and recreate the container):
+
+```yaml
+- ${HOME}/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro
+```
+
+If the key file has a non-default name (e.g. `id_ed25519_shared`), mount it **as** `id_ed25519`, or set `SSH_IDENTITY_FILE` to the path inside the container. Keep the file mode `600`. The unit that runs sparkDash itself should be added with **This host (local collectors — no SSH for metrics)**.
+
 ---
 
 ## Architecture
 
-Design principle: **one Spark model, N instances**. Every Spark is a record in `config/sparks.json`. The same `SparkMonitor`, `SystemCollector`, and `LlmProbe` code runs for all of them. Adding a unit is a config change, not a code change.
+Design principle: **one Spark model, N instances**. Every unit is a record in `config/sparks.json` with a `kind` field (`spark` or `host`). The same `SparkMonitor`, `SystemCollector`, and `LlmProbe` code runs for all of them. Adding a unit is a config change, not a code change.
 
 ```txt
-┌────────────────────── Docker container (sparkDash) ──────────────────────┐
+┌────────────────────── Docker container (sparkDash) ────────────────────────┐
 │  Express (server/)                                                         │
 │  ├─ config/sparks.json        Spark registry (API read/write)              │
 │  ├─ SparkRegistry             load/persist Sparks; change events           │
@@ -253,6 +353,7 @@ sparkDash/
 | POST | `/api/sparks/:id/llm-ports` | Add an LLM port (hot) |
 | DELETE | `/api/sparks/:id/llm-ports/:port` | Remove an LLM port (hot) |
 | PUT | `/api/sparks/:id/llm-port` | LLM port — backward-compat (hot) |
+| GET | `/api/sparks/:id/llm/daily` | Daily busy decode/prefill tok/s (`port`, `days`) |
 | GET | `/api/settings` | Global settings |
 | PUT | `/api/settings` | Update global settings |
 | WS | `/ws` | Real-time metrics stream |
@@ -280,7 +381,7 @@ Copy `.env.example` to `.env` if needed:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BIND_HOST` | `0.0.0.0` | HTTP and WebSocket listen address |
+| `BIND_HOST` | `127.0.0.1` | HTTP and WebSocket listen address. Loopback by default — the dashboard exposes SSH + power controls, so set a LAN IP (or `0.0.0.0`) to allow remote access. |
 | `PORT` | `5555` | HTTP + WebSocket listen port |
 | `LLM_PORT` | `8888` | Default LLM probe port |
 | `COMFY_PORT` | `8188` | Default ComfyUI probe port |
@@ -291,21 +392,32 @@ Copy `.env.example` to `.env` if needed:
 | `POLL_INTERVAL_STORAGE` | `5000` | Storage poll (ms) |
 | `POLL_INTERVAL_LLM` | `2000` | LLM probe poll (ms) |
 | `POLL_INTERVAL_BANDWIDTH` | `2000` | Memory bandwidth / dmon poll (ms) |
+| `POLL_INTERVAL_HERMES` | `600000` | Hermes Agent update check poll (ms) |
+| `POLL_INTERVAL_TAILSCALE` | `30000` | Tailnet probe poll (ms) |
+| `TAILSCALE_PROBE_TIMEOUT_MS` | `8000` | Timeout for `tailscale status --json` (ms) |
+| `HERMES_UPDATE_TIMEOUT_MS` | `600000` | Hard timeout for running `hermes update` over SSH (ms) |
 | `POLL_INTERVAL_LIVENESS` | `5000` | Online/SSH liveness check (ms) |
 | `SPARKDASH_SECRETS_KEY` | _(auto)_ | Passphrase or 64-char hex for secret encryption |
 | `HOST_PROC_PATH` | `/host/proc` | Host proc mount inside container |
 | `HOST_SYS_PATH` | `/host/sys` | Host sys mount |
 | `HOST_ROOT_PATH` | `/host/root` | Host root mount |
+| `SSH_IDENTITY_FILE` | _(unset)_ | Path **inside the process** to a private key (`ssh -i`). Use when the bind-mount is not a default OpenSSH name. |
 
-> When using Docker's default bridge network, keep `BIND_HOST=0.0.0.0`.  
-> With `network_mode: host`, use `BIND_HOST=127.0.0.1` to restrict access to the local host or a reverse proxy.
+> The listener defaults to `127.0.0.1` (loopback) so the dashboard — which can SSH into and
+> power off your Sparks — isn't reachable on the LAN by default. Set `BIND_HOST` to the host's
+> LAN IP (or `0.0.0.0`) to reach it from another machine. The provided `docker-compose.yml`
+> (`network_mode: host`) sets `BIND_HOST=0.0.0.0` explicitly (prod and `docker-compose.dev.yml`); restrict access at the network
+> layer, or set `127.0.0.1` when running behind a reverse proxy.
 
-### Adding a Spark
+### Adding a unit
 
 1. Open the **+** tab.
-2. Set **Name**, **LAN IP** (required), optional **CX7 IP**, **SSH user**, and auth (key or password). Wake-on-LAN MAC is auto-read from **enP7s7** when online (optional override in Edit).
-3. **Test Connection** for SSH + LLM reachability.
-4. Save — a tab appears and metrics start streaming.
+2. Choose **Unit type**:
+   - **NVIDIA DGX Spark** — the default; hardware summary shows DGX Spark specs and the CX7 IP field is available.
+   - **Dedicated GPU host** — any Linux machine with an NVIDIA GPU. It is monitored exactly like a Spark (SSH + `nvidia-smi`) but is **not** reported as a DGX Spark: the header shows a detected hardware summary (GPU model, CPU, RAM) instead of fixed GB10 specs, and the page shows separate **RAM** and **VRAM** panels (VRAM from `nvidia-smi`, RAM from system memory). On the unit page, RAM → Network → Storage stack in the right column with GPU filling the left column.
+3. Set **Name**, **LAN IP** (required), optional **CX7 IP** (Sparks only), **SSH user**, and auth (key or password). LAN IP is probed from the sparkDash host. Key auth in Docker needs a key mounted into the container (see Quick start). Wake-on-LAN MAC is auto-read from **enP7s7** when online (optional override in Edit).
+4. **Test Connection** for SSH + LLM reachability.
+5. Save — a tab appears and metrics start streaming.
 
 ### Power controls (shutdown / Wake-on-LAN)
 
@@ -338,7 +450,7 @@ Choice is stored in `localStorage`.
 - Encryption key: `config/.secrets-key` (auto-generated) or `SPARKDASH_SECRETS_KEY`. **Do not delete the key file** or encrypted secrets become unreadable.
 - **Target validation** rejects clearly unsafe IPv4 targets (link-local `169.254.0.0/16`, `0.0.0.0/8`, multicast/reserved ≥ 224). Private, loopback, and public addresses are allowed so LAN and remote Sparks work.
 - SSH and HTTP probes use short timeouts (about 5 s SSH connect, 3 s HTTP) so a hung host cannot stall the poll loop.
-- Prefer **SSH keys** over passwords.
+- Prefer **SSH keys** over passwords. In Docker, mount the private key into `/root/.ssh` (see Quick start); passwords are the only SSH secret the app stores itself.
 - Treat the dashboard as **LAN-trusted**: the API is intentionally unauthenticated for ease of use on a private network. That includes **power APIs** (shutdown / Wake-on-LAN): anyone who can reach the dashboard can request fleet power actions.
 
 
@@ -367,7 +479,7 @@ Choice is stored in `localStorage`.
 
 ### Local vs remote Sparks
 
-One `SystemCollector` path for both modes. When `spark.isLocal` is true, metrics come from host sysfs/proc and `nvidia-smi` (often via nsenter into the host namespace). Remote Sparks wrap the same commands in a shared `sshExec()` helper (key agent or `sshpass`).
+One `SystemCollector` path for both modes. When `spark.isLocal` is true, metrics come from host sysfs/proc and `nvidia-smi` (often via nsenter into the host namespace). Remote Sparks wrap the same commands in a shared `sshExec()` helper (key agent or `sshpass`). For `kind: "host"` units, actual hardware (GPU model, driver version, CPU, RAM) is detected once and cached in place of the static DGX Spark specs, and GPU VRAM comes straight from `nvidia-smi` while system RAM is read from `/proc/meminfo`.
 
 ### Graceful degradation
 

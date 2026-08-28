@@ -1,7 +1,7 @@
 {
   "name": "sparkdash",
-  "version": "1.6.0",
-  "description": "sparkDash — Multi-DGX Spark Monitoring Dashboard",
+  "version": "1.8.5",
+  "description": "sparkDash \u2014 Multi-DGX Spark Monitoring Dashboard",
   "type": "module",
   "scripts": {
     "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",

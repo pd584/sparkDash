@@ -3,6 +3,9 @@ import path from "path";
 import { SystemCollector } from "../collectors/SystemCollector.js";
 import { LlmProbe } from "../collectors/LlmProbe.js";
 import { ComfyProbe } from "../collectors/ComfyProbe.js";
+import { HermesProbe } from "../collectors/HermesProbe.js";
+import { TailscaleProbe } from "../collectors/TailscaleProbe.js";
+import { llmDaily } from "../collectors/LlmDaily.js";
 import { sshTest, sshExec } from "../collectors/ssh.js";
 import {
   POLL_INTERVAL_GPU,
@@ -13,6 +16,8 @@ import {
   POLL_INTERVAL_COMFY,
   POLL_INTERVAL_BANDWIDTH,
   POLL_INTERVAL_LIVENESS,
+  POLL_INTERVAL_HERMES,
+  POLL_INTERVAL_TAILSCALE,
   LLM_PORT,
   COMFY_PORT,
   HOST_PATHS,
@@ -32,6 +37,8 @@ export class SparkMonitor {
   constructor(spark, options = {}) {
     this.spark = spark;
     this._onWolMac = typeof options.onWolMac === "function" ? options.onWolMac : null;
+    this._onHermesChange =
+      typeof options.onHermesChange === "function" ? options.onHermesChange : null;
     this.collector = new SystemCollector(spark);
 
     // One LlmProbe per port — none when LLM monitoring is off
@@ -46,6 +53,31 @@ export class SparkMonitor {
     this.comfyProbe = this._comfyMonitoringEnabled(spark)
       ? new ComfyProbe(spark, this._comfyPort(spark))
       : null;
+
+    /** @type {TailscaleProbe | null} */
+    this.tailscaleProbe = this._tailscaleMonitoringEnabled(spark)
+      ? new TailscaleProbe(spark)
+      : null;
+
+    /** @type {HermesProbe | null} */
+    this.hermesProbe = this._hermesMonitoringEnabled(spark)
+      ? new HermesProbe(spark)
+      : null;
+    // Hermes status is surfaced in the snapshot (not under `metrics`) and is
+    // always present so the UI never has to special-case a missing field.
+    this._hermes = {
+      monitoring: this._hermesMonitoringEnabled(spark),
+      installed: null,
+      version: null,
+      updateAvailable: null,
+      behindCommits: null,
+      checkedAt: null,
+      // idle | running | success | error
+      status: "idle",
+      startedAt: null,
+      finishedAt: null,
+      error: null,
+    };
 
     // Online status from dedicated liveness checks (not metric poll success)
     this.online = false;
@@ -64,8 +96,24 @@ export class SparkMonitor {
       unifiedMemory: this.collector._defaultUnifiedMemory(),
       llm: [],
       comfy: null,
+      tailscale: null,
     };
     this._lastUpdate = {};
+
+    // Hardware summary: kind "spark" uses the static DGX Spark specs; kind
+    // "host" (dedicated GPU Linux box) detects real hardware once in the
+    // background so the header doesn't mislabel the machine as a Spark.
+    this._hardwareSummary = this._staticHardwareSummary(spark);
+    this._stopped = false;
+    if (spark?.kind === "host") {
+      void this.collector
+        .detectHardware()
+        .then((detected) => {
+          if (this._stopped || !detected) return;
+          this._hardwareSummary = { ...this._hardwareSummary, ...detected };
+        })
+        .catch(() => {});
+    }
 
     // Timers
     this._intervals = [];
@@ -73,6 +121,10 @@ export class SparkMonitor {
     this._llmIntervalId = null;
     /** @type {ReturnType<typeof setInterval> | null} */
     this._comfyIntervalId = null;
+    /** @type {ReturnType<typeof setInterval> | null} */
+    this._hermesIntervalId = null;
+    /** @type {ReturnType<typeof setInterval> | null} */
+    this._tailscaleIntervalId = null;
     this._running = false;
     /** @type {Record<string, boolean>} in-flight domain guards */
     this._inflight = {};
@@ -83,6 +135,8 @@ export class SparkMonitor {
     const wasLlm = this._llmMonitoringEnabled(this.spark);
     const wasComfy = this._comfyMonitoringEnabled(this.spark);
     const prevComfyPort = this._comfyPort(this.spark);
+    const wasHermes = this._hermesMonitoringEnabled(this.spark);
+    const wasTailscale = this._tailscaleMonitoringEnabled(this.spark);
     this.spark = spark;
     this.collector.spark = spark;
 
@@ -123,6 +177,34 @@ export class SparkMonitor {
       this._metrics.comfy = null;
     }
 
+    // Tailscale probe — create / update / clear
+    if (this._tailscaleMonitoringEnabled()) {
+      if (this.tailscaleProbe) {
+        this.tailscaleProbe.setTarget(spark);
+      } else {
+        this.tailscaleProbe = new TailscaleProbe(spark);
+      }
+    } else {
+      this.tailscaleProbe = null;
+      this._metrics.tailscale = null;
+    }
+
+    // Hermes probe — create / update / clear
+    if (this._hermesMonitoringEnabled()) {
+      if (this.hermesProbe) {
+        this.hermesProbe.setTarget(spark);
+      } else {
+        this.hermesProbe = new HermesProbe(spark);
+      }
+    } else {
+      this.hermesProbe = null;
+      this._hermes.status = "idle";
+    }
+    this._hermes.monitoring = this._hermesMonitoringEnabled();
+    if (this._running && wasHermes !== this._hermesMonitoringEnabled()) {
+      this._restartHermesPollInterval();
+    }
+
     // Toggle LLM poll interval when monitoring enablement flips
     if (this._running && wasLlm !== this._llmMonitoringEnabled()) {
       this._restartLlmPollInterval();
@@ -131,6 +213,9 @@ export class SparkMonitor {
     const comfyPortChanged = comfyOn && prevComfyPort !== this._comfyPort();
     if (this._running && (wasComfy !== comfyOn || comfyPortChanged)) {
       this._restartComfyPollInterval();
+    }
+    if (this._running && wasTailscale !== this._tailscaleMonitoringEnabled()) {
+      this._restartTailscalePollInterval();
     }
   }
 
@@ -188,6 +273,56 @@ export class SparkMonitor {
     }
   }
 
+  /**
+   * Opt-in tailnet monitoring (all roles; default off).
+   * @param {object} [spark]
+   */
+  _tailscaleMonitoringEnabled(spark = this.spark) {
+    return Boolean(spark?.tailscaleMonitoring);
+  }
+
+  /** Start or clear the tailnet poll timer based on monitoring flag. */
+  _restartTailscalePollInterval() {
+    if (this._tailscaleIntervalId != null) {
+      clearInterval(this._tailscaleIntervalId);
+      this._intervals = this._intervals.filter((id) => id !== this._tailscaleIntervalId);
+      this._tailscaleIntervalId = null;
+    }
+    if (this._tailscaleMonitoringEnabled() && this._running) {
+      this._tailscaleIntervalId = setInterval(
+        () => this._pollDomain("tailscale"),
+        POLL_INTERVAL_TAILSCALE
+      );
+      this._intervals.push(this._tailscaleIntervalId);
+      void this._pollDomain("tailscale");
+    }
+  }
+
+  /**
+   * Opt-in Hermes Agent monitoring (all roles; default off).
+   * @param {object} [spark]
+   */
+  _hermesMonitoringEnabled(spark = this.spark) {
+    return Boolean(spark?.hermesMonitoring);
+  }
+
+  /** Start or clear the Hermes update-check timer when monitoring flips. */
+  _restartHermesPollInterval() {
+    if (this._hermesIntervalId != null) {
+      clearInterval(this._hermesIntervalId);
+      this._intervals = this._intervals.filter((id) => id !== this._hermesIntervalId);
+      this._hermesIntervalId = null;
+    }
+    if (this._hermesMonitoringEnabled() && this._running) {
+      this._hermesIntervalId = setInterval(
+        () => this._pollDomain("hermes"),
+        POLL_INTERVAL_HERMES
+      );
+      this._intervals.push(this._hermesIntervalId);
+      void this._pollDomain("hermes");
+    }
+  }
+
   /** Returns array of LLM ports from spark config. */
   _llmPorts() {
     const raw = this.spark?.llmPorts;
@@ -207,6 +342,7 @@ export class SparkMonitor {
   start() {
     if (this._running) return;
     this._running = true;
+    this._stopped = false;
     this._poll();
     this._intervals.push(setInterval(() => this._pollDomain("gpu"), POLL_INTERVAL_GPU));
     this._intervals.push(setInterval(() => this._pollDomain("cpu"), POLL_INTERVAL_CPU));
@@ -216,6 +352,8 @@ export class SparkMonitor {
     this._intervals.push(setInterval(() => this._pollDomain("memory"), POLL_INTERVAL_BANDWIDTH));
     this._restartLlmPollInterval();
     this._restartComfyPollInterval();
+    this._restartHermesPollInterval();
+    this._restartTailscalePollInterval();
     // Liveness on a slightly slower cadence
     this._intervals.push(setInterval(() => this._checkOnline(), POLL_INTERVAL_LIVENESS));
     console.log(`[SparkMonitor] ${this.spark.id} started`);
@@ -224,10 +362,13 @@ export class SparkMonitor {
   /** Stop background polling. */
   stop() {
     this._running = false;
+    this._stopped = true;
     for (const id of this._intervals) clearInterval(id);
     this._intervals = [];
     this._llmIntervalId = null;
     this._comfyIntervalId = null;
+    this._hermesIntervalId = null;
+    this._tailscaleIntervalId = null;
     this._inflight = {};
     if (this.comfyProbe) {
       try {
@@ -243,9 +384,11 @@ export class SparkMonitor {
   snapshot() {
     const ports = this._llmMonitoringEnabled() ? this._llmPorts() : [];
     const comfyOn = this._comfyMonitoringEnabled();
+    const tailscaleOn = this._tailscaleMonitoringEnabled();
     return {
       id: this.spark.id,
       name: this.spark.name,
+      kind: this.spark.kind || "spark",
       online: this.online,
       uptime: this._uptimeSeconds,
       lanIp: this.spark.lanIp || "",
@@ -267,7 +410,9 @@ export class SparkMonitor {
             .filter((n) => Number.isInteger(n)),
       comfyMonitoring: comfyOn,
       comfyPort: this._comfyPort(),
-      hardware: this._getHardwareSummary(),
+      tailscaleMonitoring: tailscaleOn,
+      hermes: this._hermes,
+      hardware: this._hardwareSummary,
       metrics: {
         // NOTE: no `timestamp` here on purpose. The broadcast path skips
         // snapshots whose JSON is byte-identical to the previous one (see
@@ -284,6 +429,7 @@ export class SparkMonitor {
         unifiedMemory: this._metrics.unifiedMemory,
         llm: this._metrics.llm,
         comfy: comfyOn ? this._metrics.comfy : null,
+        tailscale: tailscaleOn ? this._metrics.tailscale : null,
       },
     };
   }
@@ -352,6 +498,8 @@ export class SparkMonitor {
       this._pollDomain("memory"),
       this._pollDomain("llm"),
       this._pollDomain("comfy"),
+      this._pollDomain("hermes"),
+      this._pollDomain("tailscale"),
     ]);
   }
 
@@ -362,6 +510,8 @@ export class SparkMonitor {
     // Worker nodes: no local LLM API
     if (domain === "llm" && !this._llmMonitoringEnabled()) return;
     if (domain === "comfy" && !this._comfyMonitoringEnabled()) return;
+    if (domain === "hermes" && !this._hermesMonitoringEnabled()) return;
+    if (domain === "tailscale" && !this._tailscaleMonitoringEnabled()) return;
     this._inflight[domain] = true;
     try {
       let result;
@@ -392,6 +542,12 @@ export class SparkMonitor {
           break;
         case "comfy":
           result = this.comfyProbe ? await this.comfyProbe.probe() : null;
+          break;
+        case "tailscale":
+          result = this.tailscaleProbe ? await this.tailscaleProbe.probe() : null;
+          break;
+        case "hermes":
+          result = this.hermesProbe ? await this.hermesProbe.check() : null;
           break;
       }
       // Re-check after the await — `stop()`/`updateSpark()` may have torn
@@ -428,9 +584,22 @@ export class SparkMonitor {
           break;
         case "llm":
           this._metrics.llm = result;
+          {
+            const probes = Array.from(this.llmProbes.values());
+            for (let i = 0; i < result.length; i++) {
+              const probe = probes[i];
+              if (probe) llmDaily.record(this.spark.id, probe.port, result[i]);
+            }
+          }
           break;
         case "comfy":
           this._metrics.comfy = result;
+          break;
+        case "tailscale":
+          this._metrics.tailscale = result;
+          break;
+        case "hermes":
+          this.applyHermesCheck(result);
           break;
       }
       this._lastUpdate[domain] = Date.now();
@@ -466,8 +635,137 @@ export class SparkMonitor {
     }
   }
 
-  // ─── Hardware summary (cached, computed once) ─────────────
-  _getHardwareSummary() {
+  // ─── Hermes Agent ─────────────────────────────────────────
+  /**
+   * Apply a Hermes check result to monitor state. Fires onHermesChange (force
+   * broadcast) only when a user-meaningful field actually changed, so idle
+   * re-checks do not spam the WS.
+   * @param {object|null} result
+   */
+  applyHermesCheck(result) {
+    if (!result || !this._running) return;
+    const prev = this._hermes;
+    const changed =
+      result.updateAvailable !== prev.updateAvailable ||
+      result.installed !== prev.installed ||
+      result.version !== prev.version;
+    this._hermes = {
+      ...prev,
+      installed: result.installed,
+      version: result.version,
+      updateAvailable: result.updateAvailable,
+      behindCommits: result.behindCommits,
+      checkedAt: result.checkedAt,
+      error: result.error ?? null,
+    };
+    // A clean check self-heals the transient one-shot update job status, so a
+    // "success / error" flag never lingers past the following poll cycle.
+    if (!result.error && this._hermes.status !== "running") {
+      this._hermes.status = "idle";
+    }
+    if (changed) this._notifyHermesChange();
+  }
+
+  /**
+   * Kick off `hermes update` in the background. Returns immediately; progress
+   * and result are surfaced through the snapshot + onHermesChange broadcast.
+   * @returns {{ started: boolean, reason?: string }}
+   */
+  runHermesUpdate() {
+    if (!this.hermesProbe) {
+      return { started: false, reason: "Hermes Agent monitoring is disabled for this Spark" };
+    }
+    if (this._hermes.status === "running") {
+      return { started: false, reason: "An update is already running" };
+    }
+    this._hermes = {
+      ...this._hermes,
+      status: "running",
+      startedAt: Date.now(),
+      finishedAt: null,
+      error: null,
+    };
+    this._notifyHermesChange();
+    // Defer the long-running SSH work so the broadcast above lands first.
+    void (async () => {
+      try {
+        const res = await this.hermesProbe.update();
+        if (!this._running) return;
+        if (res?.ok) {
+          this._hermes = {
+            ...this._hermes,
+            status: "success",
+            installed: res.installed,
+            version: res.version,
+            error: null,
+            finishedAt: res.finishedAt ?? Date.now(),
+          };
+          // Refresh update availability right away (don't wait for the next poll).
+          try {
+            const check = await this.hermesProbe.check();
+            if (this._running && check) {
+              this._hermes = {
+                ...this._hermes,
+                installed: check.installed,
+                version: check.version,
+                updateAvailable: check.updateAvailable,
+                behindCommits: check.behindCommits,
+                checkedAt: check.checkedAt,
+                error: check.error ?? null,
+              };
+            }
+          } catch {
+            /* keep the success result if the follow-up check fails */
+          }
+        } else {
+          this._hermes = {
+            ...this._hermes,
+            status: "error",
+            error: res?.error || res?.output?.slice(-400) || "hermes update failed",
+            finishedAt: res?.finishedAt ?? Date.now(),
+          };
+        }
+      } catch (err) {
+        if (!this._running) return;
+        this._hermes = {
+          ...this._hermes,
+          status: "error",
+          error: err instanceof Error ? err.message : String(err),
+          finishedAt: Date.now(),
+        };
+      }
+      this._notifyHermesChange();
+    })();
+    return { started: true };
+  }
+
+  _notifyHermesChange() {
+    if (typeof this._onHermesChange !== "function") return;
+    try {
+      this._onHermesChange(this.spark.id);
+    } catch (err) {
+      console.error(`[SparkMonitor] ${this.spark.id} hermes change error:`, err.message);
+    }
+  }
+
+  // ─── Hardware summary ─────────────────────────────────────
+  /**
+   * Static summary used for kind "spark" (DGX Spark specs) and as the
+   * pre-detection fallback for kind "host". kind "host" is then enriched
+   * with real hardware from `detectHardware()` once available.
+   */
+  _staticHardwareSummary(spark) {
+    if (spark?.kind === "host") {
+      return {
+        device: "Linux GPU host",
+        cpuModel: null,
+        cpuCores: null,
+        totalMemoryGB: null,
+        gpuChip: null,
+        cudaDriver: null,
+        storageModel: null,
+      };
+    }
     return {
       device: "NVIDIA DGX Spark",
       cpuModel: "GB10",
@@ -479,3 +777,4 @@ export class SparkMonitor {
     };
   }
 }
+

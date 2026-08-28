@@ -4,7 +4,14 @@
  */
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
-import { estimateTokenCount, round2 } from "../LlmStreaming.js";
+import {
+  applyThinkingFlags,
+  coerceThinkingFlag,
+  stripThinkingFlags,
+  thinkingOffFallbackBody,
+  estimateTokenCount,
+  round2,
+} from "../LlmStreaming.js";
 
 test("estimateTokenCount: empty → 0", () => {
   assert.equal(estimateTokenCount(""), 0);
@@ -39,4 +46,42 @@ test("live decode rate formula matches final decodeTps shape", () => {
   const elapsedMs = tLast - tFirst;
   const live = round2((decodeTokens / elapsedMs) * 1000);
   assert.equal(live, 24.75);
+});
+
+test("prefill tok/s is prompt tokens over TTFT", () => {
+  const prefillTokens = 1024;
+  const ttftMs = 80;
+  const prefillTps = round2((prefillTokens / ttftMs) * 1000);
+  assert.equal(prefillTps, 12800);
+});
+
+test("coerceThinkingFlag defaults off", () => {
+  assert.equal(coerceThinkingFlag(undefined), false);
+  assert.equal(coerceThinkingFlag(false), false);
+  assert.equal(coerceThinkingFlag("false"), false);
+  assert.equal(coerceThinkingFlag(true), true);
+  assert.equal(coerceThinkingFlag("true"), true);
+});
+
+test("applyThinkingFlags always sends MiniMax thinking_mode even without model id", () => {
+  const off = applyThinkingFlags({ messages: [] }, null, false);
+  assert.equal(off.chat_template_kwargs.enable_thinking, false);
+  assert.equal(off.chat_template_kwargs.thinking, false);
+  assert.equal(off.chat_template_kwargs.thinking_mode, "disabled");
+
+  const on = applyThinkingFlags({ messages: [] }, "Qwen3-32B", true);
+  assert.equal(on.chat_template_kwargs.enable_thinking, true);
+  assert.equal(on.chat_template_kwargs.thinking_mode, "enabled");
+});
+
+test("thinking-off 400 fallback keeps an explicit disable, strip does not", () => {
+  const body = applyThinkingFlags({ model: "x", stream: true }, "MiniMax-M2.5", false);
+  const fallback = thinkingOffFallbackBody(body);
+  assert.equal(fallback.enable_thinking, false);
+  assert.deepEqual(fallback.thinking, { type: "disabled" });
+  assert.equal(fallback.chat_template_kwargs.enable_thinking, false);
+
+  const stripped = stripThinkingFlags({ ...body, chat_template_kwargs: { ...body.chat_template_kwargs } });
+  assert.equal(stripped.chat_template_kwargs, undefined);
+  assert.equal(stripped.enable_thinking, undefined);
 });

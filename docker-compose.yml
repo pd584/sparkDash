@@ -22,6 +22,8 @@ services:
     volumes:
       # Live server code — edits apply after --watch reloads the process
       - ./server:/app/server
+      # Prompt catalog imported by DecodeBench / Showcase (not under ./server)
+      - ./src/shared:/app/src/shared:ro
       # Mount host filesystem for local Spark metrics
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
@@ -31,6 +33,12 @@ services:
       - /usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1:/usr/lib/aarch64-linux-gnu/libnvidia-ml.so.1:ro
       # Config + encrypted secrets (passwords survive restarts)
       - ./config:/app/config
+      # Remote Sparks with SSH *key* auth: OpenSSH inside the container uses
+      # /root/.ssh (not the host user's ~/.ssh). Uncomment and point at a
+      # default-named key (id_ed25519 / id_rsa). A custom name like
+      # id_ed25519_shared must be mounted *as* id_ed25519, or set
+      # SSH_IDENTITY_FILE to the path inside the container.
+      # - ${HOME}/.ssh/id_ed25519:/root/.ssh/id_ed25519:ro
     environment:
       - BIND_HOST=0.0.0.0
       - PORT=5555

@@ -63,7 +63,7 @@ export class LlmProbe {
     this.baseUrl = `http://${llmProbeHost(spark)}:${port}`;
 
     // State
-    this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'ds4' | null
+    this.backendType = null; // 'vllm' | 'llama.cpp' | 'sglang' | 'ds4' | 'exl3' | null
     this.serverIsOpenAI = null; // true = OpenAI-compatible
     /** Whether /v1/models (or /slots) answered without credentials. null = unknown. */
     this.authOpen = null;
@@ -76,11 +76,21 @@ export class LlmProbe {
     this.slotsTotal = 0;
     this.generationTps = 0;
     this.prefillTps = 0;
+    /** Live cached-prefill tok/s when the backend splits kinds (ds4 / llama.cpp / sglang). null otherwise. */
+    this.cachedPrefillTps = null;
+    /** Live uncached/computed prefill tok/s when split is available. null otherwise. */
+    this.uncachedPrefillTps = null;
     this.error = null;
 
     // Per-slot rate tracking (for llama.cpp native path)
     this.slotState = new Map();
     this.lastTokenCounts = { input: 0, output: 0 };
+    /** Previous prefill counters by kind; null until first labeled sample. */
+    this.lastPrefillKinds = null;
+    /** Previous vLLM TTFT histogram `_sum` (seconds). null until first sample. */
+    this.lastTtftSum = null;
+    /** Previous `vllm:iteration_tokens_total_sum` (engine-step tokens). */
+    this.lastIterSum = null;
     this.lastProbeTime = 0;
 
     // Cumulative total output tokens (generation) as reported by the LLM server
@@ -106,6 +116,50 @@ export class LlmProbe {
     this._lastDetectAt = 0;
     /** @type {{ value: number, liveUntil: number } | null} */
     this._sglangStickyTps = null;
+  }
+
+  /**
+   * Prefill is a short burst; decode then runs with Δprompt=0.
+   * Keep the last real prefill rate while the engine is still in-flight, then 0.
+   * @param {number} rate
+   * @param {boolean} inflight
+   */
+  _setPrefillTps(rate, inflight) {
+    const rounded = Math.max(0, Math.round(rate * 100) / 100);
+    if (rounded > 0) this.prefillTps = rounded;
+    else if (!inflight) this.prefillTps = 0;
+  }
+
+  /**
+   * Live cached vs computed prefill tok/s from cumulative counters.
+   * First sample seeds the baseline (0 tok/s). Missing either side clears the split.
+   * @param {number|null|undefined} cachedCount
+   * @param {number|null|undefined} computedCount
+   * @param {number} dtSec
+   */
+  _setPrefillSplitRates(cachedCount, computedCount, dtSec) {
+    if (cachedCount == null || computedCount == null || !Number.isFinite(cachedCount) || !Number.isFinite(computedCount)) {
+      this.cachedPrefillTps = null;
+      this.uncachedPrefillTps = null;
+      this.lastPrefillKinds = null;
+      return;
+    }
+    const total = cachedCount + computedCount;
+    this.prefixCacheHitRate =
+      total > 0 ? Math.round((cachedCount / total) * 10000) / 10000 : null;
+    if (this.lastPrefillKinds == null) {
+      this.lastPrefillKinds = { cached: cachedCount, computed: computedCount };
+      this.cachedPrefillTps = 0;
+      this.uncachedPrefillTps = 0;
+      return;
+    }
+    if (dtSec > 0 && dtSec < 10) {
+      const dCached = cachedCount - this.lastPrefillKinds.cached;
+      const dComputed = computedCount - this.lastPrefillKinds.computed;
+      this.cachedPrefillTps = Math.max(0, Math.round((dCached / dtSec) * 100) / 100);
+      this.uncachedPrefillTps = Math.max(0, Math.round((dComputed / dtSec) * 100) / 100);
+    }
+    this.lastPrefillKinds = { cached: cachedCount, computed: computedCount };
   }
 
   /** Update probe port (and host from spark). Resets detection when the target changes. */
@@ -174,6 +228,8 @@ export class LlmProbe {
     this.modelPath = null;
     this.generationTps = 0;
     this.prefillTps = 0;
+    this.cachedPrefillTps = null;
+    this.uncachedPrefillTps = null;
     this.contextLength = null;
     this.gpuMemoryUtilization = null;
     this.slotsActive = 0;
@@ -190,6 +246,9 @@ export class LlmProbe {
     this.mtpAcceptanceRate = null;
     this.slotState.clear();
     this.lastTokenCounts = { input: 0, output: 0 };
+    this.lastPrefillKinds = null;
+    this.lastTtftSum = null;
+    this.lastIterSum = null;
     this._sglangStickyTps = null;
   }
 
@@ -216,7 +275,8 @@ export class LlmProbe {
     if (
       this.backendType !== "vllm" &&
       this.backendType !== "sglang" &&
-      this.backendType !== "ds4"
+      this.backendType !== "ds4" &&
+      this.backendType !== "exl3"
     ) {
       const slotUrl = `${this.baseUrl}/slots`;
       try {
@@ -263,18 +323,43 @@ export class LlmProbe {
   }
 
   /**
-   * Classify an OpenAI-compatible server: ds4-server, SGLang, or vLLM (default).
+   * Classify an OpenAI-compatible server: ds4, SGLang, EXL3, or vLLM (default).
    * @param {unknown} ownedBy
-   * @returns {Promise<"ds4" | "sglang" | "vllm">}
+   * @returns {Promise<"ds4" | "sglang" | "exl3" | "vllm">}
    */
   async _classifyOpenAIBackend(ownedBy) {
     if (typeof ownedBy === "string") {
       if (/ds4/i.test(ownedBy)) return "ds4";
       if (/sglang/i.test(ownedBy)) return "sglang";
+      if (/exl3/i.test(ownedBy)) return "exl3";
     }
     if (await this._probeIsDs4()) return "ds4";
     if (await this._probeIsSglang()) return "sglang";
+    if (await this._probeIsExl3()) return "exl3";
     return "vllm";
+  }
+
+  /**
+   * True when EXL3 `tools/serve_openai.py` /health exposes backend + token totals.
+   * Distinguishes from vLLM's /health (no `busy` + `completion_tokens_total`).
+   */
+  async _probeIsExl3() {
+    try {
+      const res = await this._fetch(`${this.baseUrl}/health`);
+      if (!res.ok) return false;
+      const data = await res.json().catch(() => null);
+      return LlmProbe._healthLooksLikeExl3(data);
+    } catch {
+      return false;
+    }
+  }
+
+  /** @param {unknown} data */
+  static _healthLooksLikeExl3(data) {
+    if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+    if (data.backend === "exl3") return true;
+    // tools/serve_openai.py: { ok, busy } even before token counters existed.
+    return data.ok === true && typeof data.busy === "boolean";
   }
 
   /** True when SGLang native server-info endpoints respond. */
@@ -347,7 +432,27 @@ export class LlmProbe {
       if (/ds4/i.test(owned)) this.backendType = "ds4";
       else if (/sglang/i.test(owned) && this.backendType !== "ds4") {
         this.backendType = "sglang";
+      } else if (/exl3/i.test(owned) && this.backendType !== "ds4") {
+        this.backendType = "exl3";
       }
+    }
+
+    // EXL3 serve_openai.py: live tok/s from /health cumulative counters (no Prometheus).
+    if (this.backendType === "exl3" || this.backendType == null) {
+      try {
+        const healthRes = await this._fetch(`${this.baseUrl}/health`);
+        if (healthRes.ok) {
+          const health = await healthRes.json().catch(() => null);
+          if (LlmProbe._healthLooksLikeExl3(health)) {
+            this.backendType = "exl3";
+            this._applyExl3Health(health, dtSec);
+            return this._getSnapshot();
+          }
+        }
+      } catch {
+        /* health optional unless already classified exl3 */
+      }
+      if (this.backendType === "exl3") return this._getSnapshot();
     }
 
     // SGLang: native info endpoints. Skip on known vLLM/ds4 to avoid 404 spam.
@@ -357,22 +462,30 @@ export class LlmProbe {
         if (sgRes.ok) {
           this.backendType = "sglang";
           const sgData = await sgRes.json();
+          // Load before last_gen_throughput so inflight can keep a steady rate live.
+          await this._probeSglangLoad();
           this._applySglangServerInfo(sgData, dtSec);
+          // Engine tile: Active vs Sleeping. SGLang has no live sleep gauge
+          // (sleep_on_idle is a launch flag, not current state). A reachable
+          // server with weights resident is Active / ready.
+          if (this.gpuMemoryUtilization == null) this.gpuMemoryUtilization = 1;
         }
       } catch {}
     }
 
     if (this.backendType === "sglang") {
-      // Optional Prometheus path when launched with --enable-metrics
-      if (this.generationTps === 0 && this.prefillTps === 0) {
-        try {
-          const metricsRes = await this._fetch(`${this.baseUrl}/metrics`);
-          if (metricsRes.ok) {
-            this._applySglangMetrics(await metricsRes.text(), dtSec);
-          }
-        } catch {
-          /* metrics optional */
+      // Prometheus is optional (--enable-metrics). Do not mix those counters
+      // into lastTokenCounts when /get_server_info already produced live rates.
+      try {
+        const metricsRes = await this._fetch(`${this.baseUrl}/metrics`);
+        if (metricsRes.ok) {
+          const txt = await metricsRes.text();
+          const idle = this.generationTps === 0 && this.prefillTps === 0;
+          if (idle) this._applySglangMetrics(txt, dtSec);
+          else this._applySglangPrefillSplit(txt, dtSec);
         }
+      } catch {
+        /* metrics optional */
       }
       await this._enrichSglangModelInfo();
       return this._getSnapshot();
@@ -393,11 +506,11 @@ export class LlmProbe {
           this.backendType = "vllm";
           this._applyVllmMetrics(txt, dtSec);
         }
-      } else if (this.backendType !== "ds4") {
+      } else if (this.backendType !== "ds4" && this.backendType !== "exl3") {
         this.backendType = "vllm";
       }
     } catch {
-      if (this.backendType !== "ds4") this.backendType = "vllm";
+      if (this.backendType !== "ds4" && this.backendType !== "exl3") this.backendType = "vllm";
     }
 
     return this._getSnapshot();
@@ -413,7 +526,16 @@ export class LlmProbe {
    */
   _applyDs4Metrics(txt, dtSec) {
     const decoded = this._getPromMetric(txt, "ds4_tokens_decoded_total");
-    const prefilled = this._getPromMetric(txt, "ds4_tokens_prefilled_total");
+    const computedPrefill = this._getPromMetricLabeled(
+      txt,
+      "ds4_tokens_prefilled_total",
+      "kind",
+      "computed"
+    );
+    const prefilled =
+      computedPrefill ?? this._getPromMetric(txt, "ds4_tokens_prefilled_total");
+    const inflightHint = this._getPromMetric(txt, "ds4_requests_inflight");
+    const inflight = inflightHint != null && inflightHint > 0;
 
     if (decoded != null) {
       if (prefilled != null && dtSec > 0 && dtSec < 10) {
@@ -424,16 +546,16 @@ export class LlmProbe {
       } else if (dtSec > 0 && dtSec < 10) {
         const deltaOut = decoded - this.lastTokenCounts.output;
         this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
+        if (!inflight && deltaOut <= 0) this.prefillTps = 0;
       }
       if (prefilled != null) this.lastTokenCounts.input = prefilled;
       this.lastTokenCounts.output = decoded;
       this.totalOutputTokens = decoded;
     } else {
       // No counters — fall back to window gauges only while something is in flight
-      const inflightHint = this._getPromMetric(txt, "ds4_requests_inflight");
       const gaugeGen = this._getPromMetric(txt, "ds4_decode_tok_s");
       const gaugePrefill = this._getPromMetric(txt, "ds4_prefill_tok_s");
-      if (inflightHint != null && inflightHint > 0) {
+      if (inflight) {
         if (gaugeGen != null) {
           this.generationTps = Math.max(0, Math.round(gaugeGen * 100) / 100);
         }
@@ -446,9 +568,9 @@ export class LlmProbe {
       }
     }
 
-    const inflight = this._getPromMetric(txt, "ds4_requests_inflight");
-    this.requestsRunning = inflight;
-    if (inflight != null) this.slotsActive = Math.round(inflight);
+    const inflightCount = this._getPromMetric(txt, "ds4_requests_inflight");
+    this.requestsRunning = inflightCount;
+    if (inflightCount != null) this.slotsActive = Math.round(inflightCount);
 
     const banksTotal = this._getPromMetric(txt, "ds4_banks_total");
     if (banksTotal != null) this.slotsTotal = Math.round(banksTotal);
@@ -457,7 +579,7 @@ export class LlmProbe {
     this.mtpAcceptanceRate =
       specAccept != null ? Math.round(specAccept * 10000) / 10000 : null;
 
-    // Prefix-cache hit rate from prefill kind labels (cached / (computed+cached))
+    // Prefix-cache hit rate + live tok/s from prefill kind labels
     const cached = this._getPromMetricLabeled(
       txt,
       "ds4_tokens_prefilled_total",
@@ -470,13 +592,7 @@ export class LlmProbe {
       "kind",
       "computed"
     );
-    if (cached != null && computed != null) {
-      const total = cached + computed;
-      this.prefixCacheHitRate =
-        total > 0 ? Math.round((cached / total) * 10000) / 10000 : null;
-    } else {
-      this.prefixCacheHitRate = null;
-    }
+    this._setPrefillSplitRates(cached, computed, dtSec);
 
     // Clear tiles that are vLLM-histogram-specific (no ds4 equivalent yet)
     this.kvCacheUsage = null;
@@ -488,6 +604,58 @@ export class LlmProbe {
   }
 
   /**
+   * Apply EXL3 tools/serve_openai.py GET /health.
+   * Live tok/s from cumulative counter diffs so idle → 0.
+   * @param {Record<string, unknown>} data
+   * @param {number} dtSec
+   */
+  _applyExl3Health(data, dtSec) {
+    const prompt = Number(data?.prompt_tokens_total);
+    const completion = Number(data?.completion_tokens_total);
+    const busy = data?.busy === true;
+    const ctx = Number(data?.context_length);
+    if (Number.isFinite(ctx) && ctx > 0) this.contextLength = Math.round(ctx);
+
+    this.requestsRunning = busy ? 1 : 0;
+    this.slotsActive = busy ? 1 : 0;
+    this.slotsTotal = 1;
+    this.kvCacheUsage = null;
+    this.requestsWaiting = null;
+    this.ttftP95Seconds = null;
+    this.preemptionsTotal = null;
+    this.prefixCacheHitRate = null;
+    this.e2eP95Seconds = null;
+    this.itlP95Seconds = null;
+    this.mtpAcceptanceRate = null;
+    this.cachedPrefillTps = null;
+    this.uncachedPrefillTps = null;
+
+    if (!Number.isFinite(completion)) {
+      this.generationTps = busy ? this.generationTps : 0;
+      if (!busy) this.prefillTps = 0;
+      return;
+    }
+
+    if (dtSec > 0 && dtSec < 10) {
+      const deltaOut = completion - this.lastTokenCounts.output;
+      this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
+      if (Number.isFinite(prompt)) {
+        const deltaIn = prompt - this.lastTokenCounts.input;
+        this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
+      } else if (!busy && this.generationTps <= 0) {
+        this.prefillTps = 0;
+      }
+    } else if (!busy) {
+      this.generationTps = 0;
+      this.prefillTps = 0;
+    }
+
+    if (Number.isFinite(prompt)) this.lastTokenCounts.input = prompt;
+    this.lastTokenCounts.output = completion;
+    this.totalOutputTokens = completion;
+  }
+
+  /**
    * Apply stock vLLM Prometheus /metrics (tok/s + inference tiles).
    * @param {string} txt
    * @param {number} dtSec
@@ -495,19 +663,43 @@ export class LlmProbe {
   _applyVllmMetrics(txt, dtSec) {
     const promptTokens = this._getVllmMetric(txt, "prompt_tokens_total");
     const genTokens = this._getVllmMetric(txt, "generation_tokens_total");
+    const running = this._getVllmMetric(txt, "num_requests_running");
+    const iterSum = this._getVllmMetric(txt, "iteration_tokens_total_sum");
     if (promptTokens != null && genTokens != null) {
       const deltaIn = promptTokens - this.lastTokenCounts.input;
       const deltaOut = genTokens - this.lastTokenCounts.output;
       this.lastTokenCounts.input = promptTokens;
       this.lastTokenCounts.output = genTokens;
       this.totalOutputTokens = genTokens;
+      const ttftSum = this._getVllmMetric(txt, "time_to_first_token_seconds_sum");
+      const deltaIter =
+        iterSum != null && this.lastIterSum != null ? iterSum - this.lastIterSum : 0;
       if (dtSec > 0 && dtSec < 10) {
         this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
-        this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
+        const deltaTtft =
+          ttftSum != null && this.lastTtftSum != null ? ttftSum - this.lastTtftSum : 0;
+        // Engine-step tokens include prefill+decode. Surplus over generation is
+        // prefill, including the common case where a short/cached prefill lands
+        // in the same poll as the first decode tokens.
+        const prefillIter = Math.max(0, deltaIter - Math.max(0, deltaOut));
+        const specNoise = deltaOut > 0 && prefillIter > 0 && prefillIter < deltaOut * 0.5;
+        const livePrefill =
+          prefillIter > 0 && !specNoise ? prefillIter / dtSec : 0;
+        const finishedPrefill =
+          deltaIn > 0 && deltaTtft > 0
+            ? deltaIn / deltaTtft
+            : deltaIn > 0 && livePrefill <= 0
+              ? deltaIn / dtSec
+              : 0;
+        this.prefillTps = Math.max(
+          0,
+          Math.round((livePrefill > 0 ? livePrefill : finishedPrefill) * 100) / 100
+        );
       }
+      if (ttftSum != null) this.lastTtftSum = ttftSum;
     }
+    if (iterSum != null) this.lastIterSum = iterSum;
 
-    const running = this._getVllmMetric(txt, "num_requests_running");
     this.requestsRunning = running;
     if (running != null) this.slotsActive = Math.round(running);
 
@@ -594,25 +786,109 @@ export class LlmProbe {
         this.totalOutputTokens = output;
         if (dtSec > 0 && dtSec < 10) {
           this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
-          this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
+          this._setPrefillTps(deltaIn / dtSec, deltaOut > 0);
         }
         return;
       }
     }
 
-    // No cumulative counters — sticky last_gen_throughput only while it moves
+    // No cumulative counters — sticky last_gen_throughput only while it moves,
+    // unless /v1/loads (or /get_load) says requests are in flight.
     const lastGen = LlmProbe._sglangLastGenThroughput(sgData);
-    this.generationTps = this._sglangStickyThroughput(lastGen);
+    this.generationTps = this._sglangStickyThroughput(lastGen, this._sglangInflight());
+  }
+
+  /** True when SGLang load probe reported running or waiting requests. */
+  _sglangInflight() {
+    return (
+      this.slotsActive > 0 ||
+      (this.requestsRunning != null && this.requestsRunning > 0) ||
+      (this.requestsWaiting != null && this.requestsWaiting > 0)
+    );
+  }
+
+  /**
+   * Prefer /v1/loads (num_running_reqs). Fall back to /get_load, where
+   * num_reqs is running + waiting.
+   */
+  async _probeSglangLoad() {
+    for (const path of ["/v1/loads", "/get_load"]) {
+      try {
+        const res = await this._fetch(`${this.baseUrl}${path}`);
+        if (!res.ok) continue;
+        const data = await res.json().catch(() => null);
+        if (this._applySglangLoad(data)) return;
+      } catch {
+        /* try next */
+      }
+    }
+  }
+
+  /**
+   * Apply SGLang /v1/loads or /get_load. Returns true when a row was applied.
+   * @param {unknown} payload
+   * @returns {boolean}
+   */
+  _applySglangLoad(payload) {
+    const rows = LlmProbe._sglangLoadRows(payload);
+    if (!rows.length) return false;
+    let running = 0;
+    let waiting = 0;
+    let saw = false;
+    for (const row of rows) {
+      const wait = Number(row.num_waiting_reqs);
+      const runDirect = Number(row.num_running_reqs);
+      const total = Number(row.num_reqs);
+      if (Number.isFinite(wait) && wait >= 0) {
+        waiting += wait;
+        saw = true;
+      }
+      if (Number.isFinite(runDirect) && runDirect >= 0) {
+        running += runDirect;
+        saw = true;
+      } else if (Number.isFinite(total) && total >= 0) {
+        const waitPart = Number.isFinite(wait) && wait >= 0 ? wait : 0;
+        running += Math.max(0, total - waitPart);
+        saw = true;
+      }
+    }
+    if (!saw) return false;
+    this.requestsRunning = running;
+    this.requestsWaiting = waiting;
+    this.slotsActive = Math.round(running);
+    return true;
+  }
+
+  /**
+   * @param {unknown} payload
+   * @returns {Array<Record<string, unknown>>}
+   */
+  static _sglangLoadRows(payload) {
+    if (payload == null) return [];
+    if (Array.isArray(payload)) {
+      return payload.filter((row) => row && typeof row === "object");
+    }
+    if (typeof payload !== "object") return [];
+    if (Array.isArray(payload.loads)) {
+      return payload.loads.filter((row) => row && typeof row === "object");
+    }
+    if (payload.num_reqs != null || payload.num_running_reqs != null) {
+      return [payload];
+    }
+    return [];
   }
 
   /**
    * Map SGLang's sticky last_gen_throughput gauge to a live panel rate.
    * Returns 0 until the value changes between polls (avoids showing a stale
    * leftover after idle); stays live for a short window after each change.
+   * When `inflight` is true (independent load signal), keep a positive rate
+   * even if the gauge is not moving — a busy decode can report a constant value.
    * @param {number | null} raw
+   * @param {boolean} [inflight]
    * @returns {number}
    */
-  _sglangStickyThroughput(raw) {
+  _sglangStickyThroughput(raw, inflight = false) {
     if (raw == null || !Number.isFinite(raw) || raw < 0) {
       this._sglangStickyTps = null;
       return 0;
@@ -622,9 +898,12 @@ export class LlmProbe {
     const prev = this._sglangStickyTps;
 
     if (!prev) {
-      // First sample after reset/start — seed only; do not display stale gauge
-      this._sglangStickyTps = { value: rounded, liveUntil: 0 };
-      return 0;
+      // First sample after reset/start — seed only unless load says we are busy
+      this._sglangStickyTps = {
+        value: rounded,
+        liveUntil: inflight && rounded > 0 ? now + SGLANG_STICKY_TPS_LIVE_MS : 0,
+      };
+      return inflight && rounded > 0 ? rounded : 0;
     }
 
     if (rounded !== prev.value) {
@@ -636,6 +915,9 @@ export class LlmProbe {
     }
 
     if (prev.liveUntil > now) {
+      return rounded;
+    }
+    if (inflight && rounded > 0) {
       return rounded;
     }
     return 0;
@@ -700,8 +982,10 @@ export class LlmProbe {
       this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
       if (prompt != null) {
         const deltaIn = prompt - this.lastTokenCounts.input;
-        this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
+        this._setPrefillTps(deltaIn / dtSec, deltaOut > 0);
         this.lastTokenCounts.input = prompt;
+      } else if (deltaOut <= 0) {
+        this.prefillTps = 0;
       }
     }
     this.lastTokenCounts.output = gen;
@@ -714,6 +998,34 @@ export class LlmProbe {
       this.requestsRunning = running;
       this.slotsActive = Math.round(running);
     }
+
+    const cached = this._sglangCachedTokens(txt);
+    if (cached != null && prompt != null) {
+      this._setPrefillSplitRates(cached, prompt, dtSec);
+    }
+  }
+
+  /**
+   * Cache split only — does not touch generation/prefill lastTokenCounts.
+   * Prefers cache_source="device" so HiCache L1/L2/L3 labels are not summed.
+   */
+  _applySglangPrefillSplit(txt, dtSec) {
+    const prompt =
+      this._getPromMetric(txt, "sglang:prompt_tokens_total") ??
+      this._getPromMetric(txt, "sglang_prompt_tokens_total");
+    const cached = this._sglangCachedTokens(txt);
+    if (cached != null && prompt != null) {
+      this._setPrefillSplitRates(cached, prompt, dtSec);
+    }
+  }
+
+  _sglangCachedTokens(txt) {
+    return (
+      this._getPromMetricLabeled(txt, "sglang:cached_tokens_total", "cache_source", "device") ??
+      this._getPromMetricLabeled(txt, "sglang_cached_tokens_total", "cache_source", "device") ??
+      this._getPromMetricMax(txt, "sglang:cached_tokens_total") ??
+      this._getPromMetricMax(txt, "sglang_cached_tokens_total")
+    );
   }
 
   /** Prefer SGLang /get_model_info (or /model_info) over raw HF cache paths. */
@@ -758,12 +1070,21 @@ export class LlmProbe {
           let totalGen = 0;
           let totalPrefill = 0;
           let totalDecoded = 0;
+          let promptedSum = 0;
+          let cachedSum = 0;
+          let sawCache = false;
 
           for (const slot of slots) {
             const slotId = slot.id ?? "default";
             const decoded = this._getSlotDecoded(slot);
             const prompted = this._getSlotPrefilled(slot);
+            const cached = this._getSlotCached(slot);
             totalDecoded += decoded;
+            promptedSum += prompted;
+            if (cached != null) {
+              sawCache = true;
+              cachedSum += cached;
+            }
             const lastState = this.slotState.get(slotId) || { decoded: 0, prompted: 0 };
             const dDecoded = decoded - lastState.decoded;
             const dPrompted = prompted - lastState.prompted;
@@ -776,7 +1097,8 @@ export class LlmProbe {
 
           this.totalOutputTokens = totalDecoded;
           this.generationTps = Math.max(0, Math.round(totalGen * 100) / 100);
-          this.prefillTps = Math.max(0, Math.round(totalPrefill * 100) / 100);
+          this._setPrefillTps(totalPrefill, totalGen > 0);
+          if (sawCache) this._setPrefillSplitRates(cachedSum, promptedSum, dtSec);
         }
       }
     } catch {}
@@ -826,6 +1148,24 @@ export class LlmProbe {
       }
     }
     return found ? sum : null;
+  }
+
+  /**
+   * Max of Prometheus series matching `name` (avoids summing HiCache layers).
+   * @param {string} body
+   * @param {string} name
+   * @returns {number | null}
+   */
+  _getPromMetricMax(body, name) {
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`^${esc}(?:\\{[^}]*\\})?\\s+([\\d.eE+-]+)\\s*$`, "gm");
+    let best = null;
+    let m;
+    while ((m = re.exec(body)) !== null) {
+      const v = parseFloat(m[1]);
+      if (Number.isFinite(v)) best = best == null ? v : Math.max(best, v);
+    }
+    return best;
   }
 
   /**
@@ -930,7 +1270,18 @@ export class LlmProbe {
   }
 
   _getSlotPrefilled(slot) {
-    return slot.n_prompt_tokens_processed || slot.n_prompt_tokens || 0;
+    if (slot?.n_prompt_tokens_processed != null) {
+      const n = Number(slot.n_prompt_tokens_processed);
+      if (Number.isFinite(n)) return n;
+    }
+    return slot?.n_prompt_tokens || 0;
+  }
+
+  /** Cached prompt tokens on a llama.cpp slot, or null when the field is absent. */
+  _getSlotCached(slot) {
+    if (slot == null || slot.n_prompt_tokens_cache == null) return null;
+    const n = Number(slot.n_prompt_tokens_cache);
+    return Number.isFinite(n) ? n : null;
   }
 
   /**
@@ -1006,6 +1357,8 @@ export class LlmProbe {
       slotsTotal: this.slotsTotal,
       generationTps: this.generationTps,
       prefillTps: this.prefillTps,
+      cachedPrefillTps: this.cachedPrefillTps,
+      uncachedPrefillTps: this.uncachedPrefillTps,
       totalOutputTokens: this.totalOutputTokens,
       kvCacheUsage: this.kvCacheUsage,
       requestsRunning: this.requestsRunning,
@@ -1033,6 +1386,8 @@ export class LlmProbe {
       slotsTotal: 0,
       generationTps: 0,
       prefillTps: 0,
+      cachedPrefillTps: null,
+      uncachedPrefillTps: null,
       totalOutputTokens: 0,
       kvCacheUsage: null,
       requestsRunning: null,

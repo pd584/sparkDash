@@ -290,3 +290,186 @@ test("probe: modern sglang without totals still reports last_gen tok/s", async (
   assert.equal(snap.generationTps, 41.2);
   assert.equal(snap.available, true);
 });
+
+test("_applySglangLoad: /v1/loads uses num_running_reqs", () => {
+  const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 30000);
+  assert.equal(
+    probe._applySglangLoad({
+      loads: [{ num_running_reqs: 8, num_waiting_reqs: 26 }],
+    }),
+    true
+  );
+  assert.equal(probe.slotsActive, 8);
+  assert.equal(probe.requestsRunning, 8);
+  assert.equal(probe.requestsWaiting, 26);
+});
+
+test("_applySglangLoad: /get_load num_reqs is running + waiting", () => {
+  const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 30000);
+  assert.equal(
+    probe._applySglangLoad([{ num_reqs: 34, num_waiting_reqs: 26 }]),
+    true
+  );
+  assert.equal(probe.slotsActive, 8);
+  assert.equal(probe.requestsRunning, 8);
+  assert.equal(probe.requestsWaiting, 26);
+});
+
+test("_applySglangLoad: empty / unknown payload is a no-op", () => {
+  const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 30000);
+  assert.equal(probe._applySglangLoad(null), false);
+  assert.equal(probe._applySglangLoad({}), false);
+  assert.equal(probe.slotsActive, 0);
+});
+
+test("_sglangStickyThroughput: inflight keeps a steady rate after the live window", () => {
+  const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 30000);
+  assert.equal(probe._sglangStickyThroughput(40, true), 40);
+  probe._sglangStickyTps.liveUntil = Date.now() - 1;
+  assert.equal(probe._sglangStickyThroughput(40, true), 40);
+  assert.equal(probe._sglangStickyThroughput(40, false), 0);
+});
+
+test("probe: reachable SGLang without sleep metric is Active, not Sleeping", async () => {
+  const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 30000);
+  probe.serverIsOpenAI = true;
+  probe.backendType = "sglang";
+  probe.authOpen = true;
+  probe._lastDetectAt = Date.now();
+  probe.lastProbeTime = Date.now() - 2000;
+  probe._fetch = async (url) => {
+    const u = String(url);
+    if (u.endsWith("/v1/models")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [{ id: "org/model", owned_by: "sglang", max_model_len: 8192 }],
+        }),
+      };
+    }
+    if (u.endsWith("/get_server_info")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          model_path: "org/model",
+          context_length: 8192,
+          sleep_on_idle: true,
+          internal_states: [{ last_gen_throughput: 0 }],
+        }),
+      };
+    }
+    if (u.endsWith("/v1/loads")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ loads: [{ num_running_reqs: 0, num_waiting_reqs: 0 }] }),
+      };
+    }
+    return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+  };
+  const snap = await probe.probe();
+  assert.equal(snap.available, true);
+  assert.equal(snap.backend, "sglang");
+  assert.equal(snap.gpuMemoryUtilization, 1);
+  assert.equal(snap.totalOutputTokens, 0);
+});
+
+test("probe: /v1/loads inflight keeps last_gen on the first sample", async () => {
+  const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 30000);
+  probe.serverIsOpenAI = true;
+  probe.backendType = "sglang";
+  probe.authOpen = true;
+  probe._lastDetectAt = Date.now();
+  probe.lastProbeTime = Date.now() - 2000;
+  probe._fetch = async (url) => {
+    const u = String(url);
+    if (u.endsWith("/v1/models")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [{ id: "org/model", owned_by: "sglang", max_model_len: 8192 }],
+        }),
+      };
+    }
+    if (u.endsWith("/get_server_info")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          model_path: "org/model",
+          context_length: 8192,
+          internal_states: [{ last_gen_throughput: 55.5 }],
+        }),
+      };
+    }
+    if (u.endsWith("/v1/loads")) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ loads: [{ num_running_reqs: 3, num_waiting_reqs: 1 }] }),
+      };
+    }
+    return { ok: false, status: 404, json: async () => ({}), text: async () => "" };
+  };
+  const snap = await probe.probe();
+  assert.equal(snap.generationTps, 55.5);
+  assert.equal(snap.slotsActive, 3);
+  assert.equal(snap.requestsWaiting, 1);
+});
+
+test("_applySglangMetrics: cached_tokens_total vs prompt_tokens_total", () => {
+  const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 30000);
+  probe._applySglangMetrics(
+    [
+      "sglang:generation_tokens_total 10",
+      "sglang:prompt_tokens_total 100",
+      'sglang:cached_tokens_total{cache_source="device"} 40',
+      "sglang:num_running_reqs 1",
+    ].join("\n") + "\n",
+    2
+  );
+  assert.equal(probe.cachedPrefillTps, 0);
+  assert.equal(probe.uncachedPrefillTps, 0);
+
+  probe._applySglangMetrics(
+    [
+      "sglang:generation_tokens_total 30",
+      "sglang:prompt_tokens_total 140",
+      'sglang:cached_tokens_total{cache_source="device"} 80',
+      'sglang:cached_tokens_total{cache_source="host"} 80',
+      "sglang:num_running_reqs 1",
+    ].join("\n") + "\n",
+    2
+  );
+  assert.equal(probe.generationTps, 10); // (30-10)/2
+  assert.equal(probe.prefillTps, 20); // (140-100)/2
+  assert.equal(probe.uncachedPrefillTps, 20);
+  // device L1 only — do not sum HiCache host/storage layers
+  assert.equal(probe.cachedPrefillTps, 20); // (80-40)/2
+});
+
+test("_applySglangPrefillSplit does not clobber server_info tok/s", () => {
+  const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 30000);
+  probe.lastTokenCounts = { input: 100, output: 50 };
+  probe._applySglangServerInfo(
+    { total_input_tokens: 300, total_output_tokens: 150 },
+    2
+  );
+  assert.equal(probe.generationTps, 50);
+  assert.equal(probe.prefillTps, 100);
+  probe._applySglangPrefillSplit(
+    [
+      "sglang:generation_tokens_total 9999",
+      "sglang:prompt_tokens_total 140",
+      'sglang:cached_tokens_total{cache_source="device"} 80',
+    ].join("\n") + "\n",
+    2
+  );
+  assert.equal(probe.generationTps, 50);
+  assert.equal(probe.prefillTps, 100);
+  assert.equal(probe.lastTokenCounts.output, 150);
+  assert.equal(probe.cachedPrefillTps, 0); // first split sample seeds
+});
