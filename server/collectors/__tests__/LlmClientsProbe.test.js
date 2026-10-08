@@ -239,3 +239,39 @@ test("docker look-through swaps proxy loopback rows for container peer IPs", asy
   const igor = snap.byPort[11434].clients.find((c) => c.ip === "10.0.10.105");
   assert.equal(igor.name, "igor");
 });
+
+test("listen-owner check escalates to sudo when ss -p shows no process info", async () => {
+  const probe = new LlmClientsProbe({ id: "bert", isLocal: false, ssh: { host: "x", user: "u", auth: "key" }, llmPorts: [11434] });
+  const cmds = [];
+  probe._run = async (cmd) => {
+    cmds.push(String(cmd));
+    if (String(cmd).includes("ss -Htlnp") && !String(cmd).includes("sudo")) {
+      return "LISTEN 0 4096 0.0.0.0:11434 0.0.0.0:*"; // no users=() — non-root view
+    }
+    if (String(cmd).includes("sudo")) {
+      return "LISTEN 0 4096 0.0.0.0:11434 0.0.0.0:* users:((\"docker-proxy\",pid=9,fd=7))";
+    }
+    return "";
+  };
+  await probe._refreshListenOwners([11434]);
+  const e = probe._listenOwner.get(11434);
+  assert.equal(e.owner, "docker");
+  assert.ok(cmds.some((c) => c.includes("sudo -n ss -Htlnp")));
+});
+
+test("unknown owner with all-loopback host view still attempts look-through", async () => {
+  const probe = new LlmClientsProbe({ id: "b", isLocal: false, ssh: { host: "x", user: "u", auth: "key" }, llmPorts: [11434] });
+  const hostSs = "ESTAB 0 0  127.0.0.1:11434 127.0.0.1:59000\n\t lastsnd:20 lastrcv:25 bytes_sent:900 bytes_received:400";
+  probe._run = async (cmd) => {
+    const c = String(cmd);
+    if (c.includes("ss -Htlnp")) return "LISTEN 0 4096 0.0.0.0:11434 0.0.0.0:*"; // no owner info, no sudo available
+    if (c.includes("docker ps -q")) return "cid1";
+    if (c.includes("nsenter")) return "ESTAB 0 0  172.17.0.2:8001 10.0.10.105:42386\n\t lastsnd:30 lastrcv:40 bytes_sent:8000 bytes_received:90000";
+    return hostSs;
+  };
+  probe._peerMap = new Map([["10.0.10.105", { name: "igor", dnsName: null, online: true }]]);
+  probe._peerAt = Date.now();
+  const snap = await probe.probe([11434]);
+  const ips = snap.byPort[11434].clients.map((c) => c.ip);
+  assert.ok(ips.includes("10.0.10.105"), "look-through ran despite unknown owner");
+});

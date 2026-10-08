@@ -417,13 +417,29 @@ export class LlmClientsProbe {
     });
     if (stale.length === 0) return;
     let out = "";
+    let sawProcessInfo = false;
     try {
       out = await this._run("ss -Htlnp");
     } catch {
       return; // keep previous owners; without -p we just don't look through
     }
+    // A non-root SSH session cannot see other users' socket owners
+    // (docker-proxy runs as root), so a listen line with no users=() is
+    // inconclusive — retry with sudo -n before concluding "host".
+    sawProcessInfo = out.includes("users:");
+    if (!sawProcessInfo) {
+      try {
+        const sudo = await this._run("sudo -n ss -Htlnp");
+        if (sudo.includes("users:")) {
+          out = sudo;
+          sawProcessInfo = true;
+        }
+      } catch {
+        /* no passwordless sudo — decide on the plain output */
+      }
+    }
     for (const port of stale) {
-      let owner = "host";
+      let owner = sawProcessInfo ? "host" : "unknown";
       for (const line of String(out).split("\n")) {
         if (!line.includes(":" + port + " ")) continue;
         if (line.includes("docker-proxy")) owner = "docker";
@@ -582,7 +598,7 @@ export class LlmClientsProbe {
     // port's host view is all-loopback (nothing to lose, SSH cost only then).
     await this._refreshListenOwners(ports);
     const dockerPorts = ports.filter(
-      (p) => this._listenOwner.get(p)?.owner === "docker" &&
+      (p) => ["docker", "unknown"].includes(this._listenOwner.get(p)?.owner) &&
         (() => {
           const host = counts.get(p);
           return Boolean(host) && [...host.keys()].every((ip) => ip === "127.0.0.1" || ip === "::1");
