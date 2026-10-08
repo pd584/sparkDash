@@ -416,35 +416,41 @@ export class LlmClientsProbe {
       return !e || now - e.at > LISTEN_CHECK_MS;
     });
     if (stale.length === 0) return;
-    let out = "";
-    let sawProcessInfo = false;
-    try {
-      out = await this._run("ss -Htlnp");
-    } catch {
-      return; // keep previous owners; without -p we just don't look through
-    }
-    // A non-root SSH session cannot see other users' socket owners
-    // (docker-proxy runs as root), so a listen line with no users=() is
-    // inconclusive — retry with sudo -n before concluding "host".
-    sawProcessInfo = out.includes("users:");
-    if (!sawProcessInfo) {
+    // A non-root SSH session cannot see other users' socket owners, and the
+    // check is per-port: one prescott-owned listener with users=() in the
+    // output must not stop us from escalating for a root-owned one. A line
+    // without users=() is inconclusive -> try sudo -n -> else "unknown",
+    // which still allows look-through when the host view is all-loopback.
+    const runSs = async (prefix) => {
       try {
-        const sudo = await this._run("sudo -n ss -Htlnp");
-        if (sudo.includes("users:")) {
-          out = sudo;
-          sawProcessInfo = true;
-        }
+        return await this._run(prefix + "ss -Htlnp");
       } catch {
-        /* no passwordless sudo — decide on the plain output */
+        return null;
       }
-    }
+    };
+    const lineFor = (out, port) => {
+      if (typeof out !== "string") return null;
+      for (const line of out.split("\n")) {
+        if (line.includes(":" + port + " ") && line.startsWith("LISTEN")) return line;
+      }
+      return null;
+    };
+    const plain = await runSs("");
+    const plainHasUsers = plain != null && /users:[\\(]/.test(plain);
+    const sudo = plainHasUsers ? null : await runSs("sudo -n ");
+    // Pick, per port, the line that actually carries owner info: the sudo
+    // view when it has users=(), else the plain line when IT has users=();
+    // neither does -> "unknown", which still allows look-through when the
+    // host view is all-loopback.
     for (const port of stale) {
-      let owner = sawProcessInfo ? "host" : "unknown";
-      for (const line of String(out).split("\n")) {
-        if (!line.includes(":" + port + " ")) continue;
-        if (line.includes("docker-proxy")) owner = "docker";
-        break;
-      }
+      let owner = "unknown";
+      const sudoLine = sudo != null ? lineFor(sudo, port) : null;
+      const plainLine = plain != null ? lineFor(plain, port) : null;
+      const line =
+        sudoLine != null && /users:[\\(]/.test(sudoLine) ? sudoLine
+        : plainLine != null && /users:[\\(]/.test(plainLine) ? plainLine
+        : null;
+      if (line != null) owner = line.includes("docker-proxy") ? "docker" : "host";
       this._listenOwner.set(port, { owner, at: now });
     }
   }
