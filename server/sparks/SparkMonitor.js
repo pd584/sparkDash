@@ -5,6 +5,7 @@ import { LlmProbe } from "../collectors/LlmProbe.js";
 import { ComfyProbe } from "../collectors/ComfyProbe.js";
 import { HermesProbe } from "../collectors/HermesProbe.js";
 import { TailscaleProbe } from "../collectors/TailscaleProbe.js";
+import { LlmClientsProbe, annotateServing } from "../collectors/LlmClientsProbe.js";
 import { llmDaily } from "../collectors/LlmDaily.js";
 import { sshTest, sshExec } from "../collectors/ssh.js";
 import {
@@ -48,6 +49,10 @@ export class SparkMonitor {
         this.llmProbes.set(port, new LlmProbe(spark, port));
       }
     }
+    /** @type {LlmClientsProbe | null} */
+    this.llmClientsProbe = this._llmMonitoringEnabled(spark)
+      ? new LlmClientsProbe(spark)
+      : null;
 
     /** @type {ComfyProbe | null} */
     this.comfyProbe = this._comfyMonitoringEnabled(spark)
@@ -155,6 +160,11 @@ export class SparkMonitor {
     }
     if (!this._llmMonitoringEnabled()) {
       this._metrics.llm = [];
+      this.llmClientsProbe = null;
+    } else if (this.llmClientsProbe) {
+      this.llmClientsProbe.setTarget(spark);
+    } else {
+      this.llmClientsProbe = new LlmClientsProbe(spark);
     }
 
     // ComfyUI probe — create / update / clear
@@ -534,12 +544,27 @@ export class SparkMonitor {
         case "memory":
           result = await this.collector.collectUnifiedMemory();
           break;
-        case "llm":
-          // Probe all ports in parallel
-          result = await Promise.all(
-            Array.from(this.llmProbes.values()).map((probe) => probe.probe())
-          );
+        case "llm": {
+          const probes = Array.from(this.llmProbes.values());
+          const ports = probes.map((p) => p.port);
+          // ss BEFORE the HTTP probe. sparkDash's own /metrics GET is from the
+          // same IP as Local Studio (igor); if ss runs during/after that GET,
+          // lastsnd looks like a live stream. Tokens keep lastsnd <400ms;
+          // the previous poll's scrape is ~2s old.
+          const clientsSnap = this.llmClientsProbe
+            ? await this.llmClientsProbe.probe(ports)
+            : { byPort: {}, error: null };
+          const probeResults = await Promise.all(probes.map((probe) => probe.probe()));
+          result = probeResults.map((snap, i) => {
+            const entry = clientsSnap.byPort[ports[i]];
+            return {
+              ...snap,
+              clients: annotateServing(entry?.clients ?? [], snap),
+              clientsError: entry?.error ?? clientsSnap.error ?? null,
+            };
+          });
           break;
+        }
         case "comfy":
           result = this.comfyProbe ? await this.comfyProbe.probe() : null;
           break;

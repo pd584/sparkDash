@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import type { LlmMetrics } from "../../api/types";
+import type { LlmClient, LlmMetrics } from "../../api/types";
 import { setLlmApiKey, updateLlmPort, updateLlmPorts } from "../../api/client";
 import { Sparkline } from "../ui/Sparkline";
 import { Panel } from "../ui/Panel";
@@ -707,6 +707,8 @@ export function LlmPanel({
             </div>
           )}
 
+          <LlmClientsList clients={llm?.clients} error={llm?.clientsError} />
+
           <div className="border-t border-border pt-3 space-y-2">
             <button
               type="button"
@@ -744,5 +746,74 @@ export function LlmPanel({
         modelId={llm?.modelId ?? null}
       />
     </Panel>
+  );
+}
+
+function LlmClientsList({
+  clients,
+  error,
+}: {
+  clients?: LlmClient[] | null;
+  error?: string | null;
+}) {
+  const list = (Array.isArray(clients) ? clients : []).filter(
+    (c) => c.ip !== "127.0.0.1" && c.ip !== "::1"
+  );
+  const serving = list.filter((c) => c.serving);
+  const idle = list.filter((c) => !c.serving);
+  return (
+    <div className="border-t border-border pt-3">
+      <div className="mb-2 flex items-center justify-between">
+        <span
+          className="text-[10px] uppercase tracking-wide text-muted"
+          title="Who the live tok/s belongs to. Serving = engine is generating AND that device's sockets are moving bytes. Idle keep-alives are collapsed, not listed as the live client."
+        >
+          Serving
+        </span>
+        <span className="font-tabular text-[10px] text-muted">
+          {serving.length === 0 ? "idle" : `${serving.length}`}
+        </span>
+      </div>
+      {error && (
+        <p className="mb-2 rounded-md border border-border bg-surface-elevated px-3 py-2 text-[11px] text-muted">
+          {error}
+        </p>
+      )}
+      {serving.length === 0 && !error ? (
+        <p className="text-xs text-muted">
+          No live request
+          {idle.length > 0 ? ` · ${idle.length} idle keep-alive${idle.length === 1 ? "" : "s"}` : ""}
+        </p>
+      ) : (
+        <div className="space-y-1.5">
+          {serving.map((c) => {
+            const label = c.name || c.ip;
+            const title = [c.dnsName, c.ip, `${c.connections} conn`]
+              .filter(Boolean)
+              .join(" · ");
+            return (
+              <div
+                key={c.ip}
+                className="flex items-center justify-between gap-2 rounded-md border border-accent/40 bg-accent-soft px-3 py-1.5"
+                title={title}
+              >
+                <div className="min-w-0">
+                  <div className="truncate text-xs text-accent">{label}</div>
+                  {c.name && (
+                    <div className="truncate font-tabular text-[10px] text-muted">{c.ip}</div>
+                  )}
+                </div>
+                <span className="shrink-0 font-tabular text-[10px] text-accent">serving</span>
+              </div>
+            );
+          })}
+          {idle.length > 0 && (
+            <p className="text-[10px] text-muted">
+              {idle.length} idle keep-alive{idle.length === 1 ? "" : "s"}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
   );
 }

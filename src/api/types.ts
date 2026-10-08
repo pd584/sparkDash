@@ -316,12 +316,35 @@ export interface LlmMetrics {
   /** vLLM speculative/MTP acceptance rate (accepted/drafted, 0–1). null when unavailable. */
   mtpAcceptanceRate?: number | null;
   /**
+   * Live TCP clients on this listen port (`ss`), named from this node's
+   * Tailscale peer list. `serving` is true only while tok/s is live and that
+   * IP's sockets are moving — idle keep-alives stay listed as idle.
+   */
+  clients?: LlmClient[] | null;
+  /** Set when `ss` could not be read on the host. */
+  clientsError?: string | null;
+  /**
    * Observational exposure hint from unauthenticated probe reachability +
    * configured target host scope. null when auth status is unknown.
    * Does not claim process bind address.
    */
   posture?: LlmPosture | null;
   error: string | null;
+}
+
+/** One remote IP currently connected to an LLM listen port. */
+export interface LlmClient {
+  ip: string;
+  /** Tailscale HostName when the IP is in this node's Self/Peer map. */
+  name: string | null;
+  dnsName: string | null;
+  /** Established TCP sockets from this IP. */
+  connections: number;
+  /** Peer's Tailscale Online flag; null when the IP is not a known peer. */
+  online: boolean | null;
+  /** True while the engine is busy AND this IP's sockets are moving bytes. */
+  serving?: boolean;
+  bytesPerSec?: number;
 }
 
 /** One UTC day of busy tok/s rollups (null avg = no busy samples). */

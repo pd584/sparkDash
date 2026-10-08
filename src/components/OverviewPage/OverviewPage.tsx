@@ -352,21 +352,38 @@ function SparkCard({
             const llmArr = spark.metrics.llm;
             const llm = Array.isArray(llmArr) ? llmArr.find((l) => l.available) : null;
             if (!llm) return null;
+            const names = (llm.clients ?? [])
+              .filter((c) => c.serving)
+              .map((c) => c.name || c.ip)
+              .filter(Boolean);
+            const shown = names.slice(0, 3);
+            const extra = names.length - shown.length;
             return (
-              <div className="mt-3.5 grid grid-cols-2 gap-2 border-t border-border pt-3">
-                <div className="text-center">
-                  <span className="font-tabular text-[28px] font-bold leading-none text-text-strong">
-                    {llm.generationTps.toFixed(0)}
-                  </span>
-                  <span className="text-sm font-normal text-muted"> tok/s</span>
+              <>
+                <div className="mt-3.5 grid grid-cols-2 gap-2 border-t border-border pt-3">
+                  <div className="text-center">
+                    <span className="font-tabular text-[28px] font-bold leading-none text-text-strong">
+                      {llm.generationTps.toFixed(0)}
+                    </span>
+                    <span className="text-sm font-normal text-muted"> tok/s</span>
+                  </div>
+                  <div className="border-l border-border text-center">
+                    <span className="font-tabular text-[28px] font-bold leading-none text-text-strong">
+                      {llm.prefillTps.toFixed(0)}
+                    </span>
+                    <span className="text-sm font-normal text-muted"> prefill</span>
+                  </div>
                 </div>
-                <div className="border-l border-border text-center">
-                  <span className="font-tabular text-[28px] font-bold leading-none text-text-strong">
-                    {llm.prefillTps.toFixed(0)}
-                  </span>
-                  <span className="text-sm font-normal text-muted"> prefill</span>
-                </div>
-              </div>
+                {names.length > 0 && (
+                  <p
+                    className="mt-2 truncate text-[11px] text-muted"
+                    title={names.join(", ")}
+                  >
+                    Serving {shown.join(", ")}
+                    {extra > 0 ? ` +${extra}` : ""}
+                  </p>
+                )}
+              </>
             );
           })()}
         </>

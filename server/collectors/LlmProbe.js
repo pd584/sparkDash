@@ -480,9 +480,18 @@ export class LlmProbe {
         const metricsRes = await this._fetch(`${this.baseUrl}/metrics`);
         if (metricsRes.ok) {
           const txt = await metricsRes.text();
-          const idle = this.generationTps === 0 && this.prefillTps === 0;
-          if (idle) this._applySglangMetrics(txt, dtSec);
-          else this._applySglangPrefillSplit(txt, dtSec);
+          // Newer SGLang has no cumulative token counters in /get_server_info;
+          // prefill must keep updating from /metrics even when gen is live.
+          const hasTotals =
+            this._getPromMetric(txt, "sglang:generation_tokens_total") != null &&
+            this._getPromMetric(txt, "sglang:prompt_tokens_total") != null;
+          if (hasTotals) {
+            const idle = this.generationTps === 0 && this.prefillTps === 0;
+            if (idle) this._applySglangMetrics(txt, dtSec);
+            else this._applySglangPrefillSplit(txt, dtSec);
+          } else {
+            this._applySglangPrefillSplit(txt, dtSec);
+          }
         }
       } catch {
         /* metrics optional */
@@ -999,23 +1008,29 @@ export class LlmProbe {
       this.slotsActive = Math.round(running);
     }
 
-    const cached = this._sglangCachedTokens(txt);
-    if (cached != null && prompt != null) {
-      this._setPrefillSplitRates(cached, prompt, dtSec);
+    const kinds = this._sglangPrefillKinds(txt);
+    if (kinds != null) {
+      this._setPrefillSplitRates(kinds.cached, kinds.computed, dtSec);
     }
   }
 
   /**
    * Cache split only — does not touch generation/prefill lastTokenCounts.
    * Prefers cache_source="device" so HiCache L1/L2/L3 labels are not summed.
+   * Also drives the sticky prefillTps while in flight (newer SGLang builds
+   * without cached_tokens_total would otherwise leave prefill frozen).
    */
   _applySglangPrefillSplit(txt, dtSec) {
-    const prompt =
-      this._getPromMetric(txt, "sglang:prompt_tokens_total") ??
-      this._getPromMetric(txt, "sglang_prompt_tokens_total");
-    const cached = this._sglangCachedTokens(txt);
-    if (cached != null && prompt != null) {
-      this._setPrefillSplitRates(cached, prompt, dtSec);
+    const kinds = this._sglangPrefillKinds(txt);
+    if (kinds != null) {
+      this._setPrefillSplitRates(kinds.cached, kinds.computed, dtSec);
+      if (this.uncachedPrefillTps != null && this.uncachedPrefillTps > 0) {
+        this._setPrefillTps(this.uncachedPrefillTps, true);
+      } else if (this.cachedPrefillTps != null && this.cachedPrefillTps > 0) {
+        this._setPrefillTps(this.cachedPrefillTps, true);
+      } else if (this.generationTps === 0) {
+        this._setPrefillTps(0, false);
+      }
     }
   }
 
@@ -1025,6 +1040,47 @@ export class LlmProbe {
       this._getPromMetricLabeled(txt, "sglang_cached_tokens_total", "cache_source", "device") ??
       this._getPromMetricMax(txt, "sglang:cached_tokens_total") ??
       this._getPromMetricMax(txt, "sglang_cached_tokens_total")
+    );
+  }
+
+  /**
+   * Live prefill kind counters (cached vs computed). Newer SGLang builds dropped
+   * `cached_tokens_total` in favor of `prefill_effective_tokens_total` modes:
+   * device_hit / host_hit / storage_hit / input. Falls back to that series so
+   * the cached/uncached split still populates (e.g. MiMo-V2.6 on LTD 7/8).
+   * @param {string} txt
+   * @returns {{ cached: number, computed: number } | null} cumulative counts
+   */
+  _sglangPrefillKinds(txt) {
+    const cached = this._sglangCachedTokens(txt);
+    const prompt =
+      this._getPromMetric(txt, "sglang:prompt_tokens_total") ??
+      this._getPromMetric(txt, "sglang_prompt_tokens_total");
+    if (cached != null && prompt != null) {
+      return { cached, computed: prompt };
+    }
+    // prefill_effective_tokens_total: *_hit modes are cache-served tokens;
+    // "input" is computed prefill. Sums across tp/pp/moe rank labels.
+    const effName = "sglang:prefill_effective_tokens_total";
+    const hits =
+      (this._getPromMetricLabeled(txt, effName, "mode", "device_hit") ?? 0) +
+      (this._getPromMetricLabeled(txt, effName, "mode", "host_hit") ?? 0) +
+      (this._getPromMetricLabeled(txt, effName, "mode", "storage_hit") ?? 0);
+    const input = this._getPromMetricLabeled(txt, effName, "mode", "input");
+    if (input == null) return null;
+    if (cached == null && hits === 0 && !this._sglangHasEffectiveHits(txt)) {
+      // No hit series at all → treat everything as computed.
+      return { cached: 0, computed: input };
+    }
+    return { cached: hits, computed: input };
+  }
+
+  _sglangHasEffectiveHits(txt) {
+    const effName = "sglang:prefill_effective_tokens_total";
+    return (
+      this._getPromMetricLabeled(txt, effName, "mode", "device_hit") != null ||
+      this._getPromMetricLabeled(txt, effName, "mode", "host_hit") != null ||
+      this._getPromMetricLabeled(txt, effName, "mode", "storage_hit") != null
     );
   }
 

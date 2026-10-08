@@ -9,6 +9,9 @@ Format: version sections are listed newest first.
 
 ## [Unreleased]
 
+### Added
+- **LLM clients** — live TCP peers on each listen port (`ss -ti`), named from that node's Tailscale Self/Peer map. A client is **serving** only while tok/s is live and that IP's sockets are moving bytes; idle keep-alives (including the dashboard probe) stay listed as idle. Overview `Serving …` only names the live ones.
+
 ---
 
 ## [1.8.5] — 2026-08-28

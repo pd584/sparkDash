@@ -67,10 +67,10 @@ Full history: [CHANGELOG.md](./CHANGELOG.md)
 | **Non-Spark GPU hosts** | Linux boxes with a dedicated NVIDIA GPU are first-class units: same `nvidia-smi` collectors over SSH, detected hardware summary, and separate **RAM** / **VRAM** panels. Detail page: GPU (left) + **RAM → Network → Storage** (right column); Overview cards show RAM and VRAM bars |
 | **Live streaming** | WebSocket metrics with configurable poll intervals; central history store for sparklines across tab switches |
 | **Local + remote** | Host metrics via sysfs/proc/`nvidia-smi`; remotes over SSH (key or password) |
-| **LLM probe** | Auto-detects llama.cpp, vLLM, sglang, ds4-server, or EXL3; live decode/prefill tok/s; cached vs uncached prefill on ds4, llama.cpp, and SGLang; **daily peak** history on the LLM card |
+| **LLM probe** | Auto-detects llama.cpp, vLLM, sglang, ds4-server, or EXL3; live decode/prefill tok/s; cached vs uncached prefill on ds4, llama.cpp, and SGLang; **daily peak** history on the LLM card; **live clients** (TCP peers named from Tailscale) |
 | **ComfyUI** | Opt-in probe: queue/jobs, progress, cancel, Open link, inventory, overview chip |
 | **Hermes Agent** | Opt-in per unit: background update check (10 min), status badges, one-click or batch `hermes update` |
-| **Tailnet** | Opt-in probe: flags a unit that is healthy on the LAN but off its tailnet |
+| **Tailnet** | Opt-in probe: flags a unit that is healthy on the LAN but off its tailnet. Same `tailscale status --json` Peer map names LLM clients |
 | **Decode benchmark** | Multi-concurrency streaming decode tok/s; type picker (Structured / Prose / Code / JSON); lab protocol (temp 0, thinking off); persisted last run |
 | **Prompt Showcase** | Full-page multi-terminal LLM streaming demo (up to 32 prompts) with live tok/s and copy-out |
 | **vLLM health** | KV cache %, run/wait queue, TTFT/E2E/ITL p95, preemptions, prefix cache, MTP accept from Prometheus `/metrics` |
@@ -229,6 +229,10 @@ Asked of **each node about itself**. Peer state is never the verdict. The probe 
 | `tailscaleMonitoring` | `false` | Run `tailscale status --json` and show the Tailnet card |
 
 Env (optional): `POLL_INTERVAL_TAILSCALE` (default `30000`), `TAILSCALE_PROBE_TIMEOUT_MS` (default `8000`).
+
+### LLM clients (who is hitting this model)
+
+The LLM card lists **TCP peers** on that listen port (`ss -Hti` over SSH), named from the same node's `tailscale status --json` Self + Peer map (Tailscale IPs and advertised LAN addrs). A row is **serving** only while the engine tok/s is live **and** that IP's sockets are moving bytes (`lastsnd`/`bytes_sent`). Idle HTTP keep-alives and sparkDash's own `/metrics` probe stay listed as idle. Overview `Serving …` only names the live ones. Unknown IPs still show as the raw address.
 
 ---
 
