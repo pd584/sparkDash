@@ -1389,7 +1389,7 @@ export class LlmProbe {
    * @param {string} txt
    * @param {number} dtSec
    */
-  _applySglangMetrics(txt, dtSec) {
+_applySglangMetrics(txt, dtSec) {
     const gen =
       this._getPromMetric(txt, "sglang:generation_tokens_total") ??
       this._getPromMetric(txt, "sglang_generation_tokens_total");
@@ -1411,14 +1411,72 @@ export class LlmProbe {
       return;
     }
 
-    const compute = this._sglangPrefillComputeTokens(txt);
+    // Prefill accounting: the tile counts every prompt token taken in this
+    // window — cache-served + computed — and the split rows below break it
+    // down. The per-mode counters are exact; prompt_tokens_total alone cannot
+    // tell the two apart (it also folds in host/storage hits), so it is the
+    // fallback for builds without the realtime series.
+    const prefillCompute = this._sglangPrefillComputeTokens(txt);
     const cached = this._sglangCachedTokens(txt);
-    if (cached != null) this.totalCachedTokens = cached;
-    if (compute != null && cached != null) {
-      this._setPrefillSplitRates(cached, compute, dtSec);
+
+    // Difference only against our own baseline; after a server-info hand-off
+    // the first sample seeds instead of reporting the gap between two series.
+    const ownsBaseline = this._sglangTokenSource !== "server_info";
+    const canDiff = ownsBaseline && dtSec > 0 && dtSec < 10;
+    if (canDiff) {
+      const deltaOut = gen - this.lastTokenCounts.output;
+      const gauge = this._sglangGenGauge(txt);
+      const busy = (running != null && running > 0) || this._sglangInflight();
+      if (gauge != null && busy) {
+        this.generationTps = Math.max(0, Math.round(gauge * 100) / 100);
+      } else if (gauge != null) {
+        // Idle, or the completion just landed in the counter. The gauge already
+        // carried the live rate; the counter jump is not another tok/s sample.
+        this.generationTps = 0;
+      } else {
+        this.generationTps = Math.max(0, Math.round((deltaOut / dtSec) * 100) / 100);
+      }
+      if (prefillCompute == null && prompt != null) {
+        // No per-mode counters: the prompt counter is the only total we have.
+        const deltaIn = prompt - this.lastTokenCounts.input;
+        this.prefillTps = Math.max(0, Math.round((deltaIn / dtSec) * 100) / 100);
+      } else if (prefillCompute == null && deltaOut <= 0) {
+        this.prefillTps = 0;
+      }
+    }
+    // Seed outside the rate window too: on the first poll after a restart the
+    // window is unusable, and a stale 0 baseline would turn the engine's
+    // lifetime prompt counter into a rate on the next poll (#99).
+    this.lastTokenCounts.output = gen;
+    if (prompt != null) this.lastTokenCounts.input = prompt;
+    this._sglangTokenSource = "prometheus";
+    this.totalOutputTokens = gen;
+    this.totalPromptTokens = prompt ?? null;
+    // Cached share from the same exposition (device layer preferred).
+    const cachedNow = this._sglangCachedTokens(txt);
+    if (cachedNow != null) this.totalCachedTokens = cachedNow;
+
+    // The tile reads cache-served + computed; the split rows below show the
+    // two parts. Poll-window rates, not latches: a window that prefilled
+    // nothing reads 0 even while unrelated requests are still decoding
+    // (holding the last value here kept a stale number on screen for hours).
+    if (prefillCompute != null && cached != null) {
+      this._setPrefillSplitRates(cached, prefillCompute, dtSec);
+      if (
+        canDiff &&
+        this.uncachedPrefillTps != null &&
+        this.cachedPrefillTps != null
+      ) {
+        const total = this.uncachedPrefillTps + this.cachedPrefillTps;
+        this.prefillTps = Math.max(0, Math.round(total * 100) / 100);
+      }
     }
   }
 
+  /**
+   * Cache split only — does not touch generation/prefill lastTokenCounts.
+   * Prefers cache_source="device" so HiCache L1/L2/L3 labels are not summed.
+   */
   /**
    * Cache split only — does not touch generation/prefill lastTokenCounts.
    * Prefers cache_source="device" so HiCache L1/L2/L3 labels are not summed.

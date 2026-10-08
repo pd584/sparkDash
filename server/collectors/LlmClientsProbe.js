@@ -22,6 +22,10 @@ const MAX_CLIENTS = 32;
 /** lastsnd/lastrcv below this (ms) = tokens still on the wire, not a 2s scrape. */
 const RECENT_MS = 400;
 const ENGINE_TPS_BUSY = 0.5;
+/** Keep a peer on the card this long after its last connection closes. */
+const RECENT_DECAY_MS = 10 * 60_000;
+/** Re-check which process owns the listen ports this often. */
+const LISTEN_CHECK_MS = 60_000;
 
 /**
  * @param {unknown} v
@@ -106,14 +110,17 @@ function emptyAgg() {
  * @returns {Map<number, Map<string, object>>} port → ip → aggregate
  */
 export function parseSsEstablished(text, listenPorts) {
-  const ports = new Set(
-    (Array.isArray(listenPorts) ? listenPorts : [])
-      .map((n) => Number(n))
-      .filter((n) => Number.isInteger(n) && n >= 1 && n <= 65535)
-  );
+  const anyPort = !Array.isArray(listenPorts) || listenPorts.length === 0;
+  const ports = anyPort
+    ? null
+    : new Set(
+        listenPorts
+          .map((n) => Number(n))
+          .filter((n) => Number.isInteger(n) && n >= 1 && n <= 65535)
+      );
   /** @type {Map<number, Map<string, ReturnType<typeof emptyAgg>>>} */
   const byPort = new Map();
-  if (typeof text !== "string" || ports.size === 0) return byPort;
+  if (typeof text !== "string" || (!anyPort && ports.size === 0)) return byPort;
 
   const lines = text.split(/\n/);
   for (let i = 0; i < lines.length; i++) {
@@ -129,7 +136,7 @@ export function parseSsEstablished(text, listenPorts) {
     const local = parseSsAddr(cols[cols.length - 2]);
     const peer = parseSsAddr(cols[cols.length - 1]);
     if (!local || !peer) continue;
-    if (!ports.has(local.port)) continue;
+    if (!anyPort && !ports.has(local.port)) continue;
 
     let lastSndMs = null;
     let lastRcvMs = null;
@@ -324,12 +331,20 @@ export class LlmClientsProbe {
     this._peerAt = 0;
     /** @type {Map<string, { sent: number, recv: number, at: number }>} */
     this._prevBytes = new Map();
+    /** Recently-seen peers, kept after their connections close.
+     * @type {Map<string, { name: string | null, dnsName: string | null, online: boolean | null, lastSeenAt: number }>} */
+    this._recent = new Map();
+    /** Listen-port owners: "docker" when a docker-proxy holds the port.
+     * @type {Map<number, { owner: string, at: number }>} */
+    this._listenOwner = new Map();
     this.error = null;
   }
 
   /** @param {object} spark */
   setTarget(spark) {
     this.spark = spark ?? this.spark;
+    this._recent.clear();
+    this._listenOwner.clear();
     this.error = null;
   }
 
@@ -388,6 +403,129 @@ export class LlmClientsProbe {
   }
 
   /**
+   * Which process listens on these ports? "docker" = docker-proxy owns the
+   * listen socket, so host-side peers are the proxy, not the real clients
+   * (the engine sits in a container netns behind it). Never throws.
+   * @param {number[]} ports
+   * @returns {Promise<void>}
+   */
+  async _refreshListenOwners(ports) {
+    const now = Date.now();
+    const stale = ports.filter((p) => {
+      const e = this._listenOwner.get(p);
+      return !e || now - e.at > LISTEN_CHECK_MS;
+    });
+    if (stale.length === 0) return;
+    let out = "";
+    try {
+      out = await this._run("ss -Htlnp");
+    } catch {
+      return; // keep previous owners; without -p we just don't look through
+    }
+    for (const port of stale) {
+      let owner = "host";
+      for (const line of String(out).split("\n")) {
+        if (!line.includes(":" + port + " ")) continue;
+        if (line.includes("docker-proxy")) owner = "docker";
+        break;
+      }
+      this._listenOwner.set(port, { owner, at: now });
+    }
+  }
+
+  /**
+   * Read ESTAB peers from inside every container netns that could hold the
+   * engine (host listener is docker-proxy). Merges per-port: container peers
+   * carry the pre-NAT client IPs the host cannot see. Best effort — on any
+   * failure the host-side view stands.
+   * @param {number[]} ports
+   * @returns {Promise<Map<number, Map<string, object>> | null>}
+   */
+  async _containerPeers(dockerPorts) {
+    if (dockerPorts.length === 0) return null;
+    let ids = "";
+    try {
+      ids = await this._run("docker ps -q");
+    } catch {
+      return null;
+    }
+    const cids = String(ids).split("\n").map((x) => x.trim()).filter(Boolean).slice(0, 16);
+    /** @type {Map<number, Map<string, object>>} */
+    const merged = new Map();
+    for (const cid of cids) {
+      let text;
+      try {
+        // ss inside the container netns; -Hti has the same shape as the host read.
+        text = await this._run(
+          `CID=${cid}; PID=$(docker inspect -f '{{.State.Pid}}' "$CID" 2>/dev/null); ` +
+          `[ -n "$PID" ] && [ "$PID" != "0" ] && nsenter -t "$PID" -n ss -Hti || true`
+        );
+      } catch {
+        continue;
+      }
+      if (!text || !text.includes("ESTAB")) continue;
+      // The container\'s engine port differs from the host port (NAT), so parse
+      // without a port filter and keep only groups whose peers are not loopback
+      // — the engine\'s inbound traffic, not internal IPC.
+      const counts = parseSsEstablished(text, []);
+      for (const [, ipMap] of counts) {
+        const nonLoop = [...ipMap.entries()].filter(
+          ([ip]) => ip !== "127.0.0.1" && ip !== "::1"
+        );
+        if (nonLoop.length === 0) continue;
+        const port = dockerPorts[0];
+        let dst = merged.get(port);
+        if (!dst) {
+          dst = new Map();
+          merged.set(port, dst);
+        }
+        for (const [ip, agg] of nonLoop) {
+          const cur = dst.get(ip);
+          if (!cur) dst.set(ip, agg);
+          else {
+            cur.connections += agg.connections;
+            cur.recvQ += agg.recvQ;
+            cur.sendQ += agg.sendQ;
+            cur.bytesSent += agg.bytesSent;
+            cur.bytesReceived += agg.bytesReceived;
+            const m = (a, b) => (a == null ? b : b == null ? a : Math.min(a, b));
+            cur.lastSndMs = m(cur.lastSndMs, agg.lastSndMs);
+            cur.lastRcvMs = m(cur.lastRcvMs, agg.lastRcvMs);
+          }
+        }
+      }
+    }
+    return merged.size > 0 ? merged : null;
+  }
+
+  /**
+   * Merge closed-since-last-poll peers back onto the card with a decay
+   * window, so a finished burst still shows who it was serving.
+   * @param {number} port
+   * @param {Map<string, object>} live  ip -> agg for currently-ESTAB peers
+   * @param {Map<string, { name: string, dnsName: string | null, online: boolean | null }>} peerMap
+   */
+  _rememberRecent(port, live, peerMap) {
+    const now = Date.now();
+    for (const [ip, agg] of live) {
+      const peer = peerMap.get(ip);
+      this._recent.set(`${port}|${ip}`, {
+        name: peer?.name ?? (ip === "127.0.0.1" || ip === "::1" ? "local" : null),
+        dnsName: peer?.dnsName ?? null,
+        online: peer?.online ?? null,
+        lastSeenAt: now,
+      });
+    }
+    for (const [key, e] of this._recent) {
+      if (!key.startsWith(port + "|")) continue;
+      if (now - e.lastSeenAt > RECENT_DECAY_MS) this._recent.delete(key);
+      else if (!live.has(key.slice(key.indexOf("|") + 1))) {
+        // keep: still within decay window, connection gone
+      }
+    }
+  }
+
+  /**
    * Never throws.
    * @param {number[]} listenPorts
    * @returns {Promise<{ byPort: Record<number, { clients: object[], error: string | null }>, error: string | null }>}
@@ -436,12 +574,84 @@ export class LlmClientsProbe {
       }
     }
 
-    const counts = parseSsEstablished(ssText, ports);
+    let counts = parseSsEstablished(ssText, ports);
+
+    // docker look-through: when docker-proxy owns a listen port, host-side
+    // peers are the proxy's loopback relays — the real client IP only exists
+    // inside the container netns. Look through only when a docker-owned
+    // port's host view is all-loopback (nothing to lose, SSH cost only then).
+    await this._refreshListenOwners(ports);
+    const dockerPorts = ports.filter(
+      (p) => this._listenOwner.get(p)?.owner === "docker" &&
+        (() => {
+          const host = counts.get(p);
+          return Boolean(host) && [...host.keys()].every((ip) => ip === "127.0.0.1" || ip === "::1");
+        })()
+    );
+    if (dockerPorts.length > 0) {
+      const contPeers = await this._containerPeers(dockerPorts);
+      if (contPeers) {
+        for (const [port, ipMap] of contPeers) {
+          const host = counts.get(port);
+          if (!host) continue;
+          // Drop the proxy's own loopback relay rows and take the container's.
+          for (const ip of [...host.keys()]) host.delete(ip);
+          for (const [ip, agg] of ipMap) {
+            const cur = host.get(ip);
+            if (!cur) host.set(ip, agg);
+            else {
+              cur.connections += agg.connections;
+              cur.recvQ += agg.recvQ; cur.sendQ += agg.sendQ;
+              cur.bytesSent += agg.bytesSent; cur.bytesReceived += agg.bytesReceived;
+              const m = (a, b) => (a == null ? b : b == null ? a : Math.min(a, b));
+              cur.lastSndMs = m(cur.lastSndMs, agg.lastSndMs);
+              cur.lastRcvMs = m(cur.lastRcvMs, agg.lastRcvMs);
+            }
+          }
+        }
+      }
+    }
+
     const byPort = resolveClients(counts, this._peerMap, (port, ip, sent, recv) =>
       this._bytesPerSec(port, ip, sent, recv)
     );
     for (const port of ports) {
-      if (!byPort[port]) byPort[port] = { clients: [], error: null };
+      const entry = (byPort[port] = byPort[port] || { clients: [], error: null });
+      // Decay memory: peers whose connections closed this window stay listed.
+      const live = new Map((counts.get(port) || new Map()).entries());
+      this._rememberRecent(port, live, this._peerMap);
+      const now = Date.now();
+      const have = new Set(entry.clients.map((c) => c.ip));
+      for (const [key, e] of this._recent) {
+        if (!key.startsWith(port + "|")) continue;
+        const ip = key.slice(key.indexOf("|") + 1);
+        if (have.has(ip) || now - e.lastSeenAt > RECENT_DECAY_MS) continue;
+        if (
+          this._listenOwner.get(port)?.owner === "docker" &&
+          (ip === "127.0.0.1" || ip === "::1")
+        ) {
+          // Proxy relay rows are replaced by look-through; don't resurrect.
+          this._recent.delete(key);
+          continue;
+        }
+        if (entry.clients.length >= MAX_CLIENTS) break;
+        entry.clients.push({
+          ip,
+          name: e.name,
+          dnsName: e.dnsName,
+          connections: 0,
+          online: e.online,
+          recvQ: 0,
+          sendQ: 0,
+          lastSndMs: null,
+          lastRcvMs: null,
+          bytesPerSec: 0,
+          serving: false,
+          recent: true,
+          lastSeenAt: e.lastSeenAt,
+        });
+      }
+      entry.clients.sort(sortClients);
     }
     this.error = null;
     return { byPort, error: null };

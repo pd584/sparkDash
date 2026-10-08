@@ -182,3 +182,60 @@ test("LlmClientsProbe parses a combined ss + tailscale dump", async () => {
   assert.equal(igor.connections, 2);
   probe.dispose();
 });
+
+test("decay memory keeps a closed peer listed as recent for the window", async () => {
+  const probe = new LlmClientsProbe({ id: "x", isLocal: true, lanIp: "10.0.0.5", llmPorts: [8888] });
+  const ss1 = "ESTAB 0 0  0.0.0.0:8888 10.0.0.105:40001\n\t lastsnd:12 lastrcv:20 bytes_sent:100 bytes_received:5000";
+  probe._run = async () => ss1;
+  probe._refreshListenOwners = async () => {};
+  probe._containerPeers = async () => null;
+  const snap1 = await probe.probe([8888]);
+  assert.ok(snap1.byPort[8888].clients.some((c) => c.ip === "10.0.0.105"));
+  // Connection closed on the next poll: decay memory keeps it, as recent.
+  probe._run = async () => "ESTAB 0 0  0.0.0.0:8888 10.0.0.9:40100\n\t lastsnd:3000 lastrcv:3000 bytes_sent:50 bytes_received:60";
+  const snap2 = await probe.probe([8888]);
+  const recent = snap2.byPort[8888].clients.find((c) => c.ip === "10.0.0.105");
+  assert.ok(recent, "closed peer still listed");
+  assert.equal(recent.recent, true);
+  assert.equal(recent.connections, 0);
+  assert.equal(recent.serving, false);
+  const marked = annotateServing(snap2.byPort[8888].clients, { generationTps: 90 });
+  assert.equal(marked.find((c) => c.ip === "10.0.0.105").serving, false);
+});
+
+test("decay memory prunes entries older than the window", async () => {
+  const probe = new LlmClientsProbe({ id: "x", isLocal: true, lanIp: "10.0.0.5", llmPorts: [8888] });
+  probe._run = async () => "ESTAB 0 0  0.0.0.0:8888 10.0.0.7:41000\n\t lastsnd:5 lastrcv:5 bytes_sent:1 bytes_received:1";
+  probe._refreshListenOwners = async () => {};
+  probe._containerPeers = async () => null;
+  await probe.probe([8888]);
+  const key = [...probe._recent.keys()][0];
+  const e = probe._recent.get(key);
+  probe._recent.set(key, { ...e, lastSeenAt: Date.now() - (10 * 60_000 + 1000) });
+  const snap = await probe.probe([8888]);
+  assert.ok(!snap.byPort[8888].clients.some((c) => c.ip === "10.0.0.7" && c.recent));
+});
+
+test("docker look-through swaps proxy loopback rows for container peer IPs", async () => {
+  const probe = new LlmClientsProbe({ id: "bert", isLocal: false, lanIp: "10.0.10.108", ssh: { host: "10.0.10.108", user: "u", auth: "key" }, llmPorts: [11434] });
+  const hostSs =
+    "LISTEN 0 0 0.0.0.0:11434 0.0.0.0:* users:((\"docker-proxy\",pid=1,fd=7))\n" +
+    "ESTAB 0 0  127.0.0.1:11434 127.0.0.1:59000\n\t lastsnd:20 lastrcv:25 bytes_sent:900 bytes_received:400";
+  const contSs =
+    "ESTAB 0 0  172.17.0.2:8001 10.0.10.105:42386\n\t lastsnd:30 lastrcv:40 bytes_sent:8000 bytes_received:90000";
+  probe._run = async (cmd) => {
+    const c = String(cmd);
+    if (c.includes("ss -Htlnp")) return hostSs.split("\n")[0];
+    if (c.includes("docker ps -q")) return "abc123";
+    if (c.includes("nsenter")) return contSs;
+    return hostSs;
+  };
+  probe._peerMap = new Map([["10.0.10.105", { name: "igor", dnsName: "igor.tail", online: true }]]);
+  probe._peerAt = Date.now();
+  const snap = await probe.probe([11434]);
+  const ips = snap.byPort[11434].clients.map((c) => c.ip);
+  assert.ok(ips.includes("10.0.10.105"), "real client IP from container netns");
+  assert.ok(!ips.includes("127.0.0.1"), "proxy relay row replaced");
+  const igor = snap.byPort[11434].clients.find((c) => c.ip === "10.0.10.105");
+  assert.equal(igor.name, "igor");
+});
