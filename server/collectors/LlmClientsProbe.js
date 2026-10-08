@@ -477,10 +477,13 @@ export class LlmClientsProbe {
     for (const cid of cids) {
       let text;
       try {
-        // ss inside the container netns; -Hti has the same shape as the host read.
+        // ss inside the container netns; -Hti has the same shape as the host
+        // read. nsenter into another netns needs CAP_SYS_ADMIN, so the whole
+        // chain runs under sudo -n (docker inspect alone can work unprivileged
+        // while nsenter still fails silently — empty output, zero ESTAB).
         text = await this._run(
-          `CID=${cid}; PID=$(docker inspect -f '{{.State.Pid}}' "$CID" 2>/dev/null); ` +
-          `[ -n "$PID" ] && [ "$PID" != "0" ] && nsenter -t "$PID" -n ss -Hti || true`
+          `CID=${cid}; PID=$(sudo -n docker inspect -f '{{.State.Pid}}' "$CID" 2>/dev/null); ` +
+          `[ -n "$PID" ] && [ "$PID" != "0" ] && sudo -n nsenter -t "$PID" -n ss -Hti || true`
         );
       } catch {
         continue;
