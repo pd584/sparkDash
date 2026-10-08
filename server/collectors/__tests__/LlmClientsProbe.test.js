@@ -275,3 +275,30 @@ test("unknown owner with all-loopback host view still attempts look-through", as
   const ips = snap.byPort[11434].clients.map((c) => c.ip);
   assert.ok(ips.includes("10.0.10.105"), "look-through ran despite unknown owner");
 });
+
+test("sticky serving keeps a chunked streamer lit between flush gaps", async () => {
+  const probe = new LlmClientsProbe({ id: "b", isLocal: false, ssh: { host: "x", user: "u", auth: "key" }, llmPorts: [8888] });
+  // Poll 1: igor's socket is mid-flush (lastsnd 68ms) -> active.
+  probe._run = async () => "ESTAB 0 0  0.0.0.0:8888 10.0.0.105:52000\n\t lastsnd:68 lastrcv:70 bytes_sent:1000 bytes_received:400";
+  probe._refreshListenOwners = async () => {};
+  probe._containerPeers = async () => null;
+  const s1 = await probe.probe([8888]);
+  const ages1 = s1.byPort[8888].activeAgesMs;
+  let marked = annotateServing(s1.byPort[8888].clients, { generationTps: 250 }, ages1);
+  assert.equal(marked.find((c) => c.ip === "10.0.0.105").serving, true);
+  // Poll 2, 800ms later: igor between chunks (lastsnd 1200ms > 400 gate) but
+  // the sticky window (3s) keeps it lit; a fresh idle peer stays unlit.
+  probe._recent.clear();
+  probe._run = async () => "ESTAB 0 0  0.0.0.0:8888 10.0.0.105:52000\n\t lastsnd:1200 lastrcv:1206 bytes_sent:1600 bytes_received:700\nESTAB 0 0  0.0.0.0:8888 10.0.0.9:53000\n\t lastsnd:4000 lastrcv:4000 bytes_sent:10 bytes_received:10";
+  const s2 = await probe.probe([8888]);
+  marked = annotateServing(s2.byPort[8888].clients, { generationTps: 250 }, s2.byPort[8888].activeAgesMs);
+  assert.equal(marked.find((c) => c.ip === "10.0.0.105").serving, true);
+  assert.equal(marked.find((c) => c.ip === "10.0.0.9").serving, false);
+  // Poll 3, 4s later: sticky expired, still above gate -> unlit.
+  probe._recent.clear();
+  for (const [k, v] of probe._activeAt) probe._activeAt.set(k, v - 4000);
+  probe._run = async () => "ESTAB 0 0  0.0.0.0:8888 10.0.0.105:52000\n\t lastsnd:1300 lastrcv:1300 bytes_sent:1700 bytes_received:750";
+  const s3 = await probe.probe([8888]);
+  marked = annotateServing(s3.byPort[8888].clients, { generationTps: 250 }, s3.byPort[8888].activeAgesMs);
+  assert.equal(marked.find((c) => c.ip === "10.0.0.105").serving, false);
+});

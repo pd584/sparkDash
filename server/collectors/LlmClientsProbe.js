@@ -301,9 +301,17 @@ export function socketLooksActive(c) {
  * @param {object} [engine]
  * @returns {object[]}
  */
-export function annotateServing(clients, engine) {
+export function annotateServing(clients, engine, activeAgesMs) {
   const list = Array.isArray(clients) ? clients.map((c) => ({ ...c, serving: false })) : [];
   if (!engineIsBusy(engine) || list.length === 0) return list.sort(sortClients);
+  // Chunked streamers (sglang flushes ~1.5s apart) spend most of a stream
+  // above the 400ms lastsnd gate, so a fresh "active" observation sticks for
+  // a few seconds: still lit while the engine stays busy.
+  const sticky = new Set(
+    activeAgesMs instanceof Map
+      ? [...activeAgesMs.entries()].filter(([, age]) => age >= 0 && age < 3000).map(([ip]) => ip)
+      : []
+  );
 
   const remote = list.filter((c) => c.ip !== "127.0.0.1" && c.ip !== "::1");
   const active = list.filter((c) => socketLooksActive(c));
@@ -315,6 +323,12 @@ export function annotateServing(clients, engine) {
   // present — a single idle keep-alive from igor would light up every poll.
   const hasTiming = list.some((c) => c.lastSndMs != null || c.lastRcvMs != null);
   if (winners.length === 0 && !hasTiming && remote.length === 1) winners = remote;
+  if (winners.length === 0) {
+    // Nobody's socket looks active right now, but a chunked stream may have
+    // lit up moments ago: fall back to recently-active non-loopback peers.
+    const stickyRemote = [...sticky].filter((ip) => ip !== "127.0.0.1" && ip !== "::1");
+    if (stickyRemote.length > 0) winners = stickyRemote.map((ip) => ({ ip }));
+  }
   const winSet = new Set(winners.map((c) => c.ip));
   for (const c of list) c.serving = winSet.has(c.ip);
   return list.sort(sortClients);
@@ -337,6 +351,9 @@ export class LlmClientsProbe {
     /** Listen-port owners: "docker" when a docker-proxy holds the port.
      * @type {Map<number, { owner: string, at: number }>} */
     this._listenOwner = new Map();
+    /** ip-keyed (port|ip) last socketLooksActive observation. Client side keeps ages.
+     * @type {Map<string, number>} */
+    this._activeAt = new Map();
     this.error = null;
   }
 
@@ -345,6 +362,7 @@ export class LlmClientsProbe {
     this.spark = spark ?? this.spark;
     this._recent.clear();
     this._listenOwner.clear();
+    this._activeAt.clear();
     this.error = null;
   }
 
@@ -640,6 +658,20 @@ export class LlmClientsProbe {
     const byPort = resolveClients(counts, this._peerMap, (port, ip, sent, recv) =>
       this._bytesPerSec(port, ip, sent, recv)
     );
+    const now = Date.now();
+    /** port -> ip -> ms since last socketLooksActive observation */
+    const activeAges = new Map();
+    for (const [port, entry] of Object.entries(byPort)) {
+      const ages = new Map();
+      const portNum = Number(port);
+      for (const c of entry.clients) {
+        const key = portNum + "|" + c.ip;
+        if (socketLooksActive(c)) this._activeAt.set(key, now);
+        const at = this._activeAt.get(key);
+        if (at != null) ages.set(c.ip, Math.max(0, now - at));
+      }
+      activeAges.set(portNum, ages);
+    }
     for (const port of ports) {
       const entry = (byPort[port] = byPort[port] || { clients: [], error: null });
       // Decay memory: peers whose connections closed this window stay listed.
@@ -677,6 +709,10 @@ export class LlmClientsProbe {
         });
       }
       entry.clients.sort(sortClients);
+      entry.activeAgesMs = activeAges.get(port) || new Map();
+    }
+    for (const [key, at] of this._activeAt) {
+      if (now - at > 60_000) this._activeAt.delete(key);
     }
     this.error = null;
     return { byPort, error: null };

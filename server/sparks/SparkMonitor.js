@@ -768,7 +768,7 @@ export class SparkMonitor {
             const entry = clientsSnap.byPort[ports[i]];
             return {
               ...snap,
-              clients: annotateServing(entry?.clients ?? [], snap),
+              clients: annotateServing(entry?.clients ?? [], snap, entry?.activeAgesMs),
               clientsError: entry?.error ?? clientsSnap.error ?? null,
             };
           });
