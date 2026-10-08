@@ -3,19 +3,14 @@ import type { NetworkMetrics } from "../../api/types";
 import { updateDisabledInterfaces } from "../../api/client";
 import { Panel } from "../ui/Panel";
 import { NetworkIcon, GearIcon } from "../ui/icons";
+import { formatBytesPerSec } from "../../shared/formatBytes";
 
 interface NetworkPanelProps {
   network: NetworkMetrics | null;
   sparkId: string;
   disabledInterfaces: string[];
   onDisabledChange: (interfaces: string[]) => void;
-}
-
-function formatSpeed(bytesPerSec: number): string {
-  if (bytesPerSec >= 1024 * 1024 * 1024) return `${(bytesPerSec / 1024 / 1024 / 1024).toFixed(1)} GB/s`;
-  if (bytesPerSec >= 1024 * 1024) return `${(bytesPerSec / 1024 / 1024).toFixed(1)} MB/s`;
-  if (bytesPerSec >= 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
-  return `${bytesPerSec} B/s`;
+  className?: string;
 }
 
 function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
@@ -42,6 +37,7 @@ export function NetworkPanel({
   sparkId,
   disabledInterfaces,
   onDisabledChange,
+  className,
 }: NetworkPanelProps) {
   const [showSettings, setShowSettings] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -79,7 +75,7 @@ export function NetworkPanel({
       title="Network"
       accent
       icon={<NetworkIcon />}
-      className="panel-network"
+      className={`panel-network ${className ?? ""}`}
       actions={
         <button
           type="button"
@@ -159,9 +155,9 @@ export function NetworkPanel({
                       )}
                     </span>
                     <span className="font-tabular text-xs text-text">
-                      <span className="text-accent">↑</span> {formatSpeed(iface.txSpeed)}
+                      <span className="text-accent">↑</span> {formatBytesPerSec(iface.txSpeed)}
                       <span className="mx-1.5 text-border">·</span>
-                      <span className="text-accent">↓</span> {formatSpeed(iface.rxSpeed)}
+                      <span className="text-accent">↓</span> {formatBytesPerSec(iface.rxSpeed)}
                     </span>
                   </div>
                 );

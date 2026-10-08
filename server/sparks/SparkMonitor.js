@@ -1,13 +1,16 @@
 import fs from "fs";
 import path from "path";
-import { SystemCollector } from "../collectors/SystemCollector.js";
+import {
+  SystemCollector,
+  collectionWasSuccessful,
+} from "../collectors/SystemCollector.js";
 import { LlmProbe } from "../collectors/LlmProbe.js";
 import { ComfyProbe } from "../collectors/ComfyProbe.js";
 import { HermesProbe } from "../collectors/HermesProbe.js";
 import { TailscaleProbe } from "../collectors/TailscaleProbe.js";
 import { LlmClientsProbe, annotateServing } from "../collectors/LlmClientsProbe.js";
 import { llmDaily } from "../collectors/LlmDaily.js";
-import { sshTest, sshExec } from "../collectors/ssh.js";
+import { sshExec } from "../collectors/ssh.js";
 import {
   POLL_INTERVAL_GPU,
   POLL_INTERVAL_CPU,
@@ -24,6 +27,55 @@ import {
   HOST_PATHS,
 } from "../config.js";
 
+/**
+ * Liveness retry schedule. Network failures widen gradually — a rebooting host
+ * comes back on its own. Credential failures get a handful of quick attempts
+ * and then effectively stop: they are a configuration problem, and hammering a
+ * host that keeps refusing us is exactly how one mistyped unit produced ~60k
+ * failed logins a day. The slow tail is kept so the unit recovers by itself
+ * when the fix happens on the *remote* side (an authorized_keys entry added
+ * there never touches this install), and editing the unit resets the count so
+ * a local fix retries immediately.
+ */
+const LIVENESS_BACKOFF_MS = [5_000, 15_000, 30_000, 60_000];
+/** Quick attempts before a credential failure is treated as "stopped". */
+const LIVENESS_AUTH_ATTEMPTS = 5;
+/** Safety-net cadence once those attempts are spent: ~96 logins a day, not 60k. */
+const LIVENESS_AUTH_IDLE_MS = 15 * 60_000;
+
+/** True when the liveness error is a credential problem, not a network one. */
+export function isSshAuthFailure(message) {
+  return /permission denied|publickey|password|authentication/i.test(String(message || ""));
+}
+
+/** How long to wait before the next liveness attempt. */
+export function nextLivenessDelayMs(failures, reason) {
+  if (isSshAuthFailure(reason)) {
+    if (failures >= LIVENESS_AUTH_ATTEMPTS) return LIVENESS_AUTH_IDLE_MS;
+    return LIVENESS_BACKOFF_MS[Math.min(Math.max(failures, 1), LIVENESS_BACKOFF_MS.length) - 1];
+  }
+  const index = Math.min(Math.max(failures, 1), LIVENESS_BACKOFF_MS.length) - 1;
+  return LIVENESS_BACKOFF_MS[index];
+}
+
+/** True once credential failures have used up their quick attempts. */
+export function sshAuthGaveUp(failures) {
+  return failures >= LIVENESS_AUTH_ATTEMPTS;
+}
+
+/** Short, human-readable liveness failure for the UI. */
+export function livenessReason(err) {
+  const raw = String(err?.message || err || "").trim();
+  if (!raw) return "unreachable";
+  if (/timed out|timeout|ETIMEDOUT/i.test(raw)) return "connection timed out";
+  if (/ECONNREFUSED|refused/i.test(raw)) return "connection refused";
+  if (/EHOSTUNREACH|no route|ENETUNREACH/i.test(raw)) return "no route to host";
+  if (isSshAuthFailure(raw)) {
+    return "SSH authentication failed — check the key or user for this unit";
+  }
+  return raw.split("\n")[0].slice(0, 140);
+}
+
 const ONLINE_GRACE_MS = 10000;
 
 /**
@@ -33,13 +85,18 @@ const ONLINE_GRACE_MS = 10000;
 export class SparkMonitor {
   /**
    * @param {object} spark
-   * @param {{ onWolMac?: (sparkId: string, mac: string) => void }} [options]
+   * @param {{ onWolMac?: (sparkId: string, mac: string) => void, onHermesChange?: () => void, resolveHeadModelId?: ((headId: string) => string | null) }} [options]
    */
   constructor(spark, options = {}) {
     this.spark = spark;
     this._onWolMac = typeof options.onWolMac === "function" ? options.onWolMac : null;
     this._onHermesChange =
       typeof options.onHermesChange === "function" ? options.onHermesChange : null;
+    // Resolver for worker derived label: maps a head spark id to its live
+    // LLM model id (or null when unknown). Wired by index.js from the monitor
+    // map; never writes back to registry config (derived display only).
+    this._resolveHeadModelId =
+      typeof options.resolveHeadModelId === "function" ? options.resolveHeadModelId : null;
     this.collector = new SystemCollector(spark);
 
     // One LlmProbe per port — none when LLM monitoring is off
@@ -87,6 +144,14 @@ export class SparkMonitor {
     // Online status from dedicated liveness checks (not metric poll success)
     this.online = false;
     this.lastOnlineOk = 0;
+    /** Why liveness last failed — surfaced so a broken unit is diagnosable. */
+    this.offlineReason = null;
+    /** Consecutive liveness failures, used for the retry backoff. */
+    this._livenessFailures = 0;
+    /** Earliest timestamp for the next liveness attempt (0 = now). */
+    this._nextLivenessAt = 0;
+    /** Whether collector polls are currently suspended (logged once). */
+    this._pollsPaused = false;
 
     // System uptime seconds (from /proc/uptime), null when offline
     this._uptimeSeconds = null;
@@ -104,6 +169,13 @@ export class SparkMonitor {
       tailscale: null,
     };
     this._lastUpdate = {};
+    this._metricCollectionSuccessful = { gpu: false, cpu: false };
+    /**
+     * Last poll (epoch ms) in which each LLM port generated or prefilled
+     * tokens. In-memory only — null again after a restart until traffic.
+     * @type {Map<number, number>}
+     */
+    this._llmLastActiveAt = new Map();
 
     // Hardware summary: kind "spark" uses the static DGX Spark specs; kind
     // "host" (dedicated GPU Linux box) detects real hardware once in the
@@ -131,17 +203,27 @@ export class SparkMonitor {
     /** @type {ReturnType<typeof setInterval> | null} */
     this._tailscaleIntervalId = null;
     this._running = false;
-    /** @type {Record<string, boolean>} in-flight domain guards */
+    this._runGeneration = 0;
+    /** @type {Record<string, boolean | symbol>} in-flight domain guards */
     this._inflight = {};
   }
 
   /** Hot-update config without tearing down poll loops / rate baselines. */
   updateConfig(spark) {
+    // A unit edit is the user telling us something changed — most often the key
+    // or user — so the credential backoff starts over and the next liveness
+    // attempt is immediate.
+    this._livenessFailures = 0;
+    this._nextLivenessAt = 0;
     const wasLlm = this._llmMonitoringEnabled(this.spark);
     const wasComfy = this._comfyMonitoringEnabled(this.spark);
     const prevComfyPort = this._comfyPort(this.spark);
     const wasHermes = this._hermesMonitoringEnabled(this.spark);
     const wasTailscale = this._tailscaleMonitoringEnabled(this.spark);
+    this.collector.invalidatePendingCollections();
+    this._runGeneration += 1;
+    this._inflight = {};
+    this._metricCollectionSuccessful = { gpu: false, cpu: false };
     this.spark = spark;
     this.collector.spark = spark;
 
@@ -240,6 +322,50 @@ export class SparkMonitor {
     return spark?.llmMonitoring !== false;
   }
 
+  /**
+   * Live LLM model id from this monitor's own probes (first non-empty
+   * modelId on an AVAILABLE entry across ports), or null when unknown /
+   * offline / protected. Protected/auth-failure snapshots can retain a
+   * previous modelId with available:false — those entries are skipped so a
+   * dead or locked head never yields a stale model (fail-closed).
+   * @returns {string | null}
+   */
+  headLlmModelId() {
+    const llm = this._metrics?.llm;
+    if (!Array.isArray(llm)) return null;
+    for (const entry of llm) {
+      if (entry?.available !== true) continue;
+      const id = typeof entry?.modelId === "string" ? entry.modelId.trim() : "";
+      if (id) return id;
+    }
+    return null;
+  }
+
+  /**
+   * Derived worker label: mirror the head's live served model. Display-only —
+   * never written back to registry config. Non-null only when ALL hold:
+   * role is worker, workerHeadId points at another spark, and the resolver
+   * yields a non-empty model id. A hand-written workerLabel (non-empty) is a
+   * manual override and takes display priority in the frontend; it does not
+   * suppress this derived value.
+   * @returns {string | null}
+   */
+  workerDerivedLabel() {
+    const spark = this.spark || {};
+    const role = spark.role || (spark.workerNode ? "worker" : "standalone");
+    if (role !== "worker") return null;
+    const headId = typeof spark.workerHeadId === "string" ? spark.workerHeadId.trim() : "";
+    if (!headId || headId === spark.id) return null;
+    if (typeof this._resolveHeadModelId !== "function") return null;
+    let model = null;
+    try {
+      model = this._resolveHeadModelId(headId);
+    } catch {
+      return null;
+    }
+    return typeof model === "string" && model.trim() ? model.trim() : null;
+  }
+
   /** Start or clear the LLM poll timer based on monitoring flag. */
   _restartLlmPollInterval() {
     if (this._llmIntervalId != null) {
@@ -333,6 +459,34 @@ export class SparkMonitor {
     }
   }
 
+  /**
+   * Record which LLM ports served tokens in this poll and return the probe
+   * results with `lastActiveAt` (epoch ms, or null if never seen serving
+   * since the server started) on each entry. Ports no longer probed are
+   * forgotten so a re-added port does not resurface an old timestamp.
+   * @param {Array<{ port: number }>} probes  same order as `results`
+   * @param {Array<Record<string, unknown>>} results
+   */
+  _stampLlmLastActive(probes, results) {
+    const now = Date.now();
+    const ports = new Set();
+    const stamped = results.map((entry, i) => {
+      const port = probes[i]?.port;
+      if (port == null || !entry || typeof entry !== "object") return entry;
+      ports.add(port);
+      const gen = Number(entry.generationTps);
+      const pre = Number(entry.prefillTps);
+      if ((Number.isFinite(gen) && gen > 0) || (Number.isFinite(pre) && pre > 0)) {
+        this._llmLastActiveAt.set(port, now);
+      }
+      return { ...entry, lastActiveAt: this._llmLastActiveAt.get(port) ?? null };
+    });
+    for (const port of this._llmLastActiveAt.keys()) {
+      if (!ports.has(port)) this._llmLastActiveAt.delete(port);
+    }
+    return stamped;
+  }
+
   /** Returns array of LLM ports from spark config. */
   _llmPorts() {
     const raw = this.spark?.llmPorts;
@@ -351,6 +505,7 @@ export class SparkMonitor {
   /** Start background polling. */
   start() {
     if (this._running) return;
+    this._runGeneration += 1;
     this._running = true;
     this._stopped = false;
     this._poll();
@@ -371,6 +526,9 @@ export class SparkMonitor {
 
   /** Stop background polling. */
   stop() {
+    this.collector.invalidatePendingCollections();
+    this._runGeneration += 1;
+    this._metricCollectionSuccessful = { gpu: false, cpu: false };
     this._running = false;
     this._stopped = true;
     for (const id of this._intervals) clearInterval(id);
@@ -400,6 +558,8 @@ export class SparkMonitor {
       name: this.spark.name,
       kind: this.spark.kind || "spark",
       online: this.online,
+      /** Last liveness failure, or null. "offline" with no reason is a bug. */
+      offlineReason: this.online ? null : this.offlineReason,
       uptime: this._uptimeSeconds,
       lanIp: this.spark.lanIp || "",
       isLocal: Boolean(this.spark.isLocal),
@@ -410,6 +570,9 @@ export class SparkMonitor {
       role: this.spark.role || (this.spark.workerNode ? "worker" : "standalone"),
       workerLabel: this.spark.workerLabel || null,
       workerHeadId: this.spark.workerHeadId || null,
+      // Derived display label (head model mirror). Raw workerLabel above is
+      // untouched — frontend prefers a non-empty manual label over this.
+      workerDerivedLabel: this.workerDerivedLabel(),
       llmMonitoring: this._llmMonitoringEnabled(),
       llmPort: ports[0] ?? LLM_PORT,
       llmPorts: ports,
@@ -462,36 +625,62 @@ export class SparkMonitor {
   // ─── Liveness ─────────────────────────────────────────────
   async _checkOnline() {
     if (!this._running || this._inflight.online) return;
-    this._inflight.online = true;
+    // Backoff gate: a unit that keeps refusing us is probed on a widening
+    // schedule (see _scheduleNextLiveness) instead of every 5 seconds forever.
+    if (Date.now() < this._nextLivenessAt) return;
+    const runGeneration = this._runGeneration;
+    const checkToken = Symbol("online");
+    this._inflight.online = checkToken;
+    const isCurrentRun = () =>
+      this._running && this._runGeneration === runGeneration;
+    const local = this.spark.isLocal;
+    let uptimeSeconds = this._uptimeSeconds;
     try {
-      if (this.spark.isLocal) {
+      if (local) {
         await this.collector.pingHost();
+        if (!isCurrentRun()) return;
+        this.online = true;
+        this.lastOnlineOk = Date.now();
+        // Non-fatal — uptime stays at its previous value or null
+        try {
+          uptimeSeconds = await this._readUptime();
+        } catch {
+          /* ignore */
+        }
       } else {
-        const result = await sshTest(this.spark);
-        // Re-check after the (up to 10s) SSH await — `stop()` may have fired
-        // mid-flight (removeSpark / updateSpark). Bail before mutating state or
-        // running into a stopped registry entry.
-        if (!this._running) return;
-        if (!result.ok) throw new Error(result.message);
+        // One SSH round trip, not two. Reading /proc/uptime already proves the
+        // session came up, so the separate `echo ok` probe told us nothing the
+        // uptime read doesn't — and on a remote Spark every probe is a full
+        // login, which is the expensive half of this loop.
+        uptimeSeconds = await this._readUptime();
+        // The generation gate below (after the await) is the commit guard.
       }
-      if (!this._running) return;
+      if (!isCurrentRun()) return;
+      const wasOffline = !this.online;
       this.online = true;
+      this.offlineReason = null;
+      this._livenessFailures = 0;
+      this._nextLivenessAt = 0;
       this.lastOnlineOk = Date.now();
-
-      // Collect system uptime
-      try {
-        this._uptimeSeconds = await this._readUptime();
-      } catch {
-        // Non-fatal — uptime stays at previous value or null
-      }
-    } catch {
-      if (!this._running) return;
+      this._uptimeSeconds = uptimeSeconds;
+      void wasOffline;
+    } catch (err) {
+      if (!isCurrentRun()) return;
+      this._livenessFailures += 1;
+      const reason = livenessReason(err);
+      this.offlineReason =
+        isSshAuthFailure(reason) && sshAuthGaveUp(this._livenessFailures)
+          ? `${reason} (paused after ${this._livenessFailures} attempts — edit the unit to retry now)`
+          : reason;
+      this._nextLivenessAt = Date.now() + nextLivenessDelayMs(this._livenessFailures, this.offlineReason);
       if (!this.lastOnlineOk || Date.now() - this.lastOnlineOk > ONLINE_GRACE_MS) {
         this.online = false;
         this._uptimeSeconds = null;
       }
     } finally {
-      this._inflight.online = false;
+      if (this._inflight.online === checkToken) {
+        this._inflight.online = false;
+      }
     }
   }
 
@@ -515,6 +704,24 @@ export class SparkMonitor {
 
   async _pollDomain(domain) {
     if (!this._running || this._inflight[domain]) return;
+    // A remote unit that just failed liveness is unreachable for everything —
+    // metrics, tunnels, SSH commands. Polling it anyway is how one broken unit
+    // produced ~60k failed SSH logins a day: every domain interval fired, every
+    // attempt failed, nothing backed off. Local units are exempt (their checks
+    // read /proc and /sys and are cheap and honest about partial failures).
+    if (!this.spark.isLocal && !this.online) {
+      if (!this._pollsPaused) {
+        this._pollsPaused = true;
+        console.log(
+          `[SparkMonitor] ${this.spark.id}: unreachable (${this.offlineReason || "no liveness"}) — pausing collector polls`
+        );
+      }
+      return;
+    }
+    if (this._pollsPaused) {
+      this._pollsPaused = false;
+      console.log(`[SparkMonitor] ${this.spark.id}: reachable again — resuming collector polls`);
+    }
     // Skip storage auto-poll when disabled for this spark
     if (domain === "storage" && this.spark.storagePollDisabled) return;
     // Worker nodes: no local LLM API
@@ -522,7 +729,9 @@ export class SparkMonitor {
     if (domain === "comfy" && !this._comfyMonitoringEnabled()) return;
     if (domain === "hermes" && !this._hermesMonitoringEnabled()) return;
     if (domain === "tailscale" && !this._tailscaleMonitoringEnabled()) return;
-    this._inflight[domain] = true;
+    const runGeneration = this._runGeneration;
+    const pollToken = Symbol(domain);
+    this._inflight[domain] = pollToken;
     try {
       let result;
       switch (domain) {
@@ -580,13 +789,15 @@ export class SparkMonitor {
       // isn't user-visible (monitors.delete already happened) but it's a
       // latent class of bug worth killing, and a replaced monitor could
       // otherwise race the tail-end await onto the wrong object.
-      if (!this._running) return;
+      if (!this._running || this._runGeneration !== runGeneration) return;
       switch (domain) {
         case "gpu":
           this._metrics.gpu = result;
+          this._metricCollectionSuccessful.gpu = collectionWasSuccessful(result);
           break;
         case "cpu":
           this._metrics.cpu = result;
+          this._metricCollectionSuccessful.cpu = collectionWasSuccessful(result);
           break;
         case "ram":
           this._metrics.ram = result;
@@ -608,9 +819,9 @@ export class SparkMonitor {
           this._metrics.unifiedMemory = result;
           break;
         case "llm":
-          this._metrics.llm = result;
           {
             const probes = Array.from(this.llmProbes.values());
+            this._metrics.llm = this._stampLlmLastActive(probes, result);
             for (let i = 0; i < result.length; i++) {
               const probe = probes[i];
               if (probe) llmDaily.record(this.spark.id, probe.port, result[i]);
@@ -629,34 +840,39 @@ export class SparkMonitor {
       }
       this._lastUpdate[domain] = Date.now();
     } catch (err) {
+      if (
+        this._running &&
+        this._runGeneration === runGeneration &&
+        (domain === "gpu" || domain === "cpu")
+      ) {
+        this._metricCollectionSuccessful[domain] = false;
+      }
       console.error(`[SparkMonitor] ${this.spark.id} ${domain} poll error:`, err.message);
     } finally {
-      this._inflight[domain] = false;
+      if (this._inflight[domain] === pollToken) {
+        this._inflight[domain] = false;
+      }
     }
   }
 
   /** Manually refresh a single domain, bypassing auto-poll guards. */
   async refreshDomain(domain) {
-    if (this._inflight[domain]) return;
-    this._inflight[domain] = true;
+    if (domain !== "storage") return this._pollDomain(domain);
+    if (!this._running || this._inflight[domain]) return;
+    const runGeneration = this._runGeneration;
+    const refreshToken = Symbol(domain);
+    this._inflight[domain] = refreshToken;
     try {
-      let result;
-      switch (domain) {
-        case "storage":
-          result = await this.collector.collectStorage();
-          break;
-        default:
-          // Fall back to _pollDomain for other domains
-          this._inflight[domain] = false;
-          return this._pollDomain(domain);
-      }
-      if (!this._running) return;
+      const result = await this.collector.collectStorage();
+      if (!this._running || this._runGeneration !== runGeneration) return;
       this._metrics.storage = result;
       this._lastUpdate[domain] = Date.now();
     } catch (err) {
       console.error(`[SparkMonitor] ${this.spark.id} ${domain} refresh error:`, err.message);
     } finally {
-      this._inflight[domain] = false;
+      if (this._inflight[domain] === refreshToken) {
+        this._inflight[domain] = false;
+      }
     }
   }
 
@@ -802,4 +1018,3 @@ export class SparkMonitor {
     };
   }
 }
-

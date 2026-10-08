@@ -12,6 +12,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { atomicWrite } from "../util/atomicWrite.js";
 import { decodeBenchManager } from "./DecodeBench.js";
+import { prefillBenchManager } from "./PrefillBench.js";
 import {
   applyThinkingFlags,
   coerceThinkingFlag,
@@ -321,6 +322,11 @@ export class ShowcaseManager {
     }
     if (decodeBenchManager.getActive(sparkId)) {
       const err = new Error("A decode benchmark is already running for this Spark");
+      err.status = 409;
+      throw err;
+    }
+    if (prefillBenchManager.getActive(sparkId)) {
+      const err = new Error("A prefill benchmark is already running for this Spark");
       err.status = 409;
       throw err;
     }

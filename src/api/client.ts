@@ -1,6 +1,8 @@
 import type {
   DecodeBenchJob,
   DecodeBenchListResponse,
+  FleetEnergy,
+  HealthResponse,
   HermesBatchUpdateResponse,
   HermesUpdatesResponse,
   LlmMetrics,
@@ -13,7 +15,11 @@ import type {
   SparkConfig,
   SparkTestResponse,
   StartDecodeBenchRequest,
+  PrefillBenchJob,
+  PrefillBenchListResponse,
+  StartPrefillBenchRequest,
 } from "./types";
+import { authHeaders, reportAuthRequired } from "./authToken";
 
 const BASE = "";
 
@@ -26,9 +32,11 @@ async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
   if (opts?.body) headers["Content-Type"] = "application/json";
   const res = await fetch(`${BASE}${path}`, {
     ...opts,
-    headers: { ...headers, ...(opts?.headers as Record<string, string> | undefined) },
+    headers: { ...headers, ...authHeaders(), ...(opts?.headers as Record<string, string> | undefined) },
   });
   if (!res.ok) {
+    // The server wants a token we do not have (or ours is stale): ask for one.
+    if (res.status === 401) reportAuthRequired();
     const body = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(body.error || `HTTP ${res.status}`);
   }
@@ -38,6 +46,10 @@ async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
 // ─── Sparks CRUD ─────────────────────────────────────────
 export function fetchSparks(): Promise<{ sparks: SparkConfig[] }> {
   return apiFetch("/api/sparks");
+}
+
+export function fetchFleetEnergy(): Promise<FleetEnergy> {
+  return apiFetch("/api/fleet-energy");
 }
 
 /** Latest metrics snapshot for one Spark (includes per-port LLM modelId). */
@@ -201,6 +213,51 @@ export function clearDecodeBenchHistory(
   return apiFetch(`/api/sparks/${id}/llm/bench${q}`, { method: "DELETE" });
 }
 
+// ─── LLM prefill benchmark ────────────────────────────
+export function startPrefillBench(
+  id: string,
+  body: StartPrefillBenchRequest
+): Promise<PrefillBenchJob> {
+  return apiFetch(`/api/sparks/${id}/llm/prefill-bench`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function getPrefillBench(
+  id: string,
+  benchId: string
+): Promise<PrefillBenchJob> {
+  return apiFetch(`/api/sparks/${id}/llm/prefill-bench/${benchId}`);
+}
+
+export function listPrefillBench(
+  id: string,
+  port?: number
+): Promise<PrefillBenchListResponse> {
+  const q =
+    port != null && Number.isInteger(port) ? `?port=${encodeURIComponent(port)}` : "";
+  return apiFetch(`/api/sparks/${id}/llm/prefill-bench${q}`);
+}
+
+export function cancelPrefillBench(
+  id: string,
+  benchId: string
+): Promise<PrefillBenchJob> {
+  return apiFetch(`/api/sparks/${id}/llm/prefill-bench/${benchId}`, {
+    method: "DELETE",
+  });
+}
+
+export function clearPrefillBenchHistory(
+  id: string,
+  port?: number
+): Promise<{ success: boolean }> {
+  const q =
+    port != null && Number.isInteger(port) ? `?port=${encodeURIComponent(port)}` : "";
+  return apiFetch(`/api/sparks/${id}/llm/prefill-bench${q}`, { method: "DELETE" });
+}
+
 // ─── LLM Prompt Showcase ──────────────────────────────
 /** Start a concurrent prompt showcase (returns 202 session). */
 export function startShowcase(
@@ -236,6 +293,19 @@ export function cancelShowcase(
 ): Promise<ShowcaseSessionState> {
   return apiFetch(`/api/sparks/${id}/llm/showcase/${sessionId}`, {
     method: "DELETE",
+  });
+}
+
+/**
+ * Fire-and-forget cancel sent while the page unloads (pagehide/beforeunload).
+ * `keepalive` lets the request outlive the tab; it carries the same bearer
+ * token as every other API call, or a token-protected server rejects it and
+ * the session keeps running.
+ */
+export function cancelShowcaseBeacon(id: string, sessionId: string): void {
+  const url = `${BASE}/api/sparks/${encodeURIComponent(id)}/llm/showcase/${encodeURIComponent(sessionId)}`;
+  void fetch(url, { method: "DELETE", keepalive: true, headers: authHeaders() }).catch(() => {
+    /* the page is going away — nothing to report to */
   });
 }
 
@@ -371,6 +441,12 @@ export function wakeAllSparks(): Promise<BatchPowerResult> {
 /** Per-Spark update preview (release + pending commits + resolved view). */
 export function fetchHermesUpdates(id: string): Promise<HermesUpdatesResponse> {
   return apiFetch(`/api/sparks/${encodeURIComponent(id)}/hermes/updates`);
+}
+
+// ─── Health ───────────────────────────────────────────────
+/** Server health and auth posture (bind host, authMode). */
+export function fetchHealth(): Promise<HealthResponse> {
+  return apiFetch("/api/health");
 }
 
 // ─── Global settings ──────────────────────────────────────

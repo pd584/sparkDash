@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useMemo } from "react";
 import { useSnapshot } from "./hooks/useSnapshot";
 import { useAppRoute, useRoute } from "./hooks/useRoute";
-import { fetchSparks, reorderSparks, fetchSettings } from "./api/client";
+import { fetchSparks, reorderSparks, fetchSettings, fetchHealth } from "./api/client";
 import { SparkTabs } from "./components/SparkTabs";
 import { AddSparkDialog } from "./components/AddSparkDialog";
 import { EditSparkDialog } from "./components/EditSparkDialog";
@@ -10,10 +10,36 @@ import { HermesUpdateDialog } from "./components/SparkPage/HermesUpdateDialog";
 import { OverviewPage } from "./components/OverviewPage/OverviewPage";
 import { ShowcasePage } from "./components/ShowcasePage/ShowcasePage";
 import { ThemeSwitch } from "./components/ThemeSwitch";
+import { OpenAccessChip } from "./components/OpenAccessChip";
 import { SettingsDialog } from "./components/SettingsDialog";
+import { AccessTokenPrompt } from "./components/AccessTokenDialog";
+import { onTokenChange } from "./api/authToken";
 import { GearIcon, BoltIcon } from "./components/ui/icons";
+import { ConnectionBanner } from "./components/ui/ConnectionBanner";
+import { ErrorBanner } from "./components/ui/ErrorBanner";
 import { OVERVIEW_ID } from "./constants";
-import type { Settings, SparkSnapshot } from "./api/types";
+import type { AuthMode, Settings, SparkSnapshot } from "./api/types";
+import { isWorkerSpark } from "./api/sparkRole";
+
+/** Keep hidden worker ids in their original slots when the visible tabs are reordered. */
+function mergeTabOrderKeepingHidden(
+  allSparks: SparkSnapshot[],
+  visibleOrder: string[],
+  hiddenIds: Set<string>
+): string[] {
+  if (hiddenIds.size === 0) return visibleOrder;
+  const result: string[] = [];
+  let vi = 0;
+  for (const spark of allSparks) {
+    if (hiddenIds.has(spark.id)) {
+      result.push(spark.id);
+    } else if (vi < visibleOrder.length) {
+      result.push(visibleOrder[vi++]);
+    }
+  }
+  while (vi < visibleOrder.length) result.push(visibleOrder[vi++]);
+  return result;
+}
 
 function placeholderSnapshot(
   id: string,
@@ -101,14 +127,36 @@ function placeholderSnapshot(
 }
 
 function DashboardApp() {
-  const { sparks, activeId, setActiveId, activeSpark, connected } = useSnapshot();
+  const {
+    sparks,
+    activeId,
+    setActiveId,
+    activeSpark,
+    connected,
+    lastValidSnapshotAt,
+    snapshotError,
+    refreshInterval,
+  } = useSnapshot();
+  const [telemetryNow, setTelemetryNow] = useState(Date.now());
   const navigate = useRoute(setActiveId);
   const [showAdd, setShowAdd] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [settings, setSettings] = useState<Settings | null>(null);
+  const [authMode, setAuthMode] = useState<AuthMode | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
   /** Used when WS is down so add/delete still updates the tab bar */
   const [fallbackSparks, setFallbackSparks] = useState<SparkSnapshot[]>([]);
+  const staleAfterMs = Math.max(10_000, 3 * (refreshInterval ?? 2_000));
+  const telemetryStale =
+    lastValidSnapshotAt != null && telemetryNow - lastValidSnapshotAt > staleAfterMs;
+
+  useEffect(() => {
+    if (lastValidSnapshotAt == null) return;
+    setTelemetryNow(Date.now());
+    const timer = window.setInterval(() => setTelemetryNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [lastValidSnapshotAt]);
 
   // Prefer live WS data; fall back to API-fetched list when empty
   const liveSparks = sparks.length > 0 ? sparks : fallbackSparks;
@@ -139,6 +187,19 @@ function DashboardApp() {
 
 
   const isOverview = activeId === OVERVIEW_ID;
+  const hideWorkers = settings?.hideWorkers ?? false;
+  const hiddenWorkerIds = useMemo(() => {
+    if (!hideWorkers) return new Set<string>();
+    return new Set(
+      displaySparks
+        .filter((s) => isWorkerSpark(s) && s.id !== activeId)
+        .map((s) => s.id)
+    );
+  }, [displaySparks, hideWorkers, activeId]);
+  const tabSparks = useMemo(
+    () => (hideWorkers ? displaySparks.filter((s) => !hiddenWorkerIds.has(s.id)) : displaySparks),
+    [displaySparks, hideWorkers, hiddenWorkerIds]
+  );
   const displayActive = isOverview
     ? null
     : displaySparks.find((s) => s.id === activeId) || displaySparks[0] || activeSpark || null;
@@ -147,11 +208,31 @@ function DashboardApp() {
     if (sparks.length > 0) setFallbackSparks([]);
   }, [sparks]);
 
-  // Fetch global settings on mount
+  // Fetch global settings on mount, and again when a new access token is
+  // saved (the first load may have been refused for the missing token).
   useEffect(() => {
-    fetchSettings()
-      .then(setSettings)
-      .catch((err) => console.error("Failed to fetch settings:", err));
+    const load = (afterTokenChange: boolean) =>
+      fetchSettings()
+        .then((s) => {
+          setSettings(s);
+          if (afterTokenChange) setActionError(null);
+        })
+        .catch((err) =>
+          setActionError(
+            `Could not load settings: ${err instanceof Error ? err.message : String(err)}. Reload to retry.`
+          )
+        );
+    void load(false);
+    return onTokenChange((token) => {
+      if (token) void load(true);
+    });
+  }, []);
+
+  // Auth posture once on load — drives the "Open access" header warning.
+  useEffect(() => {
+    fetchHealth()
+      .then((h) => setAuthMode(h.authMode))
+      .catch(() => setAuthMode(null));
   }, []);
 
   const handleSettingsSaved = useCallback((s: Settings) => {
@@ -218,18 +299,28 @@ function DashboardApp() {
       if (configs.length === 0 && activeId !== OVERVIEW_ID) setActiveId(null);
     } catch (err) {
       console.error("Failed to refresh sparks:", err);
+      setActionError(
+        `Could not refresh Sparks: ${err instanceof Error ? err.message : String(err)}. Previous data remains visible.`
+      );
     }
   }, [sparks, activeId, setActiveId]);
 
-  const handleReorder = useCallback(async (orderedIds: string[]) => {
-    setOrderOverride(orderedIds);
-    try {
-      await reorderSparks(orderedIds);
-    } catch (err) {
-      console.error("Failed to reorder Sparks:", err);
-      setOrderOverride(null);
-    }
-  }, []);
+  const handleReorder = useCallback(
+    async (orderedIds: string[]) => {
+      const next = mergeTabOrderKeepingHidden(displaySparks, orderedIds, hiddenWorkerIds);
+      setOrderOverride(next);
+      try {
+        await reorderSparks(next);
+      } catch (err) {
+        console.error("Failed to reorder Sparks:", err);
+        setOrderOverride(null);
+        setActionError(
+          `Could not save the Spark order: ${err instanceof Error ? err.message : String(err)}. The previous order was restored.`
+        );
+      }
+    },
+    [displaySparks, hiddenWorkerIds]
+  );
 
   return (
     <div className="min-h-screen p-0 text-text sm:p-8">
@@ -246,7 +337,7 @@ function DashboardApp() {
             </span>
           </button>
           <SparkTabs
-            sparks={displaySparks}
+            sparks={tabSparks}
             activeId={displayActive?.id ?? activeId}
             onSelect={navigate}
             onAdd={() => setShowAdd(true)}
@@ -254,6 +345,7 @@ function DashboardApp() {
             onReorder={handleReorder}
           />
           <div className="ml-auto flex items-center gap-2.5">
+            <OpenAccessChip authMode={authMode} />
             <button
               type="button"
               onClick={() => setShowSettings(true)}
@@ -266,18 +358,35 @@ function DashboardApp() {
             <ThemeSwitch />
           </div>
         </header>
-        <main>
+        <ConnectionBanner
+          connected={connected}
+          lastValidSnapshotAt={lastValidSnapshotAt}
+          snapshotError={snapshotError}
+          now={telemetryNow}
+          stale={telemetryStale}
+        />
+        <ErrorBanner message={actionError} onDismiss={() => setActionError(null)} />
+        <main className={telemetryStale || !connected ? "telemetry-stale" : undefined}>
           {isOverview ? (
             <OverviewPage
               sparks={displaySparks}
               hideOffline={settings?.autoHideOffline ?? false}
+              hideWorkers={hideWorkers}
+              showFleetEnergy={settings?.showFleetEnergy ?? false}
+              showFleetExceptions={settings?.showFleetExceptions ?? false}
+              showOverviewSearch={settings?.showOverviewSearch ?? false}
+              showLlmTokenTotals={settings?.showLlmTokenTotals ?? false}
+              showVramBreakdown={settings?.showVramBreakdown ?? true}
               temperatureUnit={settings?.temperatureUnit ?? "celsius"}
               onSelectSpark={navigate}
             />
           ) : displayActive ? (
             <SparkPage
               spark={displayActive}
+              fleet={displaySparks}
               temperatureUnit={settings?.temperatureUnit ?? "celsius"}
+              benchShareImage={settings?.benchShareImage ?? false}
+              showVramBreakdown={settings?.showVramBreakdown ?? true}
               onEdit={() => setEditId(displayActive.id)}
             />
           ) : (
@@ -330,10 +439,16 @@ function DashboardApp() {
 
 function App() {
   const route = useAppRoute();
-  if (route.mode === "showcase" && route.showcaseSparkId) {
-    return <ShowcasePage sparkId={route.showcaseSparkId} />;
-  }
-  return <DashboardApp />;
+  return (
+    <>
+      {route.mode === "showcase" && route.showcaseSparkId ? (
+        <ShowcasePage sparkId={route.showcaseSparkId} />
+      ) : (
+        <DashboardApp />
+      )}
+      <AccessTokenPrompt />
+    </>
+  );
 }
 
 export default App;

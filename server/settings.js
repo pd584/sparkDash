@@ -14,11 +14,34 @@ const DEFAULTS = Object.freeze({
   pollIntervalMs: 2000,
   defaultLlmPort: 8888,
   autoHideOffline: false,
+  /** Hide worker-role Sparks from Overview and the tab bar. */
+  hideWorkers: false,
   temperatureUnit: "celsius",
   /** Persist prompts / HTTP traces / GPU samples on decode benchmark runs. */
   benchDebugTraces: false,
   /** Layout density — compact (default) or comfortable. */
   density: "compact",
+  /** Overview Fleet Energy card. Off by default. */
+  showFleetEnergy: false,
+  /** Overview active fleet exceptions strip. Off by default. */
+  showFleetExceptions: false,
+  /** Overview search + status filter row. Off by default. */
+  showOverviewSearch: false,
+  /** Overview LLM token totals card (cumulative tokens per model). Off by default. */
+  showLlmTokenTotals: false,
+  /**
+   * Benchmark dialogs offer the share-card format. On by default: the extra
+   * control is one caret next to a button that already copies, and anyone who
+   * does not want it can turn it off here (see the README's settings table).
+   */
+  benchShareImage: true,
+  /**
+   * VRAM bars on the Overview cards and the GPU panel split memory into LLM
+   * engine / system / other / free and judge severity by absolute headroom.
+   * On by default; off restores the single percentage-coloured bar. The UI
+   * falls back to the same value before settings load — keep the two in step.
+   */
+  showVramBreakdown: true,
 });
 
 /** @type {typeof DEFAULTS} */
@@ -36,8 +59,14 @@ function _clampSettings(settings) {
   }
   // Ensure autoHideOffline is boolean
   s.autoHideOffline = Boolean(s.autoHideOffline);
+  s.hideWorkers = Boolean(s.hideWorkers);
   // Ensure benchDebugTraces is boolean
   s.benchDebugTraces = Boolean(s.benchDebugTraces);
+  s.showFleetEnergy = Boolean(s.showFleetEnergy);
+  s.showFleetExceptions = Boolean(s.showFleetExceptions);
+  s.showOverviewSearch = Boolean(s.showOverviewSearch);
+  s.showLlmTokenTotals = Boolean(s.showLlmTokenTotals);
+  s.showVramBreakdown = Boolean(s.showVramBreakdown);
   // Ensure temperatureUnit is valid
   if (s.temperatureUnit !== "celsius" && s.temperatureUnit !== "fahrenheit") {
     s.temperatureUnit = DEFAULTS.temperatureUnit;

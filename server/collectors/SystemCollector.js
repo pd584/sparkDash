@@ -1,8 +1,38 @@
 import fs from "fs";
 import path from "path";
-import { HOST_PATHS, GPU_MEMORY_JSON_PATH, DGX_SPARK, HARDWARE_DEFAULTS } from "../config.js";
+import { HOST_PATHS, GPU_MEMORY_JSON_PATH, DGX_SPARK, HARDWARE_DEFAULTS, POLL_INTERVAL_NVERR } from "../config.js";
 import { normalizeMac, WOL_INTERFACE } from "../wol.js";
 import { sshExec } from "./ssh.js";
+
+const NVERR_JOURNAL_CMD =
+  'journalctl -k --no-pager -q --grep=NV_ERR_NO_MEMORY 2>/dev/null | grep -c NV_ERR_NO_MEMORY || true';
+
+/**
+ * Parse `grep -c` stdout into a non-negative integer. Exported for tests.
+ * @param {unknown} raw
+ * @returns {number}
+ */
+export function parseNvErrNoMemoryCount(raw) {
+  const line = String(raw ?? "").trim().split("\n").pop() ?? "";
+  const n = Number.parseInt(line, 10);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return n;
+}
+
+export const COLLECTION_SUCCESS = Symbol("sparkdash.collectionSuccess");
+
+export function collectionWasSuccessful(result) {
+  return result?.[COLLECTION_SUCCESS] === true;
+}
+
+function tagCollectionResult(result, successful) {
+  Object.defineProperty(result, COLLECTION_SUCCESS, {
+    value: successful === true,
+    enumerable: false,
+    configurable: true,
+  });
+  return result;
+}
 
 /**
  * SystemCollector — collects hardware metrics for a Spark.
@@ -17,6 +47,7 @@ export class SystemCollector {
     // Rate-tracking baselines
     this.lastNetworkStats = new Map();
     this.lastCpuStat = null;
+    this._cpuCollectionSequence = 0;
     /** Last computed CPU usage percentage (0-100) — used by GPU system-draw estimate. */
     this.lastCpuUsagePct = 0;
     this.lastRaplReading = null;
@@ -32,51 +63,112 @@ export class SystemCollector {
 
     // Cached hardware info
     this._hardwareInfo = null;
+    /** Cached NVRM NV_ERR_NO_MEMORY count (slow journal scan). */
+    this._nvErrCache = { count: 0, at: 0 };
   }
 
   /** Collect GPU metrics (temperature, usage, power, VRAM). */
   async collectGpu() {
-    if (!this.spark.isLocal) return this._getRemoteGpu();
     try {
-      const gpuData = await this._getGPUAll();
-      return gpuData;
+      const gpuData = this.spark.isLocal
+        ? await this._getGPUAll()
+        : await this._getRemoteGpu();
+      return tagCollectionResult(gpuData, this._isSuccessfulGpuCollection(gpuData));
     } catch (err) {
       console.error(`[SystemCollector] GPU error for ${this.spark.id}:`, err.message);
-      return this._defaultGpu();
+      return tagCollectionResult(this._defaultGpu(), false);
     }
   }
 
   /** Collect CPU metrics (usage, temperature, power). */
   async collectCpu() {
-    if (!this.spark.isLocal) return this._getRemoteCpu();
+    const collectionSequence = ++this._cpuCollectionSequence;
     try {
+      if (!this.spark.isLocal) {
+        const cpuData = await this._getRemoteCpu(collectionSequence);
+        return tagCollectionResult(cpuData, this._isSuccessfulCpuCollection(cpuData));
+      }
+
       // Read /proc/stat once and compute usage BEFORE estimating power.
       // Previously _getCPUPower re-read /proc/stat in parallel with _getCPUUsage,
       // racing on lastCpuStat and producing 0% (idle power) on the first poll.
       const usage = await this._getCPUUsage();
+      if (!this._isValidCpuStat(usage)) {
+        throw new Error("invalid /proc/stat CPU counters");
+      }
       const totalDiff = usage.total - (this.lastCpuStat?.total || usage.total);
       const usedDiff = usage.used - (this.lastCpuStat?.used || usage.used);
       const cpuPercentage = totalDiff > 0 ? Math.round((usedDiff / totalDiff) * 100) : 0;
       const usageFraction = totalDiff > 0 ? usedDiff / totalDiff : 0;
-      this.lastCpuStat = usage;
-      this.lastCpuUsagePct = cpuPercentage;
-
       // Temperature and power can run in parallel — power is now a pure
       // function of the usage fraction (no extra /proc/stat read).
-      const [temp, power] = await Promise.all([
-        this._getCPUTemperature(),
+      const [tempReading, power] = await Promise.all([
+        this._getCPUTemperatureReading(),
         this._getCPUPower(usageFraction),
       ]);
-      return { usage: cpuPercentage, temperature: temp, ...power };
+      if (collectionSequence === this._cpuCollectionSequence) {
+        this.lastCpuStat = usage;
+        this.lastCpuUsagePct = cpuPercentage;
+      }
+      const cpuData = {
+        usage: cpuPercentage,
+        temperature: tempReading.temperature,
+        temperatureLabel: tempReading.temperatureLabel,
+        temperatureSource: tempReading.temperatureSource,
+        ...power,
+      };
+      return tagCollectionResult(cpuData, this._isSuccessfulCpuCollection(cpuData));
     } catch (err) {
       console.error(`[SystemCollector] CPU error for ${this.spark.id}:`, err.message);
-      return this._defaultCpu();
+      return tagCollectionResult(this._defaultCpu(), false);
     }
+  }
+
+  _isSuccessfulGpuCollection(gpu) {
+    return (
+      Number.isFinite(gpu?.temperature) &&
+      gpu.temperature > 0 &&
+      Number.isFinite(gpu?.usage) &&
+      Number.isFinite(gpu?.power?.draw) &&
+      gpu.power.draw >= 0 &&
+      Number.isFinite(gpu?.power?.limit) &&
+      gpu.power.limit > 0
+    );
+  }
+
+  _isSuccessfulCpuCollection(cpu) {
+    return (
+      Number.isFinite(cpu?.usage) &&
+      cpu.usage >= 0 &&
+      cpu.usage <= 100 &&
+      Number.isFinite(cpu?.draw) &&
+      cpu.draw > 0 &&
+      Number.isFinite(cpu?.tdp) &&
+      cpu.tdp > 0
+    );
+  }
+
+  _isValidCpuStat(cpuStat) {
+    return (
+      Number.isFinite(cpuStat?.total) &&
+      cpuStat.total > 0 &&
+      Number.isFinite(cpuStat?.used) &&
+      cpuStat.used >= 0 &&
+      cpuStat.used <= cpuStat.total
+    );
+  }
+
+  /** Prevent an earlier monitor lifecycle from updating shared CPU baselines. */
+  invalidatePendingCollections() {
+    this._cpuCollectionSequence += 1;
   }
 
   /** Collect RAM metrics. */
   async collectRam() {
-    if (!this.spark.isLocal) return this._getRemoteRam();
+    if (!this.spark.isLocal) {
+      if (this.isMac) return this._getRemoteRamMac();
+      return this._getRemoteRam();
+    }
     try {
       return await this._getRamUsage();
     } catch (err) {
@@ -87,7 +179,10 @@ export class SystemCollector {
 
   /** Collect storage metrics per mount. */
   async collectStorage() {
-    if (!this.spark.isLocal) return this._getRemoteStorage();
+    if (!this.spark.isLocal) {
+      if (this.isMac) return this._getRemoteStorageMac();
+      return this._getRemoteStorage();
+    }
     try {
       return await this._getDiskUsage();
     } catch (err) {
@@ -130,9 +225,11 @@ export class SystemCollector {
   // ─── GPU helpers ─────────────────────────────────────────
   async _getGPUAll() {
     const gpuOut = await this._nvidiaSmi(
-      "--query-gpu=temperature.gpu,utilization.gpu,power.draw,power.limit,clocks.current.sm,clocks.max.sm,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown,clocks_throttle_reasons.hw_slowdown,clocks_throttle_reasons.sw_power_cap --format=csv,noheader,nounits"
+      "--query-gpu=temperature.gpu,utilization.gpu,power.draw,power.limit,clocks.current.sm,clocks.max.sm,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown,clocks_throttle_reasons.hw_slowdown,clocks_throttle_reasons.sw_power_cap,index,name,uuid --format=csv,noheader,nounits"
     );
-    const gpu = this._parseGpuLine(gpuOut);
+    const devices = this._parseGpuLines(gpuOut);
+    const gpu = this._aggregateGpuDevices(devices);
+    this._lastVramPerDevice = [];
     const vram = await this._queryNvidiaVram();
 
     // Estimate total system power: GPU draw + CPU draw + ~20W CX7/peripherals
@@ -144,11 +241,9 @@ export class SystemCollector {
     systemDraw += 20; // CX7 NIC + peripherals estimate
     systemDraw = Math.round(systemDraw);
 
-    // Top 5 GPU processes by VRAM usage
-    const processes = Array.from(this.nvidiaComputeAppsCache.entries())
-      .map(([pid, info]) => ({ pid, name: info.name, vramMB: info.vramMB }))
-      .sort((a, b) => b.vramMB - a.vramMB)
-      .slice(0, 5);
+    // Top 5 GPU processes by VRAM usage (a PID spanning several GPUs is summed)
+    const apps = this._cachedApps();
+    const processes = this._topProcesses(apps);
 
     return {
       temperature: gpu.temperature,
@@ -157,6 +252,8 @@ export class SystemCollector {
       vram,
       processes,
       throttle: gpu.throttle,
+      nvErrNoMemory: await this._nvErrNoMemory(),
+      gpus: this._buildGpuDevices(devices, this._lastVramPerDevice ?? [], apps, vram),
     };
   }
 
@@ -183,10 +280,9 @@ export class SystemCollector {
       const memOut = await this._nvidiaSmi(
         "--query-gpu=memory.used,memory.total --format=csv,noheader,nounits"
       );
-      const line = memOut.trim().split("\n").filter(Boolean)[0] || "";
-      const parts = line.split(",").map((s) => s.trim());
-      used = this._parseSmiNumber(parts[0]);
-      total = this._parseSmiNumber(parts[1]);
+      const perDevice = this._parseVramLines(memOut);
+      this._lastVramPerDevice = perDevice;
+      ({ used, total } = this._sumVram(perDevice));
     } catch {
       /* memory.* often N/A on GB10 */
     }
@@ -201,12 +297,17 @@ export class SystemCollector {
         computeOut != null
           ? computeOut
           : await this._nvidiaSmi(
-              "--query-compute-apps=pid,process_name,used_gpu_memory --format=csv,noheader,nounits"
+              "--query-compute-apps=pid,process_name,used_gpu_memory,gpu_uuid --format=csv,noheader,nounits"
             );
       const apps = this._parseComputeApps(raw);
       this.nvidiaComputeAppsCache.clear();
       for (const app of apps) {
-        this.nvidiaComputeAppsCache.set(app.pid, { name: app.name, vramMB: app.vramMB });
+        this.nvidiaComputeAppsCache.set(this._computeAppKey(app), {
+          pid: app.pid,
+          name: app.name,
+          vramMB: app.vramMB,
+          gpuUuid: app.gpuUuid ?? null,
+        });
         computeSum += app.vramMB;
       }
       computeAppsQueried = true;
@@ -235,7 +336,7 @@ export class SystemCollector {
               ? proc.name.trim()
               : "unknown";
           if (!Number.isInteger(pid) || pid <= 0 || vramMB == null) continue;
-          this.nvidiaComputeAppsCache.set(pid, { name, vramMB });
+          this.nvidiaComputeAppsCache.set(pid, { pid, name, vramMB, gpuUuid: null });
         }
         if ((used == null || used === 0) && this.nvidiaComputeAppsCache.size > 0) {
           let sum = 0;
@@ -285,9 +386,56 @@ export class SystemCollector {
     return Number.isFinite(n) ? n : null;
   }
 
-  _parseGpuLine(output) {
-    const lines = output.trim().split("\n").filter(Boolean);
-    if (!lines[0]) {
+  /**
+   * Parse every line of the `--query-gpu` output — one per physical GPU.
+   * Fields 0-9 are the metrics; 10-12 (`index,name,uuid`) identify the card.
+   * Returns [] when nvidia-smi printed nothing.
+   */
+  _parseGpuLines(output) {
+    const lines = String(output ?? "").trim().split("\n").filter(Boolean);
+    return lines.map((line, i) => {
+      const parts = line.split(",").map((s) => s.trim());
+      const temperature = parseFloat(parts[0]) || 0;
+      const usage = parseFloat(parts[1]) || 0;
+      const powerDraw = parseFloat(parts[2]) || 0;
+      const powerLimit = this._parseSmiNumber(parts[3]) ?? 120;
+      const smClockMHz = this._parseSmiNumber(parts[4]);
+      const smClockMaxMHz = this._parseSmiNumber(parts[5]);
+      const hwThermal = this._parseSmiActive(parts[6]);
+      const swThermal = this._parseSmiActive(parts[7]);
+      const hwSlowdown = this._parseSmiActive(parts[8]);
+      const powerCap = this._parseSmiActive(parts[9]);
+      const index = this._parseSmiNumber(parts[10]) ?? i;
+      const name = parts[11] && !/^\[?n\/a\]?$/i.test(parts[11]) ? parts[11] : null;
+      const uuid = parts[12] && /^GPU-/i.test(parts[12]) ? parts[12] : null;
+      return {
+        index,
+        name,
+        uuid,
+        temperature,
+        usage,
+        powerDraw,
+        powerLimit,
+        throttle: this._buildThrottle({
+          hwThermal,
+          swThermal,
+          hwSlowdown,
+          powerCap,
+          smClockMHz,
+          smClockMaxMHz,
+        }),
+      };
+    });
+  }
+
+  /**
+   * Fold per-GPU readings into the single `gpu` object the rest of the app
+   * consumes: hottest temperature, busiest card's usage, summed power, and
+   * the throttle state of the first card that is actually throttling.
+   * A one-GPU box (every DGX Spark) is unchanged by this.
+   */
+  _aggregateGpuDevices(devices) {
+    if (!devices.length) {
       return {
         temperature: 0,
         usage: 0,
@@ -296,31 +444,114 @@ export class SystemCollector {
         throttle: this._defaultThrottle(),
       };
     }
-    const parts = lines[0].split(",").map((s) => s.trim());
-    const temperature = parseFloat(parts[0]) || 0;
-    const usage = parseFloat(parts[1]) || 0;
-    const powerDraw = parseFloat(parts[2]) || 0;
-    const powerLimit = this._parseSmiNumber(parts[3]) ?? 120;
-    const smClockMHz = this._parseSmiNumber(parts[4]);
-    const smClockMaxMHz = this._parseSmiNumber(parts[5]);
-    const hwThermal = this._parseSmiActive(parts[6]);
-    const swThermal = this._parseSmiActive(parts[7]);
-    const hwSlowdown = this._parseSmiActive(parts[8]);
-    const powerCap = this._parseSmiActive(parts[9]);
+    const worst = devices.find((d) => d.throttle?.active) ?? devices[0];
+    const round2 = (n) => Math.round(n * 100) / 100;
     return {
-      temperature,
-      usage,
-      powerDraw,
-      powerLimit,
-      throttle: this._buildThrottle({
-        hwThermal,
-        swThermal,
-        hwSlowdown,
-        powerCap,
-        smClockMHz,
-        smClockMaxMHz,
-      }),
+      temperature: Math.max(...devices.map((d) => d.temperature)),
+      usage: Math.max(...devices.map((d) => d.usage)),
+      powerDraw: round2(devices.reduce((sum, d) => sum + d.powerDraw, 0)),
+      powerLimit: round2(devices.reduce((sum, d) => sum + d.powerLimit, 0)),
+      throttle: worst.throttle,
     };
+  }
+
+  /** Aggregate view of `--query-gpu` output (all GPUs folded into one). */
+  _parseGpuLine(output) {
+    return this._aggregateGpuDevices(this._parseGpuLines(output));
+  }
+
+  /** Parse `--query-gpu=memory.used,memory.total` — one line per GPU; N/A → null. */
+  _parseVramLines(output) {
+    return String(output ?? "")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const parts = line.split(",").map((s) => s.trim());
+        return { used: this._parseSmiNumber(parts[0]), total: this._parseSmiNumber(parts[1]) };
+      });
+  }
+
+  /** Sum per-GPU VRAM; stays null when no card reported a number (GB10 says N/A). */
+  _sumVram(perDevice) {
+    let used = null;
+    let total = null;
+    for (const d of perDevice) {
+      if (d.used != null) used = (used ?? 0) + d.used;
+      if (d.total != null) total = (total ?? 0) + d.total;
+    }
+    return { used, total };
+  }
+
+  /**
+   * Cache key for a compute app. One PID can hold memory on several GPUs
+   * (llama.cpp with a layer split does), so the key carries the GPU uuid.
+   */
+  _computeAppKey(app) {
+    return app.gpuUuid ? `${app.pid}:${app.gpuUuid}` : String(app.pid);
+  }
+
+  /** Flatten the compute-apps cache back into a list. */
+  _cachedApps() {
+    return Array.from(this.nvidiaComputeAppsCache.entries()).map(([key, info]) => ({
+      pid: info.pid ?? parseInt(String(key), 10) ?? 0,
+      name: info.name,
+      vramMB: info.vramMB || 0,
+      gpuUuid: info.gpuUuid ?? null,
+    }));
+  }
+
+  /** Top processes by VRAM, merged per PID across GPUs (sorted descending). */
+  _topProcesses(apps, limit = 5) {
+    const byPid = new Map();
+    for (const app of apps) {
+      const cur = byPid.get(app.pid);
+      if (cur) cur.vramMB += app.vramMB;
+      else byPid.set(app.pid, { pid: app.pid, name: app.name, vramMB: app.vramMB });
+    }
+    return Array.from(byPid.values())
+      .sort((a, b) => b.vramMB - a.vramMB)
+      .slice(0, limit);
+  }
+
+  /**
+   * Per-GPU metrics for multi-card hosts. `perDeviceVram` lines are in the same
+   * order as `devices` (nvidia-smi prints both by index). When a card reports
+   * no memory numbers (unified-memory GB10) it inherits the aggregate `vram`.
+   */
+  _buildGpuDevices(devices, perDeviceVram, apps, aggregateVram) {
+    return devices.map((d, i) => {
+      const own = d.uuid ? apps.filter((a) => a.gpuUuid === d.uuid) : [];
+      const mem = perDeviceVram[i] ?? { used: null, total: null };
+      let vram;
+      if (mem.total == null || devices.length === 1) {
+        vram = { ...aggregateVram };
+      } else {
+        let used = mem.used;
+        if ((used == null || used === 0) && own.length) {
+          used = own.reduce((sum, a) => sum + a.vramMB, 0);
+        }
+        const usedMB = Math.round(used || 0);
+        const totalMB = Math.round(mem.total);
+        vram = {
+          used: usedMB,
+          total: totalMB,
+          percentage: totalMB > 0 ? Math.round((usedMB / totalMB) * 100) : 0,
+          available: Math.max(0, totalMB - usedMB),
+        };
+      }
+      return {
+        index: d.index,
+        name: d.name,
+        uuid: d.uuid,
+        temperature: d.temperature,
+        usage: d.usage,
+        power: { draw: d.powerDraw, limit: d.powerLimit },
+        vram,
+        throttle: d.throttle,
+        processes: this._topProcesses(own),
+      };
+    });
   }
 
   /** Parse nvidia-smi Active / Not Active fields. */
@@ -401,11 +632,13 @@ export class SystemCollector {
     return lines
       .map((line) => {
         const parts = line.split(",").map((s) => s.trim());
-        // Format: pid,process_name,used_gpu_memory
+        // Format: pid,process_name,used_gpu_memory[,gpu_uuid]
+        const gpuUuid = parts[3] && /^GPU-/i.test(parts[3]) ? parts[3] : null;
         return {
           pid: parseInt(parts[0]) || 0,
           name: parts[1] || "unknown",
           vramMB: this._parseSmiNumber(parts[2]) || 0,
+          gpuUuid,
         };
       })
       .filter((a) => a.pid > 0);
@@ -451,44 +684,116 @@ export class SystemCollector {
     return { total, used };
   }
 
-  async _getCPUTemperature() {
-    // Try hwmon sysfs first
+  /**
+   * Sensor names that really are the CPU package, in preference order. Everything
+   * else (acpitz and friends) is a board or SoC thermal zone: worth showing, not
+   * worth calling "CPU" (#142).
+   */
+  _isCpuSensorName(name) {
+    return ["coretemp", "k10temp", "zenpower", "x86_pkg_temp", "cpu-thermal", "cpu0-thermal"].includes(
+      String(name || "").toLowerCase()
+    );
+  }
+
+  /**
+   * What to call a non-CPU sensor: `acpitz` on a GB10 is the ACPI SoC zone, and
+   * saying "CPU" there is a ~15 °C lie. Unknown names label themselves.
+   */
+  _cpuTempSourceLabel(source) {
+    const name = String(source || "").toLowerCase();
+    if (!name) return null;
+    if (this._isCpuSensorName(name)) return "CPU";
+    if (name === "acpitz") return "ACPI";
+    if (name === "soc_thermal" || name === "soc-thermal") return "SoC";
+    return source;
+  }
+
+  /**
+   * Pick the CPU temperature from named candidates, in order.
+   *
+   * A real CPU sensor always wins, wherever it appears in the order; otherwise
+   * the first plausible reading is used with its own name as the label. The
+   * reading is never dropped just because no CPU sensor exists — a board zone is
+   * still a temperature, it just is not the CPU's.
+   *
+   * @param {Array<{ source: string | null, millidegrees: number }>} candidates
+   * @returns {{ temperature: number, temperatureLabel: string | null, temperatureSource: string | null }}
+   */
+  _pickCpuTemperature(candidates) {
+    const plausible = (candidates || []).filter(
+      (c) => Number.isFinite(c?.millidegrees) && c.millidegrees > 0 && c.millidegrees < 200000
+    );
+    if (plausible.length === 0) {
+      return { temperature: 0, temperatureLabel: null, temperatureSource: null };
+    }
+    const cpu = plausible.find((c) => this._isCpuSensorName(c.source));
+    const chosen = cpu || plausible[0];
+    return {
+      temperature: Math.round((chosen.millidegrees / 1000) * 10) / 10,
+      temperatureLabel: cpu ? "CPU" : this._cpuTempSourceLabel(chosen.source),
+      temperatureSource: chosen.source || null,
+    };
+  }
+
+  /** Local sensor candidates: hwmon chips by allowlist, then thermal zones. */
+  _localCpuTempCandidates() {
+    const candidates = [];
     try {
       const hwmonDir = path.join(HOST_PATHS.SYS, "class/hwmon");
       if (fs.existsSync(hwmonDir)) {
-        const entries = fs.readdirSync(hwmonDir);
-        for (const entry of entries) {
+        for (const entry of fs.readdirSync(hwmonDir)) {
           const nameFile = path.join(hwmonDir, entry, "name");
-          if (fs.existsSync(nameFile)) {
-            const name = fs.readFileSync(nameFile, "utf-8").trim();
-            if (["coretemp", "k10temp", "zenpower", "acpitz"].includes(name)) {
-              const tempFiles = fs.readdirSync(path.join(hwmonDir, entry)).filter((f) => f.startsWith("temp") && f.endsWith("_input"));
-              if (tempFiles.length > 0) {
-                const tempRaw = parseInt(fs.readFileSync(path.join(hwmonDir, entry, tempFiles[0]), "utf-8").trim());
-                if (tempRaw > 0 && tempRaw < 200000) return tempRaw / 1000;
-              }
-            }
-          }
+          if (!fs.existsSync(nameFile)) continue;
+          const name = fs.readFileSync(nameFile, "utf-8").trim();
+          // GB10 also exposes nvme/mlx5 sensors; the allowlist keeps those out.
+          if (!["coretemp", "k10temp", "zenpower", "acpitz", "soc_thermal"].includes(name)) continue;
+          const dir = path.join(hwmonDir, entry);
+          const tempFile = fs
+            .readdirSync(dir)
+            .filter((f) => f.startsWith("temp") && f.endsWith("_input"))
+            .sort()[0];
+          if (!tempFile) continue;
+          const millidegrees = parseInt(fs.readFileSync(path.join(dir, tempFile), "utf-8").trim());
+          candidates.push({ source: name, millidegrees });
         }
       }
-    } catch {}
-
-    // Try thermal zones
+    } catch {
+      /* fall through to thermal zones */
+    }
     try {
       const thermalDir = path.join(HOST_PATHS.SYS, "class/thermal");
       if (fs.existsSync(thermalDir)) {
         const zones = fs.readdirSync(thermalDir).filter((z) => z.startsWith("thermal_zone"));
         for (const zone of zones) {
-          const tempFile = path.join(thermalDir, zone, "temp");
-          if (fs.existsSync(tempFile)) {
-            const temp = parseInt(fs.readFileSync(tempFile, "utf-8").trim());
-            if (temp > 0 && temp < 200000) return temp / 1000;
+          const dir = path.join(thermalDir, zone);
+          const tempFile = path.join(dir, "temp");
+          if (!fs.existsSync(tempFile)) continue;
+          let type = null;
+          try {
+            type = fs.readFileSync(path.join(dir, "type"), "utf-8").trim() || null;
+          } catch {
+            /* type is optional */
           }
+          candidates.push({
+            source: type,
+            millidegrees: parseInt(fs.readFileSync(tempFile, "utf-8").trim()),
+          });
         }
       }
-    } catch {}
+    } catch {
+      /* nothing readable */
+    }
+    return candidates;
+  }
 
-    return 0;
+  /** @returns {Promise<{ temperature: number, temperatureLabel: string | null, temperatureSource: string | null }>} */
+  async _getCPUTemperatureReading() {
+    return this._pickCpuTemperature(this._localCpuTempCandidates());
+  }
+
+  /** Backwards-compatible number-only view of the reading. */
+  async _getCPUTemperature() {
+    return (await this._getCPUTemperatureReading()).temperature;
   }
 
   /**
@@ -921,11 +1226,11 @@ export class SystemCollector {
   async _getRemoteGpu() {
     try {
       const cmd = [
-        "nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,power.draw,power.limit,clocks.current.sm,clocks.max.sm,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown,clocks_throttle_reasons.hw_slowdown,clocks_throttle_reasons.sw_power_cap --format=csv,noheader,nounits 2>/dev/null",
+        "nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,power.draw,power.limit,clocks.current.sm,clocks.max.sm,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown,clocks_throttle_reasons.hw_slowdown,clocks_throttle_reasons.sw_power_cap,index,name,uuid --format=csv,noheader,nounits 2>/dev/null",
         "echo '---'",
         "nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null",
         "echo '---'",
-        "nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null",
+        "nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory,gpu_uuid --format=csv,noheader,nounits 2>/dev/null",
         "echo '---'",
         "grep -E 'MemTotal|MemAvailable' /proc/meminfo 2>/dev/null",
       ].join("; ");
@@ -937,21 +1242,24 @@ export class SystemCollector {
       const computeOut = sections[2]?.trim() || "";
       const meminfoOut = sections[3]?.trim() || "";
 
-      const gpu = this._parseGpuLine(gpuOut);
+      const devices = this._parseGpuLines(gpuOut);
+      const gpu = this._aggregateGpuDevices(devices);
 
-      // Parse memory.used / memory.total from nvidia-smi (may be [N/A] on GB10)
-      let used = null;
-      let total = null;
-      const memLine = memFields.split("\n").filter(Boolean)[0] || "";
-      const memParts = memLine.split(",").map((s) => s.trim());
-      used = this._parseSmiNumber(memParts[0]);
-      total = this._parseSmiNumber(memParts[1]);
+      // Parse memory.used / memory.total from nvidia-smi, one line per GPU
+      // (may be [N/A] on GB10); the aggregate is the sum across cards.
+      const perDeviceVram = this._parseVramLines(memFields);
+      let { used, total } = this._sumVram(perDeviceVram);
 
       const apps = this._parseComputeApps(computeOut);
       this.nvidiaComputeAppsCache.clear();
       let computeSum = 0;
       for (const app of apps) {
-        this.nvidiaComputeAppsCache.set(app.pid, { name: app.name, vramMB: app.vramMB });
+        this.nvidiaComputeAppsCache.set(this._computeAppKey(app), {
+          pid: app.pid,
+          name: app.name,
+          vramMB: app.vramMB,
+          gpuUuid: app.gpuUuid ?? null,
+        });
         computeSum += app.vramMB;
       }
       if ((used == null || used === 0) && computeSum > 0) used = computeSum;
@@ -981,19 +1289,20 @@ export class SystemCollector {
       // Rough system power estimate: GPU draw + 20W CX7/peripherals
       const systemDraw = Math.round(gpu.powerDraw + 20);
 
-      // Top 5 GPU processes by VRAM usage
-      const processes = Array.from(this.nvidiaComputeAppsCache.entries())
-        .map(([pid, info]) => ({ pid, name: info.name, vramMB: info.vramMB }))
-        .sort((a, b) => b.vramMB - a.vramMB)
-        .slice(0, 5);
+      // Top 5 GPU processes by VRAM usage (a PID spanning several GPUs is summed)
+      const cachedApps = this._cachedApps();
+      const processes = this._topProcesses(cachedApps);
+      const vram = { used: usedMB, total: totalMB, percentage, available: availableMB };
 
       return {
         temperature: gpu.temperature,
         usage: gpu.usage,
         power: { draw: gpu.powerDraw, limit: gpu.powerLimit, systemDraw },
-        vram: { used: usedMB, total: totalMB, percentage, available: availableMB },
+        vram,
         processes,
         throttle: gpu.throttle,
+        nvErrNoMemory: await this._nvErrNoMemory(),
+        gpus: this._buildGpuDevices(devices, perDeviceVram, cachedApps, vram),
       };
     } catch (err) {
       console.error(`[SystemCollector] Remote GPU error for ${this.spark.id}:`, err.message);
@@ -1001,34 +1310,54 @@ export class SystemCollector {
     }
   }
 
-  async _getRemoteCpu() {
-    try {
-      const cmd = [
-        "cat /proc/stat | head -1",
-        "echo '---'",
-        "cat /proc/cpuinfo | grep -E 'CPU architecture|aarch64' | head -1",
-        ...(this.spark.kind === "host"
-          ? [
-              "echo '---'",
-              // Same hwmon-then-thermal priority as local `_getCPUTemperature()`.
-              // GB10 also exposes nvme/mlx5 sensors; the name allowlist keeps those out.
-              'for h in /sys/class/hwmon/*; do n=$(cat "$h/name" 2>/dev/null); case "$n" in coretemp|k10temp|zenpower|acpitz) for t in "$h"/temp*_input; do cat "$t" 2>/dev/null; break; done;; esac; done',
-              "cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null",
-            ]
-          : []),
-      ].join("; ");
+  /**
+   * One SSH round trip: /proc/stat, CPU arch, then the same hwmon-then-thermal
+   * sensor dump local `_getCPUTemperature()` uses. `|| true` on the thermal
+   * glob keeps a missing zone from failing the whole CPU poll (sshExec treats
+   * any non-zero exit as a hard error).
+   */
+  _buildRemoteCpuCommand() {
+    return [
+      "cat /proc/stat | head -1",
+      "echo '---'",
+      "cat /proc/cpuinfo | grep -E 'CPU architecture|aarch64' | head -1",
+      "echo '---'",
+      // GB10 also exposes nvme/mlx5 sensors; the name allowlist keeps those out.
+      // Every line is "<name> <millidegrees>" so the reader can say which sensor
+      // it used — an ACPI zone must not be reported as the CPU (#142).
+      'for h in /sys/class/hwmon/*; do n=$(cat "$h/name" 2>/dev/null); case "$n" in coretemp|k10temp|zenpower|acpitz|soc_thermal) for t in "$h"/temp*_input; do v=$(cat "$t" 2>/dev/null); [ -n "$v" ] && echo "$n $v"; break; done;; esac; done',
+      'for z in /sys/class/thermal/thermal_zone*; do n=$(cat "$z/type" 2>/dev/null); v=$(cat "$z/temp" 2>/dev/null); [ -n "$v" ] && echo "$n $v"; done || true',
+    ].join("; ");
+  }
 
-      const output = await sshExec(this.spark, cmd);
+  async _getRemoteCpu(collectionSequenceOrExecutor = null, executor = sshExec) {
+    // Keep the injectable executor used by focused collector tests while also
+    // accepting the lifecycle sequence supplied by collectCpu().
+    const sshExecutor =
+      typeof collectionSequenceOrExecutor === "function" ? collectionSequenceOrExecutor : executor;
+    const attemptSequence = Number.isInteger(collectionSequenceOrExecutor)
+      ? collectionSequenceOrExecutor
+      : ++this._cpuCollectionSequence;
+    try {
+      const cmd = this._buildRemoteCpuCommand();
+
+      const output = await sshExecutor(this.spark, cmd);
       const sections = output.split("---");
       const statOut = sections[0]?.trim() || "";
       const cpuinfoOut = sections[1]?.trim() || "";
-      const tempOut = this.spark.kind === "host" ? sections[2] || "" : "";
+      const tempOut = sections[2] || "";
 
       const cpuStat = this._parseCPUUsage(statOut);
+      if (!this._isValidCpuStat(cpuStat)) {
+        throw new Error("invalid remote /proc/stat CPU counters");
+      }
       const totalDiff = cpuStat.total - (this.lastCpuStat?.total || cpuStat.total);
       const usedDiff = cpuStat.used - (this.lastCpuStat?.used || cpuStat.used);
       const usage = totalDiff > 0 ? Math.round((usedDiff / totalDiff) * 100) : 0;
-      this.lastCpuStat = cpuStat;
+      if (attemptSequence === this._cpuCollectionSequence) {
+        this.lastCpuStat = cpuStat;
+        this.lastCpuUsagePct = usage;
+      }
 
       // ARM/Neoverse power estimation
       const isArm = /CPU architecture:\s*[89]|aarch64|ARMv[89]|armv[89]/i.test(cpuinfoOut);
@@ -1036,9 +1365,12 @@ export class SystemCollector {
       const idleWatts = tdp * 0.08;
       const draw = idleWatts + (tdp - idleWatts) * Math.min(usage / 100, 1);
 
+      const tempReading = this._pickCpuTemperature(this._parseSensorCandidates(tempOut));
       return {
         usage,
-        temperature: this.spark.kind === "host" ? this._parseSensorTemp(tempOut) : 0,
+        temperature: tempReading.temperature,
+        temperatureLabel: tempReading.temperatureLabel,
+        temperatureSource: tempReading.temperatureSource,
         draw: Math.round(draw * 10) / 10,
         tdp: Math.round(tdp),
       };
@@ -1046,6 +1378,29 @@ export class SystemCollector {
       console.error(`[SystemCollector] Remote CPU error for ${this.spark.id}:`, err.message);
       return this._defaultCpu();
     }
+  }
+
+  /**
+   * Named sensor lines from the remote dump ("<name> <millidegrees>"), tolerating
+   * a bare number from an older command shape.
+   *
+   * @param {string} raw
+   * @returns {Array<{ source: string | null, millidegrees: number }>}
+   */
+  _parseSensorCandidates(raw) {
+    const candidates = [];
+    for (const line of String(raw).split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const pair = trimmed.match(/^(\S+)\s+(\d+)$/);
+      if (pair) {
+        candidates.push({ source: pair[1], millidegrees: parseInt(pair[2], 10) });
+        continue;
+      }
+      const bare = parseInt(trimmed, 10);
+      if (Number.isFinite(bare)) candidates.push({ source: null, millidegrees: bare });
+    }
+    return candidates;
   }
 
   /**
@@ -1140,6 +1495,129 @@ export class SystemCollector {
     }
   }
 
+  /**
+   * macOS units (platform: "darwin"): /proc is absent, so Linux commands are
+   * replaced with darwin equivalents. All other kinds are unaffected.
+   */
+  get isMac() {
+    return this.spark.platform === "darwin";
+  }
+
+  /** macOS RAM via sysctl + memory_pressure (one SSH round trip). */
+  async _getRemoteRamMac() {
+    try {
+      const output = await sshExec(
+        this.spark,
+        "sysctl -n hw.memsize; memory_pressure -Q 2>/dev/null | grep -i 'memory free percentage' || vm_stat 2>/dev/null | head -4",
+      );
+      const lines = output.trim().split("\n");
+      const totalBytes = parseInt(lines[0], 10) || 0;
+      const totalMB = Math.round(totalBytes / 1024 / 1024);
+      // Prefer the free-percentage line; fall back to vm_stat free pages.
+      let availableMB = 0;
+      const pctLine = lines.find((l) => /memory free percentage/i.test(l));
+      const pctMatch = pctLine?.match(/([\d.]+)%/);
+      if (pctMatch && totalMB > 0) {
+        availableMB = Math.round((totalMB * parseFloat(pctMatch[1])) / 100);
+      } else {
+        const freeMatch = output.match(/free.*?:\s+(\d+)(?:\.\d+)?\s*\(?/i);
+        const freePages = freeMatch ? parseInt(freeMatch[1], 10) : 0;
+        availableMB = Math.round((freePages * 16384) / 1024 / 1024); // 16KiB pages (arm64)
+      }
+      const usedMB = totalMB > 0 ? Math.max(0, totalMB - availableMB) : 0;
+      return {
+        used: usedMB,
+        total: totalMB,
+        percentage: totalMB > 0 ? Math.round((usedMB / totalMB) * 100) : 0,
+      };
+    } catch (err) {
+      console.error(`[SystemCollector] Remote macOS RAM error for ${this.spark.id}:`, err.message);
+      return this._defaultRam();
+    }
+  }
+
+  /** macOS storage: BSD df has no -x excludes; filter by mount/type instead. */
+  async _getRemoteStorageMac() {
+    try {
+      const output = await sshExec(this.spark, "df -k 2>/dev/null");
+      const lines = output.trim().split("\n").slice(1); // skip header
+      const disks = [];
+      const disabledDevices = this.spark.disabledDevices || [];
+      const PSEUDO = new Set(["devfs", "autofs", "apfs", "tmpfs", "overlay"]);
+      for (const line of lines) {
+        const parts = line.split(/\s+/);
+        // BSD df (no -T): Filesystem 1024-blocks Used Available Capacity iused ifree %iused Mounted (9 cols)
+        // GNU df -T: Filesystem Type 1024-blocks Used Available Capacity Mounted (7 cols)
+        if (parts.length < 6) continue;
+        const isTyped = /^[a-z]+$/.test(parts[1] || "");
+        let fsys, type, size, used, avail, pct, mountRest;
+        if (isTyped) {
+          [fsys, type, size, used, avail, pct, ...mountRest] = parts;
+        } else {
+          // 9-col BSD: parts = fs,1024blocks,used,avail,cap,iused,ifree,%iused,mount
+          if (parts.length < 9) continue;
+          [fsys, size, used, avail, pct, , , , ...mountRest] = parts;
+          type = "apfs";
+        }
+        const mount = mountRest.join(" ") || "/";
+        if (PSEUDO.has((type || "").toLowerCase()) && type !== "apfs") continue;
+        if (mount === "/boot/efi" || mount.includes("/snap") || /^\/System\/Volumes\//.test(mount)) continue;
+        if (!mount.startsWith("/") || mount === "/dev") continue;
+        const device = fsys.split("/").pop() || fsys;
+        const isDisabled =
+          disabledDevices.includes(device) || disabledDevices.includes(mount);
+        disks.push({
+          device,
+          label: mount,
+          used: Math.round(parseInt(used) / 1024),
+          total: Math.round(parseInt(size) / 1024),
+          available: Math.round(parseInt(avail) / 1024),
+          percentage: parseInt(pct) || 0,
+          readSpeed: 0,
+          writeSpeed: 0,
+          disabled: isDisabled,
+        });
+      }
+      return disks;
+    } catch (err) {
+      console.error(`[SystemCollector] Remote macOS Storage error for ${this.spark.id}:`, err.message);
+      return [];
+    }
+  }
+
+  /**
+   * macOS model inventory (presence only, no serving probe): ollama tags +
+   * ~/models/* sizes. Enables the dashboard to show what a Mac host holds.
+   */
+  async collectMacModels() {
+    if (!this.isMac || this.spark.isLocal) return null;
+    try {
+      const output = await sshExec(
+        this.spark,
+        "ollama list 2>/dev/null || $HOME/.ollama/bin/ollama list 2>/dev/null || /usr/local/bin/ollama list 2>/dev/null || /opt/homebrew/bin/ollama list 2>/dev/null; echo '---'; du -sh $HOME/models/* 2>/dev/null",
+      );
+      const sections = output.split("---");
+      const ollama = [];
+      for (const line of (sections[0] || "").trim().split("\n").slice(1)) {
+        const toks = line.trim().split(/\s+/);
+        if (toks.length >= 4 && toks[0] !== "NAME" && !toks[0].startsWith("/")) {
+          ollama.push({ tag: toks[0], size: toks[2] });
+        }
+      }
+      const filesystem = [];
+      for (const line of (sections[1] || "").trim().split("\n")) {
+        const toks = line.trim().split(/\s+/);
+        if (toks.length === 2 && toks[1].startsWith("/Users/")) {
+          filesystem.push({ path: toks[1], size: toks[0] });
+        }
+      }
+      return { ollama, filesystem };
+    } catch (err) {
+      console.error(`[SystemCollector] macOS model inventory error for ${this.spark.id}:`, err.message);
+      return null;
+    }
+  }
+
   async _getRemoteNetwork() {
     try {
       const cmd = [
@@ -1154,6 +1632,12 @@ export class SystemCollector {
         "echo '---'",
         // WoL MAC for the primary LAN NIC on DGX Spark
         `cat /sys/class/net/${WOL_INTERFACE}/address 2>/dev/null || true`,
+        "echo '---'",
+        // Link speed for every interface, not just the primary one: which
+        // interface is primary only falls out of the route table above, and
+        // fetching that one afterwards cost a second SSH login per poll.
+        // Virtual interfaces have no `speed`; they just come back blank.
+        "for d in /sys/class/net/*/speed; do echo \"$(basename $(dirname $d)):$(cat $d 2>/dev/null)\"; done 2>/dev/null || true",
       ].join("; ");
 
       const output = await sshExec(this.spark, cmd);
@@ -1163,6 +1647,16 @@ export class SystemCollector {
       const ipOut = sections[2]?.trim() || "";
       const operstateOut = sections[3]?.trim() || "";
       const wolMac = normalizeMac(sections[4]?.trim() || "");
+      const speedOut = sections[5]?.trim() || "";
+
+      // Parse link speed lines ("enP7s7:10000"); blank values stay unknown.
+      const speedMap = new Map();
+      for (const line of speedOut.split("\n")) {
+        const idx = line.indexOf(":");
+        if (idx <= 0) continue;
+        const mbps = parseInt(line.slice(idx + 1).trim(), 10);
+        if (Number.isFinite(mbps) && mbps > 0) speedMap.set(line.slice(0, idx), mbps);
+      }
 
       // Parse operstate lines ("enP7s7:up")
       const operstateMap = new Map();
@@ -1232,22 +1726,7 @@ export class SystemCollector {
         primaryInterface = alt?.name ?? primaryInterface;
       }
 
-      let linkSpeedMbps = null;
-      if (primaryInterface) {
-        try {
-          // Interface name is from the kernel; still keep it to safe chars
-          if (/^[a-zA-Z0-9._-]+$/.test(primaryInterface)) {
-            const speedRaw = await sshExec(
-              this.spark,
-              `cat /sys/class/net/${primaryInterface}/speed 2>/dev/null || true`
-            );
-            const n = parseInt(String(speedRaw).trim(), 10);
-            if (Number.isFinite(n) && n > 0) linkSpeedMbps = n;
-          }
-        } catch {
-          /* link speed optional */
-        }
-      }
+      const linkSpeedMbps = (primaryInterface && speedMap.get(primaryInterface)) || null;
 
       return { primaryInterface, linkSpeedMbps, interfaces: tagged, wolMac };
     } catch (err) {
@@ -1392,10 +1871,7 @@ export class SystemCollector {
         coresParsed = Number.isInteger(n) && n > 0 ? n : null;
       }
 
-      const smiLine = smiOut.split("\n").find(Boolean) || "";
-      const smiParts = smiLine.split(",").map((s) => s.trim());
-      const gpuChip = smiParts[0] || null;
-      const cudaDriver = smiParts[1] || null;
+      const { gpuChip, gpuCount, cudaDriver } = this._describeGpus(smiOut);
 
       const modelMatch = cpuinfo.match(/model name\s*:\s*(.+)/i);
       const cpuModel = modelMatch ? modelMatch[1].trim() : null;
@@ -1412,12 +1888,37 @@ export class SystemCollector {
         cpuCores,
         totalMemoryGB,
         gpuChip,
+        gpuCount,
         cudaDriver,
         storageModel: null,
       };
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Header label from `--query-gpu=name,driver_version` (one line per card):
+   * one card → its name; identical cards → "2× NVIDIA GeForce RTX 5080";
+   * mixed cards → "NVIDIA GeForce RTX 5080 + RTX 5060 Ti" (vendor prefix once).
+   */
+  _describeGpus(smiOut) {
+    const rows = String(smiOut ?? "")
+      .split("\n")
+      .map((line) => line.split(",").map((s) => s.trim()))
+      .filter((parts) => parts[0]);
+    if (!rows.length) return { gpuChip: null, gpuCount: 0, cudaDriver: null };
+    const names = rows.map((r) => r[0]);
+    const cudaDriver = rows[0][1] || null;
+    if (names.length === 1) return { gpuChip: names[0], gpuCount: 1, cudaDriver };
+    if (names.every((n) => n === names[0])) {
+      return { gpuChip: `${names.length}× ${names[0]}`, gpuCount: names.length, cudaDriver };
+    }
+    const prefix = /^NVIDIA\s+(GeForce\s+|RTX\s+(?=[A-Z]))?/i;
+    const label = names
+      .map((n, i) => (i === 0 ? n : n.replace(prefix, "")))
+      .join(" + ");
+    return { gpuChip: label, gpuCount: names.length, cudaDriver };
   }
 
   /**
@@ -1443,7 +1944,7 @@ export class SystemCollector {
         });
       }
     }
-    return this._readHostFile(`/proc/net/${relPath}`);
+    return fs.readFileSync(`/proc/net/${relPath}`, "utf-8");
   }
 
   /** Lightweight liveness for local Sparks. */
@@ -1494,6 +1995,34 @@ export class SystemCollector {
     return fs.promises.statfs(dir);
   }
 
+  /**
+   * Count NVRM `NV_ERR_NO_MEMORY` lines in the kernel journal since boot.
+   * Cached for POLL_INTERVAL_NVERR — never on the 2s GPU/memory loop uncached.
+   * @returns {Promise<number>}
+   */
+  async _nvErrNoMemory() {
+    const now = Date.now();
+    if (this._nvErrCache.at > 0 && now - this._nvErrCache.at < POLL_INTERVAL_NVERR) {
+      return this._nvErrCache.count;
+    }
+    try {
+      let out;
+      if (this.spark.isLocal) {
+        out = this._hasHostProc()
+          ? await this._execOnHost(NVERR_JOURNAL_CMD)
+          : await this._exec(NVERR_JOURNAL_CMD);
+      } else {
+        out = await sshExec(this.spark, NVERR_JOURNAL_CMD, { timeoutMs: 8000 });
+      }
+      const count = parseNvErrNoMemoryCount(out);
+      this._nvErrCache = { count, at: now };
+      return count;
+    } catch {
+      this._nvErrCache.at = now;
+      return this._nvErrCache.count;
+    }
+  }
+
   // ─── Default metrics ─────────────────────────────────────
   _defaultGpu() {
     return {
@@ -1503,11 +2032,20 @@ export class SystemCollector {
       vram: { used: 0, total: 0, percentage: 0, available: 0 },
       processes: [],
       throttle: this._defaultThrottle(),
+      nvErrNoMemory: 0,
+      gpus: [],
     };
   }
 
   _defaultCpu() {
-    return { usage: 0, temperature: 0, draw: 0, tdp: 0 };
+    return {
+      usage: 0,
+      temperature: 0,
+      temperatureLabel: null,
+      temperatureSource: null,
+      draw: 0,
+      tdp: 0,
+    };
   }
 
   _defaultRam() {

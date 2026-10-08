@@ -32,7 +32,7 @@ export function SparkHeader({ spark, onEdit }: SparkHeaderProps) {
       <div className="flex items-center gap-2.5">
         <span
           className={`h-2 w-2 shrink-0 rounded-full ${online ? "bg-success dot-glow-success" : "bg-danger"}`}
-          title={online ? "Online" : "Offline"}
+          title={online ? "Online" : spark.offlineReason ? `Offline — ${spark.offlineReason}` : "Offline"}
         />
         <div className="min-w-0">
           <div className="flex items-center gap-2">
@@ -49,8 +49,11 @@ export function SparkHeader({ spark, onEdit }: SparkHeaderProps) {
                     : spark.llmMonitoring === false
                       ? "Standalone — LLM monitoring off"
                       : "Standalone — local LLM API";
+              // Manual override first, then derived head-model mirror.
               const workerLabel =
-                role === "worker" ? spark.workerLabel?.trim() || null : null;
+                role === "worker"
+                  ? spark.workerLabel?.trim() || spark.workerDerivedLabel?.trim() || null
+                  : null;
               return (
                 <>
                   <span
@@ -70,6 +73,14 @@ export function SparkHeader({ spark, onEdit }: SparkHeaderProps) {
                 </>
               );
             })()}
+            {!online && spark.offlineReason && (
+              <span
+                className="max-w-[20rem] shrink-0 truncate rounded bg-danger/15 px-1.5 py-0.5 text-[10px] font-medium text-danger"
+                title={`Offline — ${spark.offlineReason}`}
+              >
+                {spark.offlineReason}
+              </span>
+            )}
             {online && spark.uptime != null && (
               <span
                 className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 font-tabular text-[10px] font-medium text-accent"
