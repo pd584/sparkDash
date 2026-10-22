@@ -2,7 +2,16 @@
   "pollIntervalMs": 1000,
   "defaultLlmPort": 8888,
   "autoHideOffline": false,
+  "hideWorkers": false,
   "temperatureUnit": "celsius",
   "benchDebugTraces": true,
-  "density": "comfortable"
+  "density": "compact",
+  "showFleetEnergy": true,
+  "showFleetExceptions": false,
+  "showOverviewSearch": false,
+  "showLlmTokenTotals": true,
+  "benchShareImage": true,
+  "energyPricePerKwh": null,
+  "energyCurrency": "$",
+  "showVramBreakdown": true
 }
