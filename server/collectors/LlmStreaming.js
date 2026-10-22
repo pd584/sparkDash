@@ -169,6 +169,11 @@ export async function readServerGenerationTokens(baseUrl, opts = {}) {
           /^q27_decode_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
         );
       if (q27 != null) return q27;
+      // NVIDIA Flare (Helios): committed generated tokens, counted from server start.
+      const flare = fromSeries(
+        /^flare_generated_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
+      );
+      if (flare != null) return flare;
     }
   } catch {
     /* try next */
@@ -365,6 +370,19 @@ export function stripThinkingFlags(body) {
 }
 
 /**
+ * Last-resort disable-only payload: `enable_thinking: false` and nothing else.
+ * Servers that validate template options (Flare's DeepSeek frontend accepts only
+ * enable_thinking / thinking_mode = thinking|chat and 400s on `thinking` or
+ * `thinking_mode: "disabled"`) take this where the wider sets are refused.
+ * @param {Record<string, unknown>} body
+ */
+export function thinkingOffMinimalBody(body) {
+  const next = stripThinkingFlags({ ...body });
+  next.chat_template_kwargs = { enable_thinking: false };
+  return next;
+}
+
+/**
  * Alternate disable-only payload after HTTP 400 on the full thinking-flag set.
  * Keeps an explicit off switch instead of stripping (which re-enables default thinking).
  * @param {Record<string, unknown>} body
@@ -497,12 +515,16 @@ export async function runStreamingRequest(
               : {},
         })
       : thinkingOffFallbackBody(body);
-    return runStreamingRequestOnce(url, retryBody, signal, {
-      debug,
-      collectContent,
-      onDelta,
-      apiKey,
-    });
+    const retryOpts = { debug, collectContent, onDelta, apiKey };
+    const retried = await runStreamingRequestOnce(url, retryBody, signal, retryOpts);
+    if (
+      retried.error &&
+      /^HTTP 400\b/.test(retried.error) &&
+      !coerceThinkingFlag(thinking)
+    ) {
+      return runStreamingRequestOnce(url, thinkingOffMinimalBody(body), signal, retryOpts);
+    }
+    return retried;
   }
 
   return result;

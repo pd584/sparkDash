@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useModalPresence } from "../hooks/useModalPresence";
+import { useOverlayClose } from "../hooks/useOverlayClose";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import {
   fetchAuthStatus,
@@ -27,6 +28,7 @@ export function AccessTokenDialog({ open, reason, onClose }: AccessTokenDialogPr
   const titleId = useId();
   const { mounted, visible } = useModalPresence(open);
   const trapRef = useFocusTrap(mounted);
+  const overlayClose = useOverlayClose(() => onClose(false), !submitting);
 
   useEffect(() => {
     if (!open) {
@@ -79,10 +81,7 @@ export function AccessTokenDialog({ open, reason, onClose }: AccessTokenDialogPr
   return createPortal(
     <div
       className={`modal-overlay${visible ? " is-open" : ""}`}
-      onClick={(e) => {
-        if (submitting) return;
-        if (e.target === e.currentTarget) onClose(false);
-      }}
+      {...overlayClose}
     >
       <div
         ref={trapRef}

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { isolatedConfigEnv } from "../../__tests__/isolatedEnv.js";
 import { once } from "node:events";
 import fs from "node:fs";
 import { mkdtemp } from "node:fs/promises";
@@ -25,6 +26,7 @@ async function startServer(t) {
     cwd: path.resolve(import.meta.dirname, "../../.."),
     env: {
       ...process.env,
+      ...isolatedConfigEnv(tmp),
       HOME: tmp, // the launcher log directory lives under $HOME on the (local) Spark
       BIND_HOST: "127.0.0.1",
       PORT: String(port),
@@ -33,8 +35,10 @@ async function startServer(t) {
       SECRETS_KEY_PATH: path.join(tmp, ".secrets-key"),
       LLM_DAILY_JSON_PATH: path.join(tmp, "llm-daily.json"),
       FLEET_ENERGY_JSON_PATH: path.join(tmp, "fleet-energy.json"),
+      FLEET_ENERGY_MONTHLY_JSON_PATH: path.join(tmp, "fleet-energy-monthly.json"),
       EVENTS_JSON_PATH: path.join(tmp, "events.json"),
       GPU_HISTORY_JSON_PATH: path.join(tmp, "gpu-history.json"),
+      GPU_HISTORY_LONG_JSON_PATH: path.join(tmp, "gpu-history-long.json"),
       LLM_LAUNCHERS_JSON_PATH: path.join(tmp, "llm-launchers.json"),
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -132,4 +136,16 @@ test("register, start, stream, stop and remove an LLM through the HTTP API", asy
   assert.equal((await api(port, `${base}/${lid}`, { method: "DELETE" })).status, 200);
   assert.equal((await api(port, base)).body.launchers.length, 0);
   assert.equal((await api(port, `${base}/${lid}/start`, { method: "POST" })).status, 404);
+});
+
+test("model launchers are refused for a Windows unit", async (t) => {
+  const { port } = await startServer(t);
+  const created = await api(port, "/api/sparks", {
+    method: "POST",
+    body: JSON.stringify({ id: "desk", name: "desk", platform: "windows", lanIp: "192.0.2.10", ssh: { host: "192.0.2.10", user: "me", auth: "key" } }),
+  });
+  assert.equal(created.status, 200);
+  const res = await api(port, "/api/sparks/desk/llm-launchers");
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /not supported on Windows/);
 });

@@ -1,3 +1,4 @@
+import { RestartButton } from "../ui/RestartButton";
 import { AppLink } from "../ui/AppLink";
 import { ENERGY_ID, idToPath } from "../../constants";
 import { useEffect, useState } from "react";
@@ -10,7 +11,24 @@ function number(value: number | null, digits = 2): string {
   return value == null ? "—" : value.toFixed(digits);
 }
 
-export function FleetEnergyCard({ nodeCount, onOpenDetails }: { nodeCount: number; onOpenDetails?: () => void }) {
+// Fleet efficiency is ~0.001 Wh per token, so fixed decimals keep only one or
+// two digits of it. toPrecision turns 1000 and up into exponent notation, so
+// large values (a nearly idle fleet) are printed whole.
+function significant(value: number | null): string {
+  if (value == null) return "—";
+  return Math.abs(value) >= 1000 ? value.toFixed(0) : value.toPrecision(3);
+}
+
+export function FleetEnergyCard({
+  nodeCount,
+  nodeNames,
+  onOpenDetails,
+}: {
+  nodeCount: number;
+  /** Display names by Spark id, used to say which nodes are missing. */
+  nodeNames?: Record<string, string>;
+  onOpenDetails?: () => void;
+}) {
   const [data, setData] = useState<FleetEnergy | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -31,6 +49,13 @@ export function FleetEnergyCard({ nodeCount, onOpenDetails }: { nodeCount: numbe
   const coverage = data && nodeCount > 0
     ? Math.min(100, (data.coverage24hMs / coverageWindowMs) * 100)
     : 0;
+  const stale = (data?.staleNodeIds ?? []).map((id) => nodeNames?.[id] ?? id);
+  const partialHelp =
+    data && !data.membershipChanged && data.freshNodeCount < nodeCount
+      ? `Energy is estimated from each node's live GPU and CPU readings. ${
+          stale.length ? `No fresh reading from: ${stale.join(", ")}. ` : ""
+        }A node that is offline, unreachable or not reporting power stops the fleet total from being measured for that time, so 24h coverage drops. It recovers by itself once the node reports again.`
+      : null;
   const state = error
     ? `Energy telemetry unavailable: ${error}`
     : data?.membershipChanged
@@ -58,7 +83,18 @@ export function FleetEnergyCard({ nodeCount, onOpenDetails }: { nodeCount: numbe
           ) : null}
         </div>
       </div>
-      {state && <p className="ov-note" role="status">{state}</p>}
+      {state && (
+        <p className="ov-note" role="status">
+          {state}
+          {partialHelp ? (
+            <>
+              {" "}
+              <span className="ov-help" tabIndex={0} role="img" aria-label={partialHelp} title={partialHelp}>ⓘ</span>
+            </>
+          ) : null}
+        </p>
+      )}
+      {data?.membershipChanged && !error ? <RestartButton /> : null}
       <div>
         <div className="big-num">{number(data?.energy24hKwh ?? null)}<small>kWh / 24 h</small></div>
         <div className="ov-card__sub mono">Estimated, not wall-metered · 24h coverage {coverage.toFixed(1)}%</div>
@@ -77,7 +113,7 @@ export function FleetEnergyCard({ nodeCount, onOpenDetails }: { nodeCount: numbe
       <dl className="ov-stats">
         <div><dt>Current</dt><dd className="mono">{number(data?.currentWatts30s ?? null, 0)} W</dd></div>
         <div><dt>31 days</dt><dd className="mono">{number(data?.energy31dKwh ?? null)} kWh</dd></div>
-        <div><dt>Efficiency</dt><dd className="mono">{number(data?.whPerOutputToken24h ?? null, 4)} Wh/token</dd></div>
+        <div><dt>Efficiency</dt><dd className="mono">{significant(data?.whPerOutputToken24h ?? null)} Wh/token</dd></div>
       </dl>
     </section>
   );

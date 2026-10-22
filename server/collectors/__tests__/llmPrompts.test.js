@@ -79,6 +79,23 @@ test("decode bench types pick fixed prompts (structured default)", () => {
   }
 });
 
+test("non-code decode requests keep the same task as concurrency increases", () => {
+  for (const type of ["structured", "prose", "json"]) {
+    const firstFour = pickDecodeBenchPrompts(4, type);
+    for (const count of [5, 6, 8, 10, 12, 16, 24, 32]) {
+      assert.deepEqual(pickDecodeBenchPrompts(count, type).slice(0, 4), firstFour,
+        `${type}: adding streams must not change existing requests`);
+    }
+  }
+});
+
+test("structured request labels do not divide the counting task into parts", () => {
+  for (const prompt of pickDecodeBenchPrompts(4, "structured")) {
+    assert.doesNotMatch(prompt, /\(stream\s+\d+\/\d+\)/,
+      "a stream fraction can make the model count only one part of 1 to 200");
+  }
+});
+
 test("concurrent code tasks stay distinct through the catalog and past it", () => {
   assert.equal(DECODE_CODE_TASKS.length, 32);
   const heads = DECODE_CODE_TASKS.map((p) => p.split("\n")[0]);

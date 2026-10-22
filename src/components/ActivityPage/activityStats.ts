@@ -1,4 +1,5 @@
 import type { ActivityEvent } from "../../api/types";
+import { configuredTimeZone } from "../../shared/timeZone";
 
 /** Pure logic for the Activity page: categories, labels, filtering, counts, day grouping, export. */
 
@@ -13,12 +14,13 @@ export const SEVERITY_LABEL: Record<Severity, string> = {
   info: "Info",
 };
 
-export type CategoryId = "status" | "thermal" | "health" | "hermes" | "bench" | "power" | "llm" | "fleet" | "other";
+export type CategoryId = "status" | "thermal" | "health" | "alerts" | "hermes" | "bench" | "power" | "llm" | "fleet" | "other";
 
 export const CATEGORIES: readonly { id: CategoryId; label: string }[] = [
   { id: "status", label: "Status (online/offline)" },
   { id: "thermal", label: "Thermal" },
   { id: "health", label: "Health" },
+  { id: "alerts", label: "Alert notifications" },
   { id: "hermes", label: "Hermes" },
   { id: "bench", label: "Benchmarks" },
   { id: "power", label: "Power" },
@@ -56,6 +58,7 @@ export function categorize(type: string): CategoryId {
   if (type === "spark.added" || type === "spark.removed") return "fleet";
   if (type.startsWith("gpu.throttle")) return "thermal";
   if (type.startsWith("health.")) return "health";
+  if (type.startsWith("alert.")) return "alerts";
   if (type.startsWith("hermes.")) return "hermes";
   if (type.startsWith("bench.")) return "bench";
   if (type.startsWith("power.")) return "power";
@@ -80,7 +83,11 @@ const KNOWN_LABELS: Record<string, string> = {
   "health.memory": "Low memory",
   "health.concurrency": "Many models loaded",
   "health.link-speed": "Slow link",
+  "health.roce-link": "RoCE link down",
+  "health.roce-loss": "RoCE packet loss",
   "health.cleared": "Health OK",
+  "alert.notify.sent": "Notification sent",
+  "alert.notify.failed": "Notification failed",
   "power.shutdown": "Shutdown",
   "power.wake": "Wake",
 };
@@ -195,10 +202,12 @@ export function sparkOptions(
 
 const dtfCache = new Map<string, Intl.DateTimeFormat>();
 function dtf(key: string, tz: string | undefined, opts: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
-  const k = `${key}|${tz ?? ""}`;
+  // No explicit zone: the Settings time zone, else the browser's.
+  const zone = tz ?? configuredTimeZone() ?? undefined;
+  const k = `${key}|${zone ?? ""}`;
   let f = dtfCache.get(k);
   if (!f) {
-    f = new Intl.DateTimeFormat("en-US", { ...opts, timeZone: tz });
+    f = new Intl.DateTimeFormat("en-US", { ...opts, timeZone: zone });
     dtfCache.set(k, f);
   }
   return f;

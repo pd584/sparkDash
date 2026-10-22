@@ -8,12 +8,16 @@
  * function of the bench job, so every number and label is unit-testable
  * without a real canvas context.
  */
+import { decodeBenchSamplingLabel } from "./decodeSampling";
 import { formatDuration } from "../../shared/formatDuration";
 import { decodeBenchTypeLabel } from "../../shared/llmPrompts.js";
 import { backendLabel } from "../../shared/llmBackends.js";
 import { formatContextSize } from "../../shared/prefillBench.js";
 import { QUALITY_CATEGORIES, QUALITY_CATEGORY_LABELS, checkQualityComparable } from "../../shared/qualityBench.js";
-import type { DecodeBenchJob, PrefillBenchJob, QualityBenchJob } from "../../api/types";
+import type { DecodeBenchJob, PrefillBenchJob, QualityBenchJob, ToolEvalRun } from "../../api/types";
+import { compareToolResults, configCaveats, type Delta as CompareDelta } from "../bench/tooleval/compare";
+import { scoreTier } from "../bench/tooleval/format";
+import { CATEGORY_NAMES, type NormToolResult } from "../bench/tooleval/normalize";
 
 /** Fixed width; height grows with the number of result rows. */
 export const SHARE_CARD_WIDTH = 1200;
@@ -69,6 +73,94 @@ export interface ShareCardQuality {
   tiles: ShareCardTile[];
 }
 
+/** One category tile on the Tool Eval card. */
+export interface ShareCardToolEvalCategory {
+  /** The tool's category letter (A–P). */
+  id: string;
+  name: string;
+  /** Score 0–100, or null when the category has none. */
+  pct: number | null;
+  /** `18/20 pts`, or empty when the result carries no points. */
+  detail: string;
+}
+
+/** A labelled score next to the ring (Deployability, Responsiveness). */
+export interface ShareCardToolEvalStat {
+  label: string;
+  value: string;
+  /** `/100`, or empty. */
+  suffix: string;
+  tone: ShareCardTone;
+}
+
+/** Tool Eval card payload: a score hero, an outcome strip, optional safety warnings and a category grid. */
+export interface ShareCardToolEval {
+  /** Final score 0–100, or null when the run produced none. */
+  score: number | null;
+  /** Rating word under the stars (`Good`); empty when unrated. */
+  rating: string;
+  /** 0–5 filled stars. */
+  stars: number;
+  tone: ShareCardTone;
+  /** Model under test (large, next to the ring); empty when unknown. */
+  modelName: string;
+  /** `llama.cpp · tool-eval-bench 1.4.0`. */
+  subline: string;
+  stats: ShareCardToolEvalStat[];
+  counts: { pass: number; partial: number; fail: number; other: number; total: number };
+  /** `65 scenarios · 12m 03s`. */
+  summary: string;
+  /** First few warnings, as the tool words them; `safetyTotal` counts all of them. */
+  safety: string[];
+  safetyTotal: number;
+  categories: ShareCardToolEvalCategory[];
+}
+
+/** One run's column in the Tool Eval comparison hero. */
+export interface ShareCardCompareSide {
+  /** `RUN A · 2026-10-14` — the run's label when it has one. */
+  heading: string;
+  model: string;
+  score: number | null;
+  rating: string;
+  tone: ShareCardTone;
+  /** `52 pass · 11 partial`; empty when the result has no scenarios. */
+  summary: string;
+  safety: number;
+}
+
+/** A metric tile on the comparison card: A → B and the change. */
+export interface ShareCardCompareStat {
+  label: string;
+  a: string;
+  b: string;
+  delta: string;
+  tone: ShareCardTone;
+}
+
+export interface ShareCardCompareCategory {
+  id: string;
+  name: string;
+  a: number | null;
+  b: number | null;
+  delta: string;
+  tone: ShareCardTone;
+}
+
+/** Tool Eval comparison payload: two score columns, metric tiles, scenario changes and a per-category list. */
+export interface ShareCardToolEvalCompare {
+  a: ShareCardCompareSide;
+  b: ShareCardCompareSide;
+  scoreDelta: string;
+  scoreDeltaTone: ShareCardTone;
+  stats: ShareCardCompareStat[];
+  /** Scenario status changes B vs A; null when either result has no per-scenario data. */
+  changes: { improved: number; regressed: number; unchanged: number } | null;
+  categories: ShareCardCompareCategory[];
+  /** First reason the runs are not directly comparable (plus a count of the rest); empty when they are. */
+  caveat: string;
+}
+
 export interface ShareCardModel {
   brand: string;
   /** Unit name, right-aligned on the brand line. Empty when unknown. */
@@ -87,6 +179,10 @@ export interface ShareCardModel {
   generatedAt: number;
   /** Set for the Quality card: painted as a ring and tiles instead of the row table. */
   quality?: ShareCardQuality;
+  /** Set for the Tool Eval card: painted as a score hero, outcome strip and category grid. */
+  toolEval?: ShareCardToolEval;
+  /** Set for the Tool Eval comparison card: two runs side by side. */
+  toolEvalCompare?: ShareCardToolEvalCompare;
 }
 
 export interface ShareCardSource {
@@ -110,7 +206,7 @@ export function shareCardDate(epochMs: number): string {
 }
 
 /** `sparkdash-decode-spark-38bd-2026-09-17.png` */
-export function shareCardFileName(model: ShareCardModel, kind: "decode" | "prefill" | "quality"): string {
+export function shareCardFileName(model: ShareCardModel, kind: "decode" | "prefill" | "quality" | "tool-eval" | "tool-eval-compare"): string {
   const slug = (s: string) =>
     s
       .toLowerCase()
@@ -203,7 +299,7 @@ export function buildDecodeShareCard(
     subtitle: shareCardSubtitle(src),
     chips: shareCardChips(src),
     status: shareCardStatus(job.status),
-    meta: `${decodeBenchTypeLabel(job.config?.promptType)} · ${job.config?.maxTokens ?? "?"} tok · ${
+    meta: `${decodeBenchTypeLabel(job.config?.promptType)} · ${job.config?.maxTokens ?? "?"} tok · ${decodeBenchSamplingLabel(job.config)} · ${
       concurrencies.length ? `${concurrencies.join(", ")} conc` : "—"
     }${job.durationMs != null ? ` · ${formatDuration(job.durationMs)}` : ""}`,
     columns: { load: "Load", primary: "Aggregate", secondary: "Stream" },
@@ -334,6 +430,206 @@ export function buildQualityShareCard(
     columns: { load: "Category", primary: "Score", secondary: compare ? "vs other" : "" },
     rows,
     legend: "Score — share of items passed. Temperature 0, fixed seed.",
+    footer: "github.com/MiaAI-Lab/sparkDash",
+    generatedAt: now,
+  };
+}
+
+/** Score band → card tone, following the tool's tiers (75+ good, 60+ adequate, 40+ weak, below poor). */
+function toolEvalTone(score: number | null | undefined): ShareCardTone {
+  const tier = scoreTier(score);
+  if (!tier) return "muted";
+  return tier.tone === "good" ? "ok" : tier.tone === "info" ? "accent" : tier.tone === "warn" ? "warn" : "bad";
+}
+
+/** Most safety warnings the card lists; the rest become a "+N more" line. */
+const TOOL_EVAL_SAFETY_SHOWN = 3;
+
+function toolEvalStatus(status: ToolEvalRun["status"]): { label: string; tone: ShareCardTone } {
+  switch (status) {
+    case "completed":
+      return { label: "COMPLETED", tone: "ok" };
+    case "running":
+      return { label: "RUNNING", tone: "warn" };
+    case "failed":
+      return { label: "FAILED", tone: "bad" };
+    case "stopped":
+      return { label: "STOPPED", tone: "warn" };
+    default:
+      return { label: String(status).toUpperCase(), tone: "muted" };
+  }
+}
+
+/**
+ * Tool Eval card — the headline of a tool-eval-bench run: final score and rating,
+ * deployability / responsiveness, the pass–partial–fail split, safety warnings and
+ * one tile per category. Reads the same normalised result the Results tab shows.
+ */
+export function buildToolEvalShareCard(
+  data: NormToolResult,
+  run: Pick<ToolEvalRun, "status" | "startedAt" | "finishedAt" | "model">,
+  src: { sparkName?: string | null },
+  now: number = Date.now()
+): ShareCardModel {
+  const tier = scoreTier(data.score);
+  const ratingStars = (data.rating?.match(/★/g) ?? []).length || tier?.stars || 0;
+  const rating = data.rating?.replace(/[★☆]+/g, "").trim() || tier?.label || "";
+  const done = data.counts.pass + data.counts.partial + data.counts.fail + data.counts.other;
+  const total = data.total ?? done;
+  const ms = run.finishedAt != null ? run.finishedAt - run.startedAt : null;
+  const stat = (label: string, v: number | null): ShareCardToolEvalStat => ({
+    label,
+    value: v == null ? "—" : v.toFixed(1),
+    suffix: v == null ? "" : "/100",
+    tone: toolEvalTone(v),
+  });
+  const modelName = data.model || run.model || "";
+  const categories = data.categories.map<ShareCardToolEvalCategory>((c) => ({
+    id: c.id,
+    name: c.name ?? CATEGORY_NAMES[c.id] ?? "Category",
+    pct: c.percent == null ? null : Math.max(0, Math.min(100, c.percent)),
+    detail:
+      c.points != null && c.maxPoints != null
+        ? `${Number(c.points.toFixed(1))}/${Number(c.maxPoints.toFixed(1))} pts`
+        : "",
+  }));
+  const summary = [
+    `${total.toLocaleString("en-US")} ${total === 1 ? "scenario" : "scenarios"}`,
+    ...(ms != null && ms >= 0 ? [formatDuration(ms)] : []),
+  ].join(" · ");
+  const chips: ShareCardChip[] = [];
+  if (data.backend) chips.push({ label: backendLabel(data.backend) || data.backend, tone: "accent" });
+  if (data.safety.length) {
+    chips.push({ label: `${data.safety.length} safety ${data.safety.length === 1 ? "warning" : "warnings"}`, tone: "warn" });
+  }
+  return {
+    toolEval: {
+      score: data.score,
+      rating,
+      stars: Math.max(0, Math.min(5, ratingStars)),
+      tone: data.safety.length ? "warn" : toolEvalTone(data.score),
+      modelName,
+      subline: [data.backend ? backendLabel(data.backend) || data.backend : "", data.version ? `tool-eval-bench ${data.version}` : ""]
+        .filter(Boolean)
+        .join(" · "),
+      stats: [stat("Deployability", data.deployability), stat("Responsiveness", data.responsiveness)],
+      counts: { ...data.counts, total },
+      summary,
+      safety: data.safety.slice(0, TOOL_EVAL_SAFETY_SHOWN),
+      safetyTotal: data.safety.length,
+      categories,
+    },
+    brand: "sparkDash",
+    host: src.sparkName || "",
+    title: "Tool Eval Bench",
+    subtitle: modelName,
+    chips,
+    status: toolEvalStatus(run.status),
+    meta: `Score ${data.score == null ? "—" : data.score.toFixed(1)}${rating ? ` · ${rating}` : ""} · ${summary}`,
+    columns: { load: "Category", primary: "Score", secondary: "" },
+    rows: [],
+    legend: "Score 0–100. Tiers: 90+ Excellent, 75+ Good, 60+ Adequate, 40+ Weak, else Poor.",
+    footer: "github.com/MiaAI-Lab/sparkDash",
+    generatedAt: now,
+  };
+}
+
+/** `+4.2` / `−1.0` / `±0`, coloured by whether the change is for the better. */
+function compareDelta(d: CompareDelta, suffix = ""): { text: string; tone: ShareCardTone } {
+  if (d.delta == null) return { text: "—", tone: "muted" };
+  if (Math.abs(d.delta) < 10 ** -d.digits / 2) return { text: "±0", tone: "muted" };
+  const better = d.higherIsBetter ? d.delta > 0 : d.delta < 0;
+  return {
+    text: `${d.delta > 0 ? "+" : "−"}${Math.abs(d.delta).toFixed(d.digits)}${suffix}`,
+    tone: better ? "ok" : "bad",
+  };
+}
+
+function compareSide(
+  tag: "A" | "B",
+  data: NormToolResult,
+  run: Pick<ToolEvalRun, "label" | "startedAt" | "model">,
+  sparkName?: string | null
+): ShareCardCompareSide {
+  const tier = scoreTier(data.score);
+  return {
+    heading: `RUN ${tag} · ${sparkName ? `${sparkName} · ` : ""}${run.label || shareCardDate(run.startedAt)}`,
+    model: data.model || run.model || "",
+    score: data.score,
+    rating: data.rating?.replace(/[★☆]+/g, "").trim() || tier?.label || "",
+    tone: data.safety.length ? "warn" : toolEvalTone(data.score),
+    // Failures are left off the card, as on the single-run card.
+    summary: data.scenarios.length ? `${data.counts.pass} pass · ${data.counts.partial} partial` : "",
+    safety: data.safety.length,
+  };
+}
+
+/**
+ * Tool Eval comparison card: run B against baseline run A — score change, metric tiles,
+ * how many scenarios moved, and every category side by side. Uses the same comparison
+ * the History tab shows, so the card and the panel always agree.
+ */
+export function buildToolEvalCompareShareCard(
+  a: NormToolResult,
+  b: NormToolResult,
+  runA: Pick<ToolEvalRun, "label" | "startedAt" | "model" | "baseUrl" | "options" | "type">,
+  runB: Pick<ToolEvalRun, "label" | "startedAt" | "model" | "baseUrl" | "options" | "type">,
+  src: { sparkName?: string | null; sparkNameA?: string | null; sparkNameB?: string | null },
+  now: number = Date.now()
+): ShareCardModel {
+  const cmp = compareToolResults(a, b);
+  // Runs from two Sparks: each side names its Spark and the card's host reads "spark1 vs spark3".
+  const cross = Boolean(src.sparkNameA && src.sparkNameB && src.sparkNameA !== src.sparkNameB);
+  const head = (label: string) => cmp.headline.find((h) => h.label === label)!;
+  const score = compareDelta(head("Score"));
+  const stat = (label: string, d: CompareDelta, digits: number): ShareCardCompareStat | null => {
+    if (d.a == null && d.b == null) return null;
+    const { text, tone } = compareDelta(d);
+    const v = (n: number | null) => (n == null ? "—" : n.toFixed(digits));
+    return { label, a: v(d.a), b: v(d.b), delta: text, tone };
+  };
+  const stats = [
+    stat("Deployability", head("Deployability"), 1),
+    stat("Responsiveness", head("Responsiveness"), 1),
+    stat("Scenarios passed", head("Passed"), 0),
+  ].filter((x): x is ShareCardCompareStat => x != null);
+  const changes =
+    cmp.hasScenarios.a && cmp.hasScenarios.b
+      ? {
+          improved: cmp.changes.filter((c) => c.kind === "improvement").length,
+          regressed: cmp.changes.filter((c) => c.kind === "regression").length,
+          unchanged: cmp.unchanged,
+        }
+      : null;
+  const caveats = configCaveats(runA, runB);
+  const caveat = caveats.length ? `${caveats[0]}${caveats.length > 1 ? ` (+${caveats.length - 1} more)` : ""}` : "";
+  const sideA = compareSide("A", a, runA, cross ? src.sparkNameA : null);
+  const sideB = compareSide("B", b, runB, cross ? src.sparkNameB : null);
+  return {
+    toolEvalCompare: {
+      a: sideA,
+      b: sideB,
+      scoreDelta: score.text,
+      scoreDeltaTone: score.tone,
+      stats,
+      changes,
+      categories: cmp.categories.map((c) => {
+        const clamp = (v: number | null) => (v == null ? null : Math.max(0, Math.min(100, v)));
+        const d = compareDelta(c, " pts");
+        return { id: c.id, name: c.name ?? CATEGORY_NAMES[c.id] ?? "Category", a: clamp(c.a), b: clamp(c.b), delta: d.text, tone: d.tone };
+      }),
+      caveat,
+    },
+    brand: "sparkDash",
+    host: cross ? `${src.sparkNameA} vs ${src.sparkNameB}` : src.sparkName || "",
+    title: "Tool Eval Comparison",
+    subtitle: "",
+    chips: [],
+    status: caveat ? { label: "DIFFERENT SETUP", tone: "warn" } : { label: "SAME SETUP", tone: "ok" },
+    meta: `Score ${score.text} · ${sideA.model || "run A"} → ${sideB.model || "run B"}`,
+    columns: { load: "Category", primary: "Run A", secondary: "Run B" },
+    rows: [],
+    legend: "Run B against run A, the baseline. Green is better, red is worse. Scores 0–100.",
     footer: "github.com/MiaAI-Lab/sparkDash",
     generatedAt: now,
   };
@@ -489,6 +785,20 @@ const QUALITY_TOP = 156;
 const QUALITY_HERO_HEIGHT = 224;
 const QUALITY_TILE_HEIGHT = 108;
 const QUALITY_TILE_GAP = 16;
+/** Tool Eval card geometry: hero, outcome strip, optional safety panel, then the category grid. */
+const TE_HERO_HEIGHT = 224;
+const TE_STRIP_HEIGHT = 112;
+const TE_GAP = 18;
+const TE_SAFETY_HEAD = 58;
+const TE_SAFETY_LINE = 30;
+const TE_TILE_HEIGHT = 88;
+const TE_TILE_GAP = 14;
+/** Tool Eval comparison card geometry. */
+const TC_HERO_HEIGHT = 262;
+const TC_CAVEAT_HEIGHT = 44;
+const TC_TILE_HEIGHT = 124;
+const TC_CATS_HEAD = 52;
+const TC_CATS_ROW = 54;
 
 function font(weight: number, size: number): string {
   return `${weight} ${size}px ${FONT_STACK}`;
@@ -522,8 +832,25 @@ function fitText(ctx: ShareCardContext, text: string, maxWidth: number): string 
   return `${text.slice(0, lo)}…`;
 }
 
+/** Largest font size from `start` down to `min` at which `text` fits `maxWidth` (the caller still `fitText`s at `min`). */
+function shrinkToFit(ctx: ShareCardContext, text: string, weight: number, start: number, min: number, maxWidth: number): number {
+  let size = start;
+  ctx.font = font(weight, size);
+  while (size > min && ctx.measureText(text).width > maxWidth) {
+    size -= 2;
+    ctx.font = font(weight, size);
+  }
+  return size;
+}
+
 /** Panel height is one row per level, so a 12-level sweep grows, not clips. */
 export function shareCardHeight(model: ShareCardModel): number {
+  if (model.toolEvalCompare) {
+    return Math.max(SHARE_CARD_MIN_HEIGHT, toolEvalCompareLayout(model.toolEvalCompare).bottom + 120);
+  }
+  if (model.toolEval) {
+    return Math.max(SHARE_CARD_MIN_HEIGHT, toolEvalLayout(model.toolEval).bottom + 120);
+  }
   if (model.quality) {
     const rows = Math.max(1, Math.ceil(model.quality.tiles.length / 2));
     const tilesBottom = QUALITY_TOP + QUALITY_HERO_HEIGHT + 22 + rows * (QUALITY_TILE_HEIGHT + QUALITY_TILE_GAP) - QUALITY_TILE_GAP;
@@ -650,6 +977,18 @@ export function paintShareCard(
 
   if (model.quality) {
     const bottom = paintQualityCard(ctx, P, model);
+    paintFooter(ctx, P, model, bottom + 42, height);
+    return;
+  }
+
+  if (model.toolEvalCompare) {
+    const bottom = paintToolEvalCompareCard(ctx, P, model);
+    paintFooter(ctx, P, model, bottom + 42, height);
+    return;
+  }
+
+  if (model.toolEval) {
+    const bottom = paintToolEvalCard(ctx, P, model);
     paintFooter(ctx, P, model, bottom + 42, height);
     return;
   }
@@ -972,4 +1311,596 @@ function paintQualityCard(ctx: ShareCardContext, P: Palette, model: ShareCardMod
   });
   const rows = Math.max(1, Math.ceil(q.tiles.length / 2));
   return gridTop + rows * (QUALITY_TILE_HEIGHT + QUALITY_TILE_GAP) - QUALITY_TILE_GAP;
+}
+
+/** Vertical positions of the Tool Eval card's blocks; shared by the height calculation and the painter. */
+function toolEvalLayout(te: ShareCardToolEval): {
+  heroY: number;
+  stripY: number;
+  safetyY: number | null;
+  safetyHeight: number;
+  gridY: number | null;
+  bottom: number;
+} {
+  const heroY = QUALITY_TOP;
+  const stripY = heroY + TE_HERO_HEIGHT + TE_GAP;
+  let bottom = stripY + TE_STRIP_HEIGHT;
+  let safetyY: number | null = null;
+  let safetyHeight = 0;
+  if (te.safetyTotal > 0) {
+    safetyY = bottom + TE_GAP;
+    const lines = te.safety.length + (te.safetyTotal > te.safety.length ? 1 : 0);
+    safetyHeight = TE_SAFETY_HEAD + lines * TE_SAFETY_LINE;
+    bottom = safetyY + safetyHeight;
+  }
+  let gridY: number | null = null;
+  if (te.categories.length) {
+    gridY = bottom + 22;
+    const rows = Math.ceil(te.categories.length / 2);
+    bottom = gridY + rows * (TE_TILE_HEIGHT + TE_TILE_GAP) - TE_TILE_GAP;
+  }
+  return { heroY, stripY, safetyY, safetyHeight, gridY, bottom };
+}
+
+/** Five-point star centred on (cx, cy), as a filled path. */
+function drawStar(ctx: ShareCardContext, cx: number, cy: number, outer: number, fill: string): void {
+  const inner = outer * 0.42;
+  ctx.fillStyle = fill;
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const r = i % 2 === 0 ? outer : inner;
+    const a = -Math.PI / 2 + (i * Math.PI) / 5;
+    const x = cx + Math.cos(a) * r;
+    const y = cy + Math.sin(a) * r;
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+  ctx.fill();
+}
+
+/** Fill colour for a bar or ring in a tone: the brand amber stays the fill colour, not the darker text one. */
+function toolEvalFill(P: Palette, tone: ShareCardTone): string {
+  return tone === "accent" ? P.accent : toneColor(P, tone);
+}
+
+function panelBox(ctx: ShareCardContext, P: Palette, x: number, y: number, w: number, h: number, radius: number): void {
+  ctx.fillStyle = P.panel;
+  ctx.beginPath();
+  ctx.roundRect(x, y, w, h, radius);
+  ctx.fill();
+  ctx.strokeStyle = P.panelBorder;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+}
+
+/**
+ * The Tool Eval card from the title down: score hero (ring, stars, model, deployability and
+ * responsiveness), the pass/partial/fail strip, safety warnings when there are any, then a
+ * two-column grid of category tiles. Returns the bottom edge's y.
+ */
+function paintToolEvalCard(ctx: ShareCardContext, P: Palette, model: ShareCardModel): number {
+  const te = model.toolEval as ShareCardToolEval;
+  const inner = SHARE_CARD_WIDTH - PAD * 2;
+  const L = toolEvalLayout(te);
+
+  // Title, with the run status at the right on the same line
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = P.textStrong;
+  ctx.font = font(700, 44);
+  ctx.fillText(model.title, PAD, PAD + 78);
+  ctx.font = font(700, 20);
+  const pillW = ctx.measureText(model.status.label).width + 40;
+  drawPill(ctx, P, PAD + inner - pillW, PAD + 46, model.status.label, model.status.tone);
+
+  // Hero panel
+  const top = L.heroY;
+  panelBox(ctx, P, PAD, top, inner, TE_HERO_HEIGHT, 20);
+
+  // Score ring
+  const radius = 76;
+  const cx = PAD + 48 + radius + 8;
+  const cy = top + TE_HERO_HEIGHT / 2;
+  const heroTone = toolEvalFill(P, te.tone);
+  ctx.lineWidth = 16;
+  ctx.lineCap = "butt";
+  ctx.strokeStyle = P.badge;
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.stroke();
+  if (te.score != null && te.score > 0) {
+    ctx.strokeStyle = heroTone;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, -Math.PI / 2, -Math.PI / 2 + (Math.min(100, te.score) / 100) * Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = P.muted;
+  ctx.font = font(600, 15);
+  ctx.fillText("SCORE", cx, cy - 30);
+  ctx.fillStyle = P.textStrong;
+  ctx.font = font(700, 48);
+  ctx.fillText(te.score == null ? "—" : te.score.toFixed(1), cx, cy + 18);
+
+  // Right column: deployability and responsiveness, behind a divider
+  const statX = PAD + inner - 260;
+  ctx.strokeStyle = P.rowBorder;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(statX - 30, top + 28);
+  ctx.lineTo(statX - 30, top + TE_HERO_HEIGHT - 28);
+  ctx.stroke();
+  te.stats.forEach((stat, i) => {
+    const labelY = top + 52 + i * 84;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = P.muted;
+    ctx.font = font(600, 16);
+    ctx.fillText(stat.label.toUpperCase(), statX, labelY);
+    ctx.fillStyle = stat.tone === "muted" ? P.muted : toneColor(P, stat.tone);
+    ctx.font = font(700, 44);
+    ctx.fillText(stat.value, statX, labelY + 46);
+    if (stat.suffix) {
+      const w = ctx.measureText(stat.value).width;
+      ctx.fillStyle = P.muted;
+      ctx.font = font(500, 20);
+      ctx.fillText(stat.suffix, statX + w + 8, labelY + 46);
+    }
+  });
+
+  // Middle column: stars + rating, the model under test, its engine, then chips
+  const textX = cx + radius + 56;
+  const textW = statX - 48 - textX;
+  const starY = cy - 62;
+  for (let i = 0; i < 5; i++) drawStar(ctx, textX + 14 + i * 34, starY, 14, i < te.stars ? P.accent : P.badge);
+  if (te.rating) {
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = P.textStrong;
+    ctx.font = font(700, 26);
+    ctx.fillText(te.rating, textX + 5 * 34 + 4, starY + 1);
+  }
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = P.textStrong;
+  // Long model ids shrink to fit before they are cut.
+  const modelName = te.modelName || "Unknown model";
+  shrinkToFit(ctx, modelName, 700, 34, 24, textW);
+  ctx.fillText(fitText(ctx, modelName, textW), textX, cy - 8);
+  ctx.fillStyle = P.muted;
+  ctx.font = font(500, 21);
+  ctx.fillText(fitText(ctx, te.subline, textW), textX, cy + 22);
+  let chipX = textX;
+  for (const chip of model.chips) {
+    const w = drawChip(ctx, P, chipX, cy + 42, chip);
+    chipX += w + 10;
+  }
+
+  // Outcome strip: one segment per outcome, sized by count
+  const stripY = L.stripY;
+  panelBox(ctx, P, PAD, stripY, inner, TE_STRIP_HEIGHT, 16);
+  const sx = PAD + 28;
+  const sw = inner - 56;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = P.muted;
+  ctx.font = font(600, 16);
+  ctx.fillText("SCENARIO OUTCOMES", sx, stripY + 34);
+  ctx.textAlign = "right";
+  ctx.font = font(400, 20);
+  ctx.fillText(te.summary, sx + sw, stripY + 34);
+  // Failures are left off the card: the bar keeps its full scale (so pass/partial show their
+  // real share of all scenarios) but only pass, partial and other are drawn and listed.
+  const outcomes: { label: string; n: number; color: string; shown: boolean }[] = [
+    { label: "pass", n: te.counts.pass, color: P.success, shown: true },
+    { label: "partial", n: te.counts.partial, color: P.warning, shown: true },
+    { label: "fail", n: te.counts.fail, color: P.danger, shown: false },
+    { label: "other", n: te.counts.other, color: P.muted, shown: te.counts.other > 0 },
+  ];
+  const barY = stripY + 50;
+  ctx.fillStyle = P.badge;
+  ctx.beginPath();
+  ctx.roundRect(sx, barY, sw, 14, 7);
+  ctx.fill();
+  const counted = outcomes.reduce((n, o) => n + o.n, 0);
+  if (counted > 0) {
+    const gap = 3;
+    const live = outcomes.filter((o) => o.n > 0);
+    const usable = sw - gap * (live.length - 1);
+    let segX = sx;
+    for (const o of live) {
+      const w = (usable * o.n) / counted;
+      if (o.shown) {
+        ctx.fillStyle = o.color;
+        ctx.beginPath();
+        ctx.roundRect(segX, barY, w, 14, Math.min(7, w / 2));
+        ctx.fill();
+      }
+      segX += w + gap;
+    }
+  }
+  let legendX = sx;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  for (const o of outcomes.filter((x) => x.shown)) {
+    ctx.fillStyle = o.color;
+    ctx.beginPath();
+    ctx.arc(legendX + 6, stripY + 91, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.font = font(700, 22);
+    ctx.fillStyle = P.textStrong;
+    const count = String(o.n);
+    ctx.fillText(count, legendX + 20, stripY + 98);
+    const cw = ctx.measureText(count).width;
+    ctx.font = font(400, 20);
+    ctx.fillStyle = P.muted;
+    ctx.fillText(o.label, legendX + 20 + cw + 7, stripY + 98);
+    legendX += 20 + cw + 7 + ctx.measureText(o.label).width + 34;
+  }
+
+  // Safety warnings: a warning-tinted panel, since they cap the rating
+  if (L.safetyY != null) {
+    const y = L.safetyY;
+    ctx.fillStyle = `${P.warning}1a`;
+    ctx.beginPath();
+    ctx.roundRect(PAD, y, inner, L.safetyHeight, 16);
+    ctx.fill();
+    ctx.strokeStyle = `${P.warning}66`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = P.warning;
+    ctx.font = font(700, 20);
+    ctx.fillText(
+      `SAFETY WARNINGS (${te.safetyTotal}) · the rating is capped`,
+      PAD + 28,
+      y + 38
+    );
+    ctx.font = font(400, 20);
+    ctx.fillStyle = P.text;
+    te.safety.forEach((w, i) => {
+      ctx.fillText(fitText(ctx, `•  ${w}`, inner - 56), PAD + 28, y + TE_SAFETY_HEAD + 16 + i * TE_SAFETY_LINE);
+    });
+    if (te.safetyTotal > te.safety.length) {
+      ctx.fillStyle = P.muted;
+      ctx.fillText(
+        `+${te.safetyTotal - te.safety.length} more`,
+        PAD + 28,
+        y + TE_SAFETY_HEAD + 16 + te.safety.length * TE_SAFETY_LINE
+      );
+    }
+  }
+
+  // Category tiles
+  const gridY = L.gridY;
+  if (gridY != null) {
+    const gap = 20;
+    const tileW = (inner - gap) / 2;
+    te.categories.forEach((cat, i) => {
+      const x = PAD + (i % 2) * (tileW + gap);
+      const y = gridY + Math.floor(i / 2) * (TE_TILE_HEIGHT + TE_TILE_GAP);
+      panelBox(ctx, P, x, y, tileW, TE_TILE_HEIGHT, 16);
+      const tone = cat.pct == null ? "muted" : toolEvalTone(cat.pct);
+      const left = x + 22;
+      const right = x + tileW - 22;
+
+      // Letter badge, tinted by the score band
+      ctx.fillStyle = tone === "muted" ? P.badge : `${toolEvalFill(P, tone)}24`;
+      ctx.beginPath();
+      ctx.roundRect(left, y + 14, 44, 44, 11);
+      ctx.fill();
+      ctx.fillStyle = tone === "muted" ? P.muted : toneColor(P, tone);
+      ctx.font = font(700, 22);
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(cat.id, left + 22, y + 37);
+
+      // Name and points on the left, score on the right
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+      ctx.fillStyle = P.textStrong;
+      ctx.font = font(700, 23);
+      ctx.fillText(fitText(ctx, cat.name, tileW - 44 - 16 - 22 - 150), left + 60, y + 32);
+      ctx.fillStyle = P.muted;
+      ctx.font = font(400, 18);
+      ctx.fillText(cat.detail, left + 60, y + 54);
+
+      ctx.textAlign = "right";
+      const pctText = cat.pct == null ? "—" : String(Number(cat.pct.toFixed(1)));
+      ctx.font = font(500, 18);
+      const unitW = cat.pct == null ? 0 : ctx.measureText("%").width + 3;
+      ctx.fillStyle = tone === "muted" ? P.muted : toneColor(P, tone);
+      ctx.font = font(700, 36);
+      ctx.fillText(pctText, right - unitW, y + 46);
+      if (cat.pct != null) {
+        ctx.font = font(500, 18);
+        ctx.fillStyle = P.muted;
+        ctx.fillText("%", right, y + 46);
+      }
+
+      // Bar
+      const barW = right - left;
+      ctx.fillStyle = P.badge;
+      ctx.beginPath();
+      ctx.roundRect(left, y + TE_TILE_HEIGHT - 16, barW, 6, 3);
+      ctx.fill();
+      if (cat.pct != null && cat.pct > 0) {
+        ctx.fillStyle = toolEvalFill(P, tone);
+        ctx.beginPath();
+        ctx.roundRect(left, y + TE_TILE_HEIGHT - 16, Math.max(6, (barW * cat.pct) / 100), 6, 3);
+        ctx.fill();
+      }
+    });
+  }
+  return L.bottom;
+}
+
+/** Vertical positions of the comparison card's blocks; shared by the height calculation and the painter. */
+function toolEvalCompareLayout(c: ShareCardToolEvalCompare): {
+  heroY: number;
+  caveatY: number | null;
+  tilesY: number | null;
+  tileCount: number;
+  catsY: number | null;
+  catsHeight: number;
+  bottom: number;
+} {
+  const heroY = QUALITY_TOP;
+  let bottom = heroY + TC_HERO_HEIGHT;
+  let caveatY: number | null = null;
+  if (c.caveat) {
+    caveatY = bottom;
+    bottom += TC_CAVEAT_HEIGHT;
+  }
+  const tileCount = c.stats.length + (c.changes ? 1 : 0);
+  let tilesY: number | null = null;
+  if (tileCount > 0) {
+    tilesY = bottom + TE_GAP;
+    bottom = tilesY + TC_TILE_HEIGHT;
+  }
+  let catsY: number | null = null;
+  let catsHeight = 0;
+  if (c.categories.length) {
+    catsY = bottom + 22;
+    catsHeight = TC_CATS_HEAD + c.categories.length * TC_CATS_ROW + 8;
+    bottom = catsY + catsHeight;
+  }
+  return { heroY, caveatY, tilesY, tileCount, catsY, catsHeight, bottom };
+}
+
+/** `72.5%`, or an em dash for a missing score. */
+function pctText(v: number | null): string {
+  return v == null ? "—" : `${Number(v.toFixed(1))}%`;
+}
+
+/**
+ * The comparison card from the title down: a hero with both runs' scores around the change,
+ * a caveat line when the setups differ, metric tiles, then every category with both bars and
+ * the change in points. Returns the bottom edge's y.
+ */
+function paintToolEvalCompareCard(ctx: ShareCardContext, P: Palette, model: ShareCardModel): number {
+  const c = model.toolEvalCompare as ShareCardToolEvalCompare;
+  const inner = SHARE_CARD_WIDTH - PAD * 2;
+  const L = toolEvalCompareLayout(c);
+
+  // Title, with whether the two runs share a setup at the right
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = P.textStrong;
+  ctx.font = font(700, 44);
+  ctx.fillText(model.title, PAD, PAD + 78);
+  ctx.font = font(700, 20);
+  const pillW = ctx.measureText(model.status.label).width + 40;
+  drawPill(ctx, P, PAD + inner - pillW, PAD + 46, model.status.label, model.status.tone);
+
+  // Hero: run A | change | run B
+  const top = L.heroY;
+  panelBox(ctx, P, PAD, top, inner, TC_HERO_HEIGHT, 20);
+  const colW = 360;
+  const centerX = PAD + inner / 2;
+  const drawSide = (side: ShareCardCompareSide, x: number) => {
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = P.muted;
+    ctx.font = font(600, 16);
+    ctx.fillText(fitText(ctx, side.heading.toUpperCase(), colW), x, top + 44);
+    ctx.fillStyle = P.textStrong;
+    const modelName = side.model || "Unknown model";
+    shrinkToFit(ctx, modelName, 700, 26, 18, colW);
+    ctx.fillText(fitText(ctx, modelName, colW), x, top + 84);
+    ctx.fillStyle = side.score == null ? P.muted : toneColor(P, side.tone);
+    ctx.font = font(700, 64);
+    const scoreText = side.score == null ? "—" : side.score.toFixed(1);
+    ctx.fillText(scoreText, x, top + 160);
+    if (side.rating) {
+      const w = ctx.measureText(scoreText).width;
+      ctx.fillStyle = P.text;
+      ctx.font = font(600, 24);
+      ctx.fillText(fitText(ctx, side.rating, colW - w - 18), x + w + 18, top + 160);
+    }
+    ctx.fillStyle = P.muted;
+    ctx.font = font(400, 20);
+    if (side.summary) ctx.fillText(side.summary, x, top + 200);
+    if (side.safety > 0) {
+      ctx.fillStyle = P.warning;
+      ctx.font = font(600, 20);
+      ctx.fillText(`${side.safety} safety ${side.safety === 1 ? "warning" : "warnings"}`, x, top + (side.summary ? 232 : 200));
+    }
+  };
+  drawSide(c.a, PAD + 36);
+  drawSide(c.b, PAD + inner - 36 - colW);
+
+  ctx.strokeStyle = P.rowBorder;
+  ctx.lineWidth = 1;
+  for (const dx of [-130, 130]) {
+    ctx.beginPath();
+    ctx.moveTo(centerX + dx, top + 30);
+    ctx.lineTo(centerX + dx, top + TC_HERO_HEIGHT - 30);
+    ctx.stroke();
+  }
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = P.muted;
+  ctx.font = font(600, 16);
+  ctx.fillText("SCORE CHANGE", centerX, top + 96);
+  ctx.fillStyle = c.scoreDeltaTone === "muted" ? P.muted : toneColor(P, c.scoreDeltaTone);
+  ctx.font = font(700, 58);
+  ctx.fillText(c.scoreDelta, centerX, top + 160);
+  ctx.fillStyle = P.muted;
+  ctx.font = font(400, 18);
+  ctx.fillText("run B vs run A", centerX, top + 196);
+
+  // Caveat
+  if (L.caveatY != null) {
+    ctx.textAlign = "left";
+    ctx.fillStyle = P.warning;
+    ctx.font = font(500, 20);
+    ctx.fillText(fitText(ctx, `⚠  ${c.caveat}`, inner), PAD, L.caveatY + 30);
+  }
+
+  // Metric tiles, one more for the scenario changes
+  if (L.tilesY != null) {
+    const gap = 16;
+    const tileW = (inner - gap * (L.tileCount - 1)) / L.tileCount;
+    const tileAt = (i: number) => PAD + i * (tileW + gap);
+    c.stats.forEach((st, i) => {
+      const x = tileAt(i);
+      panelBox(ctx, P, x, L.tilesY!, tileW, TC_TILE_HEIGHT, 16);
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+      ctx.fillStyle = P.muted;
+      ctx.font = font(600, 15);
+      ctx.fillText(st.label.toUpperCase(), x + 24, L.tilesY! + 34);
+      ctx.font = font(700, 32);
+      ctx.fillStyle = P.muted;
+      const aw = ctx.measureText(st.a).width;
+      ctx.fillText(st.a, x + 24, L.tilesY! + 78);
+      ctx.font = font(500, 22);
+      ctx.fillText("→", x + 24 + aw + 10, L.tilesY! + 76);
+      const arrowW = ctx.measureText("→").width;
+      ctx.font = font(700, 32);
+      ctx.fillStyle = P.textStrong;
+      ctx.fillText(st.b, x + 24 + aw + 20 + arrowW, L.tilesY! + 78);
+      ctx.fillStyle = st.tone === "muted" ? P.muted : toneColor(P, st.tone);
+      ctx.font = font(700, 22);
+      ctx.fillText(st.delta, x + 24, L.tilesY! + 108);
+    });
+    if (c.changes) {
+      const x = tileAt(c.stats.length);
+      panelBox(ctx, P, x, L.tilesY, tileW, TC_TILE_HEIGHT, 16);
+      ctx.textAlign = "left";
+      ctx.fillStyle = P.muted;
+      ctx.font = font(600, 15);
+      ctx.fillText("SCENARIO CHANGES", x + 24, L.tilesY + 34);
+      let cx = x + 24;
+      for (const part of [
+        { n: c.changes.improved, label: "better", color: P.success },
+        { n: c.changes.regressed, label: "worse", color: P.danger },
+      ]) {
+        ctx.font = font(700, 32);
+        ctx.fillStyle = part.n > 0 ? part.color : P.muted;
+        ctx.fillText(String(part.n), cx, L.tilesY + 78);
+        const w = ctx.measureText(String(part.n)).width;
+        ctx.font = font(400, 20);
+        ctx.fillStyle = P.muted;
+        ctx.fillText(part.label, cx + w + 7, L.tilesY + 78);
+        cx += w + 7 + ctx.measureText(part.label).width + 26;
+      }
+      ctx.font = font(400, 17);
+      ctx.fillStyle = P.muted;
+      ctx.fillText(`${c.changes.unchanged} unchanged`, x + 24, L.tilesY + 108);
+    }
+  }
+
+  // Categories: both bars and the change in points
+  if (L.catsY != null) {
+    const y0 = L.catsY;
+    panelBox(ctx, P, PAD, y0, inner, L.catsHeight, 18);
+    const left = PAD + 24;
+    const right = PAD + inner - 24;
+    const barX = left + 390;
+    const barW = 300;
+    const aRight = right - 270;
+    const bRight = right - 170;
+    ctx.textBaseline = "middle";
+    ctx.font = font(600, 16);
+    ctx.fillStyle = P.muted;
+    ctx.textAlign = "left";
+    ctx.fillText("CATEGORY", left, y0 + TC_CATS_HEAD / 2 + 2);
+    // Legend swatches over the bars
+    ctx.fillStyle = `${P.muted}99`;
+    ctx.beginPath();
+    ctx.roundRect(barX, y0 + TC_CATS_HEAD / 2 - 5, 18, 8, 4);
+    ctx.fill();
+    ctx.fillStyle = P.muted;
+    ctx.fillText("RUN A", barX + 26, y0 + TC_CATS_HEAD / 2 + 2);
+    ctx.fillStyle = P.accent;
+    ctx.beginPath();
+    ctx.roundRect(barX + 110, y0 + TC_CATS_HEAD / 2 - 5, 18, 8, 4);
+    ctx.fill();
+    ctx.fillStyle = P.muted;
+    ctx.fillText("RUN B", barX + 136, y0 + TC_CATS_HEAD / 2 + 2);
+    ctx.textAlign = "right";
+    ctx.fillText("A", aRight, y0 + TC_CATS_HEAD / 2 + 2);
+    ctx.fillText("B", bRight, y0 + TC_CATS_HEAD / 2 + 2);
+    ctx.fillText("CHANGE", right, y0 + TC_CATS_HEAD / 2 + 2);
+
+    c.categories.forEach((cat, i) => {
+      const y = y0 + TC_CATS_HEAD + i * TC_CATS_ROW;
+      const mid = y + TC_CATS_ROW / 2;
+      ctx.strokeStyle = P.rowBorder;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(PAD + 1, y);
+      ctx.lineTo(PAD + inner - 1, y);
+      ctx.stroke();
+
+      const tone = cat.b == null ? "muted" : toolEvalTone(cat.b);
+      ctx.fillStyle = tone === "muted" ? P.badge : `${toolEvalFill(P, tone)}24`;
+      ctx.beginPath();
+      ctx.roundRect(left, mid - 18, 36, 36, 9);
+      ctx.fill();
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = tone === "muted" ? P.muted : toneColor(P, tone);
+      ctx.font = font(700, 19);
+      ctx.fillText(cat.id, left + 18, mid + 1);
+      ctx.textAlign = "left";
+      ctx.fillStyle = P.textStrong;
+      ctx.font = font(600, 22);
+      ctx.fillText(fitText(ctx, cat.name, barX - left - 52 - 20), left + 52, mid + 1);
+
+      // Two thin bars: A (muted) over B (the score band's colour)
+      for (const [value, dy, color] of [
+        [cat.a, -11, `${P.muted}99`],
+        [cat.b, 3, toolEvalFill(P, tone)],
+      ] as const) {
+        ctx.fillStyle = P.badge;
+        ctx.beginPath();
+        ctx.roundRect(barX, mid + dy, barW, 8, 4);
+        ctx.fill();
+        if (value != null && value > 0) {
+          ctx.fillStyle = color;
+          ctx.beginPath();
+          ctx.roundRect(barX, mid + dy, Math.max(8, (barW * value) / 100), 8, 4);
+          ctx.fill();
+        }
+      }
+
+      ctx.textAlign = "right";
+      ctx.font = font(500, 20);
+      ctx.fillStyle = P.muted;
+      ctx.fillText(pctText(cat.a), aRight, mid + 1);
+      ctx.font = font(700, 22);
+      ctx.fillStyle = P.textStrong;
+      ctx.fillText(pctText(cat.b), bRight, mid + 1);
+      ctx.font = font(700, 22);
+      ctx.fillStyle = cat.tone === "muted" ? P.muted : toneColor(P, cat.tone);
+      ctx.fillText(cat.delta, right, mid + 1);
+    });
+  }
+  return L.bottom;
 }

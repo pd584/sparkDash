@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { isolatedConfigEnv } from "../../__tests__/isolatedEnv.js";
 import { once } from "node:events";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
@@ -42,6 +43,7 @@ test("a new WebSocket client receives its initial snapshot without rebroadcastin
     cwd: path.resolve(import.meta.dirname, "../../.."),
     env: {
       ...process.env,
+      ...isolatedConfigEnv(tmp),
       BIND_HOST: "127.0.0.1",
       PORT: String(port),
       SPARKS_JSON_PATH: sparksPath,
@@ -49,8 +51,10 @@ test("a new WebSocket client receives its initial snapshot without rebroadcastin
       SECRETS_KEY_PATH: path.join(tmp, ".secrets-key"),
       LLM_DAILY_JSON_PATH: path.join(tmp, "llm-daily.json"),
       FLEET_ENERGY_JSON_PATH: path.join(tmp, "fleet-energy.json"),
+      FLEET_ENERGY_MONTHLY_JSON_PATH: path.join(tmp, "fleet-energy-monthly.json"),
       EVENTS_JSON_PATH: path.join(tmp, "events.json"),
       GPU_HISTORY_JSON_PATH: path.join(tmp, "gpu-history.json"),
+      GPU_HISTORY_LONG_JSON_PATH: path.join(tmp, "gpu-history-long.json"),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

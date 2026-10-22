@@ -44,6 +44,8 @@ const VLLM_METRIC_INFO = {
     "Free tokens left in the engine’s KV-cache pool, over the allocated pool (tokens and memory). The pool is shared across concurrent requests and can be larger than one request’s max context. High usage (≥80% full) means little room for new or long contexts and often leads to queuing or preemptions.",
   requests:
     "Run = requests actively generating on the GPU. Wait = accepted but not yet scheduled (capacity or constraints). Growing wait with high KV cache usually means the server is overloaded.",
+  ttftMean:
+    "Mean time-to-first-token reported by FreeToken (a mean, not a percentile): how long requests wait until the first output token.",
   ttftP95:
     "95th percentile time-to-first-token from the engine’s request history: how long “slow” requests wait until the first output token. Spikes mean queueing, long prefills, or cold paths—not average decode speed.",
   preempts:
@@ -422,12 +424,13 @@ export function LlmPanel({
 
   const generationTps = llm?.generationTps ?? 0;
   const prefillTps = llm?.prefillTps ?? 0;
+  const isStrata = llm?.backend === "strata";
   const showPrefillSplit = llm?.cachedPrefillTps != null || llm?.uncachedPrefillTps != null;
   const cachedPrefillTps = llm?.cachedPrefillTps ?? 0;
   const uncachedPrefillTps = llm?.uncachedPrefillTps ?? 0;
   const available = llm?.available ?? false;
   // While nothing is flowing, say when the endpoint last served.
-  const idleNote = available && isLlmIdle({ generationTps, prefillTps })
+  const idleNote = available && isLlmIdle({ generationTps, prefillTps, prefillActive: llm?.prefillActive, decodeActive: llm?.decodeActive })
     ? idleLabel(llm?.lastActiveAt)
     : null;
 
@@ -497,7 +500,10 @@ export function LlmPanel({
 
   const fmtTps = (n: number) => (n >= 1000 ? Math.round(n).toLocaleString() : n.toFixed(1));
   const fmtAvg = (n: number) => (n >= 100 ? n.toFixed(0) : n.toFixed(1));
-  const isVllm = llm != null && (llm.backend === "vllm" || llm.backend === "q27");
+  const isVllm = llm != null && (llm.backend === "vllm" || llm.backend === "q27" || llm.backend === "radiance" || llm.backend === "flare");
+  // FreeToken reports KV use, active requests and a TTFT mean in /v1/stats; the tiles below are null-gated.
+  const isFreeToken = llm?.backend === "freetoken";
+  const showEngineTiles = isVllm || isFreeToken || isStrata;
   const kvTone =
     llm?.kvCacheUsage == null
       ? ""
@@ -556,9 +562,16 @@ export function LlmPanel({
       actions={
         <div className="sp-actions">
           {available && backend && (
-            <Tag tone="info" title={`Backend: ${backend}`}>
-              {backend} · :{llmPort}
-            </Tag>
+            <>
+              {llm?.via === "ssh-tunnel" && (
+                <Tag title="This engine's port is not reachable from the dashboard, so it is read through an SSH tunnel to the unit">
+                  via SSH
+                </Tag>
+              )}
+              <Tag tone="info" title={`Backend: ${backend}`}>
+                {backend} · :{llmPort}
+              </Tag>
+            </>
           )}
           {onRemovePort && (
             <button
@@ -595,7 +608,7 @@ export function LlmPanel({
       {showSettings ? (
         <div className="sp-stack">
           <p className="sp-hint">
-            HTTP port of the LLM server on this Spark (vLLM / llama.cpp / sglang / ds4 / EXL3 / TensorFold / OpenAI-compatible gateway).
+            HTTP port of the LLM server on this Spark (vLLM / llama.cpp / sglang / ds4 / EXL3 / TensorFold / Radiance / OpenAI-compatible gateway).
           </p>
           <label className="sp-field">
             <span className="eyebrow">Port</span>
@@ -618,6 +631,33 @@ export function LlmPanel({
               className="sp-input"
             />
           </label>
+          <div className="sp-btns" role="group" aria-label="Server presets">
+            <span className="eyebrow">Presets:</span>
+            <button
+              type="button"
+              title="Fill LM Studio's default port (1234)"
+              onClick={() => setPortDraft("1234")}
+              className="btn btn--sm"
+            >
+              LM Studio :1234
+            </button>
+            <button
+              type="button"
+              title="Fill Ollama's default port (11434)"
+              onClick={() => setPortDraft("11434")}
+              className="btn btn--sm"
+            >
+              Ollama :11434
+            </button>
+            <button
+              type="button"
+              title="Fill TensorFold's default port (8888)"
+              onClick={() => setPortDraft("8888")}
+              className="btn btn--sm"
+            >
+              TensorFold :8888
+            </button>
+          </div>
           <label className="sp-field">
             <span className="eyebrow">API key (optional)</span>
             <input
@@ -716,14 +756,31 @@ export function LlmPanel({
           </div>
 
           <div className="sp-decode">
-            <div className="sp-metric">
+            <div
+              className="sp-metric"
+              title={
+                isStrata
+                  ? "Live sliding-window decode rate. When that window is unavailable, the active-slot mean sums each active slot’s generated tokens divided by its elapsed time since first token; it excludes prefill time."
+                  : undefined
+              }
+            >
               <span className="eyebrow">Decode</span>
               <div className="big-num sp-big-lg">
-                {fmtTps(generationTps)}
-                <small>tok/s</small>
+                {isStrata && llm?.decodeActive && generationTps <= 0 ? (
+                  <>
+                    <span className="ov-tps__dots" aria-hidden />
+                    <small>decoding</small>
+                  </>
+                ) : (
+                  <>
+                    {fmtTps(generationTps)}
+                    <small>tok/s</small>
+                  </>
+                )}
               </div>
               <TrendLine data={genHistory} height={44} color="var(--color-accent)" />
               {genAvg != null && <span className="sp-avg mono">avg {fmtAvg(genAvg)}</span>}
+              {isStrata && llm?.generationTpsSource === "slot-mean" && <span className="sp-avg">active-slot mean</span>}
               {idleNote && (
                 <span className="sp-avg" data-llm-idle>
                   {idleNote}
@@ -732,14 +789,18 @@ export function LlmPanel({
             </div>
             <div
               className="sp-metric"
-              title="Prompt tokens/sec taken in during the last poll window — cache-served + computed. Opening a saved chat in the UI does not hit the GPU; send (or regenerate) so the history is sent as the prompt. Cached prefill does little GPU work; uncached prefill is what builds KV cache."
+              title={
+                isStrata
+                  ? "Engine-reported mean for computed/new prompt tokens. It may be from an earlier prefill and is not an aggregate across slots."
+                  : "Prompt tokens/sec taken in during the last poll window — cache-served + computed. Opening a saved chat in the UI does not hit the GPU; send (or regenerate) so the history is sent as the prompt. Cached prefill does little GPU work; uncached prefill is what builds KV cache."
+              }
             >
               <span className="eyebrow">Prefill</span>
               <div className="big-num sp-big-lg">
                 {llm?.prefillActive && prefillTps <= 0 ? (
                   <>
                     <span className="ov-tps__dots" aria-hidden />
-                    <small title="A prompt is being processed. The engine reports its speed only when the request finishes.">prefilling</small>
+                    <small title={isStrata ? "A prompt is being processed; no current prefill rate is available." : "A prompt is being processed. The engine reports its speed only when the request finishes."}>prefilling</small>
                   </>
                 ) : (
                   <>
@@ -750,6 +811,7 @@ export function LlmPanel({
               </div>
               <TrendLine data={prefillHistory} height={44} color="var(--color-info)" />
               {prefillAvg != null && <span className="sp-avg mono">avg {fmtAvg(prefillAvg)}</span>}
+              {isStrata && prefillTps > 0 && <span className="sp-avg">last reported mean</span>}
             </div>
           </div>
           {showPrefillSplit && (
@@ -782,8 +844,8 @@ export function LlmPanel({
           )}
 
           <div className="sp-tiles">
-            {isVllm && kvValue != null && tile("kvCache", "KV cache", kvValue, { tone: kvTone, sub: kvSub || undefined })}
-            {isVllm &&
+            {showEngineTiles && kvValue != null && tile("kvCache", "KV cache", kvValue, { tone: kvTone, sub: kvSub || undefined })}
+            {showEngineTiles &&
               llm?.requestsRunning != null &&
               tile(
                 "requests",
@@ -791,22 +853,23 @@ export function LlmPanel({
                 `${Math.round(llm.requestsRunning)} / ${llm.requestsWaiting != null ? Math.round(llm.requestsWaiting) : "—"}`,
                 { align: "right" }
               )}
-            {isVllm && llm?.ttftP95Seconds != null && tile("ttftP95", "TTFT p95", `${Math.round(llm.ttftP95Seconds * 1000)} ms`)}
-            {isVllm &&
+            {isFreeToken && llm?.ttftSeconds != null && tile("ttftMean", "TTFT mean", `${Math.round(llm.ttftSeconds * 1000)} ms`)}
+            {showEngineTiles && llm?.ttftP95Seconds != null && tile("ttftP95", "TTFT p95", `${Math.round(llm.ttftP95Seconds * 1000)} ms`)}
+            {showEngineTiles &&
               llm?.preemptionsTotal != null &&
               tile("preempts", "Preempts", Math.round(llm.preemptionsTotal).toLocaleString(), { align: "right" })}
-            {isVllm &&
+            {showEngineTiles &&
               llm?.prefixCacheHitRate != null &&
               tile("prefixCache", "Prefix hit", `${(llm.prefixCacheHitRate * 100).toFixed(0)}%`)}
-            {isVllm && llm?.e2eP95Seconds != null && tile("e2eP95", "E2E p95", `${llm.e2eP95Seconds.toFixed(2)}s`, { align: "right" })}
-            {isVllm && llm?.itlP95Seconds != null && tile("itlP95", "Inter-token p95", `${Math.round(llm.itlP95Seconds * 1000)} ms`)}
-            {isVllm &&
+            {showEngineTiles && llm?.e2eP95Seconds != null && tile("e2eP95", "E2E p95", `${llm.e2eP95Seconds.toFixed(2)}s`, { align: "right" })}
+            {showEngineTiles && llm?.itlP95Seconds != null && tile("itlP95", "Inter-token p95", `${Math.round(llm.itlP95Seconds * 1000)} ms`)}
+            {showEngineTiles &&
               llm?.mtpAcceptanceRate != null &&
               tile("mtpAccept", "MTP accept", llm.mtpAcceptanceRate.toFixed(2), { align: "right" })}
             <div className="sp-tile">
               <b>
                 {(llm?.slotsTotal ?? 0) > 0
-                  ? `${llm?.slotsActive ?? 0} / ${llm?.slotsTotal ?? 0}`
+                  ? `${llm?.slotsActive ?? "?"} / ${llm?.slotsTotal ?? 0}`
                   : (llm?.slotsActive ?? 0) > 0
                     ? `${llm?.slotsActive} running`
                     : "—"}
@@ -885,6 +948,7 @@ export function LlmPanel({
         sparkId={sparkId}
         llmPort={llmPort}
         modelId={remoteTarget ? null : llm?.modelId ?? null}
+        models={remoteTarget || (available && llm?.backend === "llama.cpp") ? undefined : llm?.models}
         remoteTarget={remoteTarget}
         shareImage={shareImage}
         sparkName={sparkName ?? null}

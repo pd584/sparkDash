@@ -5,6 +5,7 @@
  * Uses execFile + argv arrays (no shell interpolation of user/host/cmd).
  * Password auth uses sshpass -e (password via env), not -p on the command line.
  */
+import { powershellCommand } from "./windowsMetrics.js";
 import { execFile } from "child_process";
 import crypto from "crypto";
 import fs from "fs";
@@ -263,6 +264,22 @@ export function sshCommandSpec(spark, opts = {}) {
 }
 
 /**
+ * A Windows OpenSSH server runs commands through cmd.exe, which has no `true`,
+ * `cat` or `/proc`. Say so instead of leaving a cmd.exe error as the whole story.
+ * On a Windows unit, a refused key gets the administrator-account gotcha: sshd ignores
+ * ~/.ssh/authorized_keys for administrators.
+ */
+export function explainSshFailure(message, { windows = false } = {}) {
+  if (/is not recognized as an internal or external command/i.test(message)) {
+    return `${message} (this looks like a Windows host: set the Unit type to "Windows PC with an NVIDIA GPU" in the unit's settings.)`;
+  }
+  if (windows && /permission denied \(.*publickey/i.test(message)) {
+    return `${message} (if this Windows user is an administrator, sshd ignores ~/.ssh/authorized_keys and reads C:\\ProgramData\\ssh\\administrators_authorized_keys, which only Administrators and SYSTEM may write.)`;
+  }
+  return message;
+}
+
+/**
  * Execute a command on a remote Spark via SSH.
  *
  * @param {Object} spark - Spark config object
@@ -270,6 +287,11 @@ export function sshCommandSpec(spark, opts = {}) {
  * @param {{ timeoutMs?: number }} [options]
  * @returns {Promise<string>} - Trimmed stdout
  */
+/** The single remote argv for a command: PowerShell-encoded on Windows units, as written elsewhere. */
+export function remoteArgvFor(spark, cmd) {
+  return [spark?.platform === "windows" ? powershellCommand(cmd) : cmd];
+}
+
 export async function sshExec(spark, cmd, options = {}) {
   const timeoutMs =
     Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : 10000;
@@ -278,25 +300,35 @@ export async function sshExec(spark, cmd, options = {}) {
     throw new Error("SSH command must be a non-empty string");
   }
 
+  // Windows OpenSSH hands the command to cmd.exe or PowerShell, never bash.
+  const isWindows = spark?.platform === "windows";
   const { file, args, env, targetHost, multiplex, sshPort } = sshCommandSpec(spark, {
-    remoteArgv: [cmd],
+    remoteArgv: remoteArgvFor(spark, cmd),
   });
 
   const execute = (execArgs) =>
     new Promise((resolve, reject) => {
-      execFile(file, execArgs, { timeout: timeoutMs, env, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      const child = execFile(file, execArgs, { timeout: timeoutMs, env, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
         if (err) {
           const msg = stderr?.trim() || err.message;
-          reject(new Error(`SSH to ${targetHost}:${sshPort} failed: ${msg}`));
+          reject(new Error(`SSH to ${targetHost}:${sshPort} failed: ${explainSshFailure(msg, { windows: isWindows })}`));
         } else {
           resolve(String(stdout).trim());
         }
       });
+      // Windows PowerShell can wait for stdin to close; nothing is ever sent on it.
+      if (isWindows) child.stdin?.end();
+      // `options.input` travels on stdin only (never argv, never the environment), e.g. a
+      // sudo password for one action. Ignored for the multiplex readiness probe.
+      else if (typeof options.input === "string" && execArgs === args) {
+        child.stdin?.on("error", () => {});
+        child.stdin?.end(options.input);
+      }
     });
 
   if (multiplex) {
     const probeArgs = [...args];
-    probeArgs[probeArgs.length - 1] = "true";
+    probeArgs[probeArgs.length - 1] = isWindows ? powershellCommand("exit 0") : "true";
     await ensureMultiplexReady(multiplex, () => execute(probeArgs));
   }
   try {

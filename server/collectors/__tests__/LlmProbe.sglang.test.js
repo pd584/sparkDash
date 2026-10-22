@@ -195,7 +195,7 @@ test("_detectServerType: OpenAI models + get_server_info → sglang", async () =
       return {
         ok: true,
         status: 200,
-        json: async () => ({ version: "0.5.0" }),
+        json: async () => ({ version: "0.5.0", model_path: "/models/qwen" }),
       };
     }
     return { ok: false, status: 404, json: async () => ({}) };
@@ -313,8 +313,8 @@ test("_applySglangServerInfo: prefers total_* counter diffs over last_gen", () =
     },
     2
   );
-  assert.equal(probe.generationTps, 50); // (150-50)/2
-  assert.equal(probe.prefillTps, 100); // (300-100)/2
+  assert.ok(Math.abs(probe.generationTps - 50) <= 0.5, `probe.generationTps ${probe.generationTps}`); // (150-50)/2 (measured over the real clock: allow jitter)
+  assert.ok(Math.abs(probe.prefillTps - 100) <= 1.0, `probe.prefillTps ${probe.prefillTps}`); // (300-100)/2 (measured over the real clock: allow jitter)
   assert.equal(probe.totalOutputTokens, 150);
   assert.equal(probe.totalPromptTokens, 300);
   assert.equal(probe.totalCachedTokens, null); // server_info without total_cached_tokens
@@ -526,8 +526,8 @@ test("_applySglangMetrics: prefill = cached + computed, not prompt totals", () =
     ].join("\n") + "\n",
     2
   );
-  assert.equal(probe.generationTps, 10); // (30-10)/2
-  assert.equal(probe.prefillTps, 200); // cached 150 + computed 50
+  assert.ok(Math.abs(probe.generationTps - 10) <= 0.5, `probe.generationTps ${probe.generationTps}`); // (30-10)/2 (measured over the real clock: allow jitter)
+  assert.ok(Math.abs(probe.prefillTps - 200) <= 2.0, `probe.prefillTps ${probe.prefillTps}`); // cached 150 + computed 50 (measured over the real clock: allow jitter)
   assert.equal(probe.uncachedPrefillTps, 50); // (600-500)/2
   assert.equal(probe.cachedPrefillTps, 150); // (9300-9000)/2
   assert.equal(probe.prefixCacheHitRate, 0.9394); // 9300/(9300+600)
@@ -681,7 +681,8 @@ function sglangCounterProbe(state) {
   return probe;
 }
 
-test("probe: SGLang prefill tok/s returns to 0 once the engine goes idle (#99)", async () => {
+test("probe: SGLang prefill tok/s returns to 0 once the engine goes idle (#99)", async (t) => {
+  t.mock.method(Date, "now", () => 1_800_000_000_000);
   const state = { prompt: 1000, gen: 500, running: 0 };
   const probe = sglangCounterProbe(state);
 

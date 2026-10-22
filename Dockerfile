@@ -7,7 +7,10 @@
 # to IPv6; Sparks with no IPv6 route fail auth.docker.io with
 # "network is unreachable". ECR public is the same official image, IPv4-first.
 ARG NODE_IMAGE=public.ecr.aws/docker/library/node:22-bookworm-slim
-FROM ${NODE_IMAGE} AS builder
+# The builder runs on the build machine's own architecture: its output (the
+# frontend bundle and pure-JS node_modules) is the same for every target, and
+# the bundler's native binding (rolldown) crashes under QEMU emulation.
+FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS builder
 
 WORKDIR /app
 
@@ -50,6 +53,8 @@ WORKDIR /app
 
 # Copy built frontend, pruned deps, and server
 COPY --from=builder /app/dist ./dist
+# Second copy: compose bind-mounts ./dist over the one above, and an unbuilt host dir would hide it.
+COPY --from=builder /app/dist ./dist-baked
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./package.json
 COPY --from=builder /app/package-lock.json ./package-lock.json

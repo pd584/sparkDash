@@ -16,7 +16,9 @@ const POLL_MS = 60_000;
 
 const RANGE_OPTIONS: Array<{ value: LlmTokenRange; label: string }> = [
   { value: "all", label: "All time" },
-  { value: "today", label: "Today" },
+  { value: "today", label: "Last 24 hours" },
+  { value: "6h", label: "Last 6 hours" },
+  { value: "1h", label: "Last 1 hour" },
   { value: "7d", label: "Last 7 days" },
   { value: "14d", label: "Last 14 days" },
   { value: "30d", label: "Last month" },
@@ -94,6 +96,33 @@ export function FleetTokenTotals({ onOpenDetails }: { onOpenDetails?: () => void
   if (!series || series.length === 0) return null;
 
   const { rows, totalPrompt, totalCached, totalCompletion } = aggregateModelTotals(series);
+  // One row per machine-model combination (merged across ports on the same
+  // machine serving the same model). Workers serve no LLM endpoint, so they
+  // produce no series and appear nowhere.
+  const combinedRows = (() => {
+    const byKey = new Map<
+      string,
+      { sparkId: string; modelId: string; promptTokens: number; cachedTokens: number; completionTokens: number }
+    >();
+    for (const s of Array.isArray(series) ? series : []) {
+      for (const m of Array.isArray(s.models) ? s.models : []) {
+        const key = `${s.sparkId}\u0000${m.modelId}`;
+        const entry =
+          byKey.get(key) ??
+          { sparkId: s.sparkId, modelId: m.modelId, promptTokens: 0, cachedTokens: 0, completionTokens: 0 };
+        entry.promptTokens = addTokens(entry.promptTokens, m.promptTokens || 0);
+        entry.cachedTokens = addTokens(entry.cachedTokens, m.cachedTokens || 0);
+        entry.completionTokens = addTokens(entry.completionTokens, m.completionTokens || 0);
+        byKey.set(key, entry);
+      }
+    }
+    return [...byKey.values()]
+      .map((e) => ({ ...e, cachedTokens: Math.min(e.cachedTokens, e.promptTokens) }))
+      .sort(
+        (a, b) =>
+          a.sparkId.localeCompare(b.sparkId) || a.modelId.localeCompare(b.modelId)
+      );
+  })();
   // Count only endpoints with token data in the selected period, not all configured ones.
   const activeEndpoints = series.filter((s) => s.models.length > 0).length;
   if (rows.length === 0 && range === "all") return null;
@@ -150,7 +179,7 @@ export function FleetTokenTotals({ onOpenDetails }: { onOpenDetails?: () => void
       </div>
       <div className="ov-rows">
         <div className="ov-row ov-row--head">
-          <span className="ov-row__name eyebrow">Model</span>
+          <span className="ov-row__name eyebrow">Machine · Model</span>
           <span className="ov-row__num eyebrow">Cached</span>
           <span className="ov-row__num eyebrow">Prefill</span>
           <span className="ov-row__num eyebrow">Gen</span>
@@ -158,15 +187,15 @@ export function FleetTokenTotals({ onOpenDetails }: { onOpenDetails?: () => void
         {rows.length === 0 ? (
           <p className="ov-card__sub">No tokens recorded in this period.</p>
         ) : (
-          rows.map((row) => (
+          combinedRows.map((row) => (
             <div
-              key={row.modelId}
+              key={`${row.sparkId}\u0000${row.modelId}`}
               className="ov-row"
-              title={`${row.promptTokens.toLocaleString()} prompt · ${row.cachedTokens.toLocaleString()} cached · ${(row.promptTokens - row.cachedTokens).toLocaleString()} prefill · ${row.completionTokens.toLocaleString()} generated · ${row.sparkCount} Spark${row.sparkCount === 1 ? "" : "s"}`}
+              title={`${row.promptTokens.toLocaleString()} prompt \u00b7 ${row.cachedTokens.toLocaleString()} cached \u00b7 ${(row.promptTokens - row.cachedTokens).toLocaleString()} prefill \u00b7 ${row.completionTokens.toLocaleString()} generated`}
             >
               <span className="ov-row__name" title={row.modelId}>
-                {row.modelId}
-                {row.sparkCount > 1 && <span className="ov-row__x">{"\u00d7"}{row.sparkCount}</span>}
+                {row.sparkId}
+                <span className="text-muted">{" \u00b7 "}{row.modelId}</span>
               </span>
               <span className="ov-row__num mono">{row.cachedTokens > 0 ? formatTokensCompact(row.cachedTokens) : "\u2014"}</span>
               <span className="ov-row__num mono">{formatTokensCompact(row.promptTokens - row.cachedTokens)}</span>

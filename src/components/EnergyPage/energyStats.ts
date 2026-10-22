@@ -1,4 +1,5 @@
 import type { EnergyHistoryRow } from "../../api/types";
+import { tzOffsetMinutes } from "../../shared/timeZone";
 
 /**
  * Pure maths for the Fleet energy page: range selection, local-calendar grouping,
@@ -21,11 +22,23 @@ export const RANGE_DAYS: Record<EnergyRange, number> = { "24h": 1, "7d": 7, "14d
 /** Minutes east of UTC for the instant `ms` (e.g. +120 for CEST). */
 export type TzOffsetFn = (ms: number) => number;
 
-/** Offset of the viewer's browser time zone at `ms`. */
-export const browserTzOffset: TzOffsetFn = (ms) => -new Date(ms).getTimezoneOffset();
+/** Offset of the chart time zone at `ms`: the Settings time zone, else the viewer's browser's. */
+export const browserTzOffset: TzOffsetFn = (ms) => tzOffsetMinutes(ms);
 
 /** Fixed-offset helper, mostly for tests. */
 export const fixedTz = (minutes: number): TzOffsetFn => () => minutes;
+
+/** Node colours in stack order (largest consumer first). */
+export const NODE_COLORS = [
+  "var(--color-accent)",
+  "var(--color-info)",
+  "var(--color-violet)",
+  "var(--color-success)",
+  "var(--color-warning)",
+  "var(--color-danger)",
+  "var(--color-muted-strong)",
+  "var(--color-faint)",
+];
 
 /** Rows need at least this much coverage before an hour counts for "peak". */
 const MIN_PEAK_COVERAGE_MS = 10 * 60_000;

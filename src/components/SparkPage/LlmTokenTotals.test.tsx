@@ -58,4 +58,36 @@ describe("token totals wording", () => {
     await flush();
     expect(container.textContent).toContain("Counted by sparkDash since tracking began, whole fleet");
   });
+
+  it("lists one row per machine and model, merging ports of the same model on a machine", async () => {
+    const model = (modelId: string, completionTokens: number) => ({
+      modelId,
+      promptTokens: 1000,
+      completionTokens,
+      cachedTokens: 0,
+      lastSeenAt: 1,
+    });
+    const series = (sparkId: string, port: number, models: ReturnType<typeof model>[]) => ({
+      sparkId,
+      port,
+      updatedAt: 1,
+      lastModelId: models[0].modelId,
+      totals: { promptTokens: 1000, completionTokens: 0, cachedTokens: 0 },
+      models,
+    });
+    fetchTotals.mockResolvedValue({
+      range: "all",
+      series: [
+        series("gx13", 8888, [model("Qwen", 10)]),
+        series("gx12", 8888, [model("Qwen", 20)]),
+        series("gx12", 8889, [model("Qwen", 30), model("Llama", 5)]),
+      ],
+    });
+    const { container } = render(<FleetTokenTotals />);
+    await flush();
+    const names = [...container.querySelectorAll(".ov-row:not(.ov-row--head) .ov-row__name")].map((el) => el.textContent).filter((t) => t !== "Total");
+    expect(names).toEqual(["gx12 · Llama", "gx12 · Qwen", "gx13 · Qwen"]);
+    const gx12Qwen = container.querySelectorAll<HTMLElement>(".ov-row:not(.ov-row--head)")[1];
+    expect(gx12Qwen.title).toContain("50 generated");
+  });
 });

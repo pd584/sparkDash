@@ -21,6 +21,29 @@ const LINK_MIN_MBPS = 1000;
 
 const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
 
+/**
+ * The GPU thresholds below are tuned for NVIDIA cards. Other vendors (Intel Arc
+ * today) stay in the displayed panel and the power totals but are not judged
+ * here: their temperature, utilisation and power-cap behaviour differ, so the
+ * rules are fed from the NVIDIA devices only. A host with no per-device list
+ * (older snapshot shape) or only NVIDIA cards gets the aggregate unchanged.
+ * Returns null when the host has GPUs but none are NVIDIA.
+ */
+function nvidiaView(gpu) {
+  const devices = Array.isArray(gpu?.gpus) ? gpu.gpus : null;
+  if (!devices || devices.every((d) => (d?.vendor ?? "nvidia") === "nvidia")) return gpu;
+  const nv = devices.filter((d) => (d?.vendor ?? "nvidia") === "nvidia");
+  if (!nv.length) return gpu?.kernelErrors ? { kernelErrors: gpu.kernelErrors } : null;
+  const max = (key) => Math.max(...nv.map((d) => num(d[key]) ?? 0));
+  const draw = nv.reduce((sum, d) => sum + (num(d.power?.draw) ?? 0), 0);
+  return {
+    ...gpu,
+    temperature: max("temperature"),
+    usage: max("usage"),
+    power: { ...gpu.power, draw: Math.round(draw * 100) / 100 },
+  };
+}
+
 export class HealthEvaluator {
   constructor({ now = Date.now } = {}) {
     this._now = now;
@@ -41,7 +64,7 @@ export class HealthEvaluator {
     this.pendingEvents = [];
     const out = [];
     try {
-      const gpu = metrics?.gpu ?? null;
+      const gpu = nvidiaView(metrics?.gpu ?? null);
       const mem = metrics?.unifiedMemory ?? null;
       const net = metrics?.network ?? null;
       const llm = Array.isArray(metrics?.llm) ? metrics.llm : [];
@@ -51,6 +74,7 @@ export class HealthEvaluator {
       this._kernelErrors(gpu, out);
       this._concurrency(llm, mem, out);
       this._link(net, out);
+      this._roce(metrics?.roce ?? null, out);
     } catch {
       /* a rule bug must never break the poll loop */
     }
@@ -169,5 +193,38 @@ export class HealthEvaluator {
     });
   }
 }
+
+
+// RoCE rules (see collectors/roce.js). Kept out of the class body above for readability.
+const ROCE_LOSS_STREAK = 3;
+const ROCE_ETH_LOSS_STREAK = 2;
+
+HealthEvaluator.prototype._roce = function roce(roce, out) {
+  const devices = Array.isArray(roce?.devices) ? roce.devices : [];
+  // A port that was up and is not any more. Ports that never came up (uncabled) are not a finding.
+  const down = devices.filter((d) => d.everActive && !d.active);
+  if (down.length > 0) {
+    out.push({
+      id: "roce-link",
+      severity: "critical",
+      title: down.length === 1 ? "A RoCE link went down" : `${down.length} RoCE links went down`,
+      detail: down.map((d) => `${d.netdev ?? d.name}: ${d.state ?? "unknown"}${d.physState ? ` (${d.physState})` : ""}`).join(", ") + ".",
+      hint: "Check the cable, the transceiver and the switch port. Tensor-parallel and NCCL traffic over this port stalls or falls back to another path.",
+    });
+  }
+  // Loss counters that keep rising across several samples in a row.
+  const lossy = devices.filter(
+    (d) => d.active && ((num(d.loss?.streak) ?? 0) >= ROCE_LOSS_STREAK || (num(d.loss?.ethStreak) ?? 0) >= ROCE_ETH_LOSS_STREAK)
+  );
+  if (lossy.length > 0) {
+    out.push({
+      id: "roce-loss",
+      severity: "warn",
+      title: "RoCE is dropping packets",
+      detail: lossy.map((d) => `${d.netdev ?? d.name}: ${(d.loss.rising ?? []).join(", ") || "counters rising"}`).join("; ") + ".",
+      hint: "Rising out_of_buffer, sequence or ack-timeout errors point at congestion or a lossless-network (PFC/ECN) misconfiguration. Compare the PFC and trust settings on every Spark and on the switch.",
+    });
+  }
+};
 
 export default HealthEvaluator;

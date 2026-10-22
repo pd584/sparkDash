@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import type { ToolEvalLine, ToolEvalRun } from "../../../api/types";
 import { Tag } from "../../ui/Tag";
 import { GenericResult, GenericValue } from "./GenericResult";
@@ -5,11 +6,13 @@ import { explainErrorCode, fmtDate, fmtDuration, toolNotes } from "./format";
 import { useToolEvalResult } from "./hooks";
 import { hasScenarioData, isObj, normalizeToolResult } from "./normalize";
 import { CopyButton, Notice, RunTerminal, Skeleton } from "./parts";
+import { buildToolEvalShareCard } from "../../SparkPage/benchShareCard";
+import { ShowCardButton } from "./ShowCardButton";
 import { statusLabel, statusTone } from "./status";
 import { ToolResult } from "./ToolResult";
 
 /** Run facts: when, how long, what it ran against, the command and the (redacted) options. */
-export function RunMeta({ run }: { run: ToolEvalRun }) {
+export function RunMeta({ run, actions }: { run: ToolEvalRun; actions?: ReactNode }) {
   const dur = run.finishedAt ? (run.finishedAt - run.startedAt) / 1000 : null;
   const optionCount = Object.keys(run.options ?? {}).length;
   return (
@@ -20,6 +23,7 @@ export function RunMeta({ run }: { run: ToolEvalRun }) {
         {dur != null ? <span className="te-faint">took {fmtDuration(dur)}</span> : null}
         {run.model ? <Tag tone="neutral">{run.model}</Tag> : null}
         <span className="te-faint mono">{run.id}</span>
+        {actions ? <span className="te-runmeta__actions">{actions}</span> : null}
       </div>
       <div className="te-cmd">
         <div className="te-cmd__head">
@@ -44,6 +48,8 @@ export function RunMeta({ run }: { run: ToolEvalRun }) {
 
 interface ResultPanelProps {
   sparkId: string;
+  /** Display name of the unit, printed on the share card. */
+  sparkName?: string;
   type: string;
   run: ToolEvalRun;
   /** Output captured while this page followed the run (only available for runs started or watched in this visit). */
@@ -54,7 +60,7 @@ interface ResultPanelProps {
 }
 
 /** The result of one run: headline renderers for tool-call data, metric-first for everything else, and failure explanations. */
-export function ResultPanel({ sparkId, type, run, lines, errorCode, version }: ResultPanelProps) {
+export function ResultPanel({ sparkId, sparkName, type, run, lines, errorCode, version }: ResultPanelProps) {
   const wantsResult = run.status === "completed" || run.status === "stopped" || run.status === "failed";
   const state = useToolEvalResult(sparkId, wantsResult ? run.id : null, version);
   const tool = state.result ? normalizeToolResult(state.result) : null;
@@ -65,7 +71,17 @@ export function ResultPanel({ sparkId, type, run, lines, errorCode, version }: R
 
   return (
     <div className="te-result">
-      <RunMeta run={run} />
+      <RunMeta run={run} actions={
+          scenarios && tool && isToolType ? (
+            <ShowCardButton
+              kind="tool-eval"
+              build={() => buildToolEvalShareCard(tool, run, { sparkName })}
+              dialogLabel="Tool Eval share card"
+              imgAlt={`Tool Eval Bench result card${tool.score != null ? `: score ${tool.score.toFixed(1)}` : ""}`}
+              title="Render these results as an image you can copy or save"
+            />
+          ) : null
+        } />
       {failed ? (
         <Notice tone={run.status === "failed" ? "bad" : "warn"} title={run.status === "failed" ? `The run failed${run.exitCode != null ? ` (exit code ${run.exitCode})` : ""}` : run.status === "stopped" ? "The run was stopped" : "The run is gone"}>
           {errorCode

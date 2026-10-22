@@ -7,6 +7,7 @@
  * served subset of prompt, computed = prompt - cached. total = generated + prompt.
  */
 import { addTokens, formatTokensCompact } from "../../shared/tokenFormat";
+import { tzOffsetMinutes } from "../../shared/timeZone";
 import type { TokenHistory, TokenHistoryRow } from "../../api/types";
 import type { LlmTokenSeriesTotals } from "../../api/llmTokenTypes";
 
@@ -57,6 +58,12 @@ export interface Tally {
   computed: number;
   /** generated + prompt. */
   total: number;
+  /**
+   * true = at least one entry measured the prefix-cache split, false = none did
+   * (the engine publishes no cached-prompt counter), undefined = pre-flag data
+   * (assume reported, which is what earlier versions did).
+   */
+  cacheReported?: boolean;
 }
 
 export function emptyTally(): Tally {
@@ -64,7 +71,7 @@ export function emptyTally(): Tally {
 }
 
 /** Add one entry; cached is clamped to that entry's prompt so the invariant holds per row. */
-export function addEntry(t: Tally, e: Pick<Entry, "promptTokens" | "completionTokens" | "cachedTokens">): void {
+export function addEntry(t: Tally, e: Pick<Entry, "promptTokens" | "completionTokens" | "cachedTokens" | "cacheReported">): void {
   const prompt = nn(e.promptTokens);
   const cached = Math.min(nn(e.cachedTokens), prompt);
   t.generated = addTokens(t.generated, nn(e.completionTokens));
@@ -72,6 +79,9 @@ export function addEntry(t: Tally, e: Pick<Entry, "promptTokens" | "completionTo
   t.cached = addTokens(t.cached, cached);
   t.computed = t.prompt - t.cached;
   t.total = addTokens(t.generated, t.prompt);
+  // A single reporting entry is enough; "unreported" wins only when no entry reported.
+  if (e.cacheReported === true) t.cacheReported = true;
+  else if (e.cacheReported === false && t.cacheReported === undefined) t.cacheReported = false;
 }
 
 export function tallyOf(entries: readonly Entry[]): Tally {
@@ -83,6 +93,15 @@ export function tallyOf(entries: readonly Entry[]): Tally {
 /** cached / prompt, or null when there is no prompt data to divide by. */
 export function cacheRate(t: Pick<Tally, "cached" | "prompt">): number | null {
   return t.prompt > 0 ? Math.min(1, t.cached / t.prompt) : null;
+}
+
+/**
+ * Cache hit rate for display, or null when it cannot be measured: no prompt data, or
+ * the engine never reported a cached-prompt counter (`cacheReported === false`). A rate
+ * of 0 % must mean "the cache missed", never "this backend stays silent about it".
+ */
+export function hitRate(t: Tally): number | null {
+  return t.cacheReported === false ? null : cacheRate(t);
 }
 
 /** Fraction change (0.25 = +25 %); null when the baseline is zero. */
@@ -121,7 +140,7 @@ export function bucketKeys(unit: BucketUnit, count: number, nowMs: number): stri
 }
 
 function tzOffset(ms: number, offsetMin?: number): number {
-  return offsetMin ?? -new Date(ms).getTimezoneOffset();
+  return offsetMin ?? tzOffsetMinutes(ms);
 }
 
 /**
@@ -136,7 +155,7 @@ export function bucketLabel(key: string, unit: BucketUnit, offsetMin?: number): 
     return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`;
   }
   const d = new Date(ms + tzOffset(ms, offsetMin) * 60_000);
-  return `${String(d.getUTCHours()).padStart(2, "0")}:00`;
+  return `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")}`;
 }
 
 /** Tooltip heading: "Wed 7 Oct 2026 (UTC)" or "Wed 7 Oct, 14:00–15:00 (local)". */
@@ -149,8 +168,9 @@ export function bucketTitle(key: string, unit: BucketUnit, offsetMin?: number): 
   }
   const off = tzOffset(ms, offsetMin);
   const d = new Date(ms + off * 60_000);
-  const hh = (n: number) => `${String(n % 24).padStart(2, "0")}:00`;
-  return `${WEEKDAYS[d.getUTCDay()]} ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}, ${hh(d.getUTCHours())}–${hh(d.getUTCHours() + 1)} (local)`;
+  // Hour buckets are UTC hours, so a half-hour zone (India, Nepal...) starts them at :30 or :45.
+  const clock = (t: Date) => `${String(t.getUTCHours()).padStart(2, "0")}:${String(t.getUTCMinutes()).padStart(2, "0")}`;
+  return `${WEEKDAYS[d.getUTCDay()]} ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}, ${clock(d)}–${clock(new Date(d.getTime() + 3_600_000))} (local)`;
 }
 
 export interface RangeWindow {
@@ -227,6 +247,7 @@ export function entriesFromTotals(series: readonly LlmTokenSeriesTotals[]): Entr
         promptTokens: m.promptTokens,
         completionTokens: m.completionTokens,
         cachedTokens: m.cachedTokens,
+        cacheReported: m.cacheReported,
       });
     }
   }
@@ -272,7 +293,7 @@ export function summarize(tally: Tally, totals: readonly { key: string; total: n
   }
   return {
     ...tally,
-    cacheRate: cacheRate(tally),
+    cacheRate: hitRate(tally),
     genPerPrompt: tally.prompt > 0 ? tally.generated / tally.prompt : null,
     elapsed: n,
     avgPerBucket: tally.total / n,
@@ -292,8 +313,8 @@ export interface Comparison {
 /** Compare against the previous period; null when it had no traffic. */
 export function compare(cur: Tally, prev: Tally): Comparison | null {
   if (prev.total <= 0) return null;
-  const cr = cacheRate(cur);
-  const pr = cacheRate(prev);
+  const cr = hitRate(cur);
+  const pr = hitRate(prev);
   return {
     total: pctChange(cur.total, prev.total),
     generated: pctChange(cur.generated, prev.generated),
@@ -399,7 +420,7 @@ export function modelRows(entries: readonly Entry[], lastSeen?: ReadonlyMap<stri
     .map(([modelId, v]) => ({
       ...v.t,
       modelId,
-      cacheRate: cacheRate(v.t),
+      cacheRate: hitRate(v.t),
       share: grand > 0 ? v.t.total / grand : 0,
       sparkIds: [...v.sparks].sort(),
       lastSeen: lastSeen?.get(modelId) ?? null,
@@ -432,7 +453,7 @@ export function endpointRows(entries: readonly Entry[]): EndpointRow[] {
       ...v.t,
       sparkId: v.sparkId,
       port: v.port,
-      cacheRate: cacheRate(v.t),
+      cacheRate: hitRate(v.t),
       share: grand > 0 ? v.t.total / grand : 0,
       models: [...v.models].sort(),
     }))
@@ -498,10 +519,13 @@ export function buildInsights(i: InsightInput): string[] {
   }
 
   if (s.prompt > 0) {
-    if (s.cached > 0) {
-      out.push(`The prefix cache served ${fmtPct(s.cacheRate ?? 0)} of prompt tokens, so about ${compact(s.cached)} prefill tokens did not have to be recomputed.`);
+    const rate = hitRate(s);
+    if (rate == null) {
+      out.push("This engine does not publish a prefix-cache counter, so the cache hit rate cannot be measured — only the per-response split knows it.");
+    } else if (s.cached > 0) {
+      out.push(`The prefix cache served ${fmtPct(rate)} of prompt tokens, so about ${compact(s.cached)} prefill tokens did not have to be recomputed.`);
     } else {
-      out.push("No prompt tokens were served from the prefix cache. Either prefix caching is off or the engine does not report cache hits.");
+      out.push("No prompt tokens were served from the prefix cache: either prefix caching is off or no prompt reused an earlier one.");
     }
   }
 

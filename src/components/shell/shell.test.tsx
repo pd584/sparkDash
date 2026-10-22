@@ -1,6 +1,6 @@
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AppSidebar, RAIL_KEYBOARD_CODES } from "./AppSidebar";
+import { AppSidebar, RAIL_KEYBOARD_CODES, markRailDrop } from "./AppSidebar";
 import { MobileTabBar } from "./MobileTabBar";
 import { CommandPalette, filterCommands, fuzzyScore, type PaletteCommand } from "./CommandPalette";
 import { railSubLabel, showcaseTarget } from "./sparkSummary";
@@ -61,8 +61,50 @@ describe("AppSidebar", () => {
     expect(railSubLabel(sparks[1])).toBe("off");
   });
 
+  it("links the Temps page with a deep-linkable href", () => {
+    const { container } = render(
+      <AppSidebar sparks={[]} activeId={null} onSelect={() => {}} onAdd={() => {}} onOpenSettings={() => {}} onOpenSearch={() => {}} connected />
+    );
+    const link = container.querySelector<HTMLAnchorElement>('a[href="/temps"]')!;
+    expect(link.textContent).toContain("Temps");
+  });
+
   it("only offers the showcase when an online Spark has a reachable LLM", () => {
     expect(showcaseTarget([makeSpark("a", false)])).toBeNull();
+  });
+
+  it("uses Strata activity flags instead of displaying an unmeasured zero decode rate", () => {
+    const spark = makeSpark("strata");
+    Object.assign(spark.metrics.llm[0], { backend: "strata", generationTps: 0, prefillTps: 0, prefillActive: true, decodeActive: false });
+    const { container, root } = render(
+      <AppSidebar sparks={[spark]} activeId={null} onSelect={() => {}} onAdd={() => {}} onOpenSettings={() => {}} onOpenSearch={() => {}} connected />,
+    );
+    const label = () => container.querySelector(".rail-item__sub")?.textContent;
+
+    expect(label()).toBe("prefilling");
+    act(() => root.render(
+      <AppSidebar sparks={[{ ...spark, metrics: { ...spark.metrics, llm: [{ ...spark.metrics.llm[0], prefillActive: false, decodeActive: true }] } }]} activeId={null} onSelect={() => {}} onAdd={() => {}} onOpenSettings={() => {}} onOpenSearch={() => {}} connected />,
+    ));
+    expect(label()).toBe("decoding");
+    act(() => root.render(
+      <AppSidebar sparks={[{ ...spark, metrics: { ...spark.metrics, llm: [{ ...spark.metrics.llm[0], prefillActive: false, decodeActive: false }] } }]} activeId={null} onSelect={() => {}} onAdd={() => {}} onOpenSettings={() => {}} onOpenSearch={() => {}} connected />,
+    ));
+    expect(label()).toBe("0.0");
+  });
+
+  it("keeps rates in the sortable rail and prioritizes offline and worker labels", () => {
+    const strata = makeSpark("strata");
+    Object.assign(strata.metrics.llm[0], { backend: "strata", generationTps: 42.5, prefillTps: 0, decodeActive: true });
+    const offline = makeSpark("offline", false);
+    Object.assign(offline.metrics, { llm: [{ ...strata.metrics.llm[0], prefillActive: true, generationTps: 0 }] });
+    const worker = makeSpark("worker");
+    Object.assign(worker, { role: "worker", workerNode: true });
+    Object.assign(worker.metrics.llm[0], { backend: "strata", generationTps: 0, prefillActive: true });
+    const { container } = render(
+      <AppSidebar sparks={[strata, offline, worker]} activeId={null} onSelect={() => {}} onAdd={() => {}} onReorder={() => {}} onOpenSettings={() => {}} onOpenSearch={() => {}} connected />,
+    );
+    const labels = [...container.querySelectorAll(".rail-item__sub")].map((label) => label.textContent);
+    expect(labels).toEqual(["42.5", "off", "worker"]);
   });
 });
 
@@ -84,6 +126,50 @@ describe("keyboard access", () => {
       btn.dispatchEvent(ev);
     });
     expect(ev.defaultPrevented).toBe(false);
+  });
+});
+
+describe("rail drag", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+  it("the click that follows a drop does not open the Spark, a later click does", () => {
+    const onSelect = vi.fn();
+    const { container } = render(
+      <AppSidebar sparks={[makeSpark("a"), makeSpark("b")]} activeId={null} onSelect={onSelect} onAdd={() => {}} onReorder={() => {}} onOpenSettings={() => {}} onOpenSearch={() => {}} connected />
+    );
+    const link = container.querySelector<HTMLAnchorElement>('nav[aria-label="Sparks"] a')!;
+    act(() => markRailDrop());
+    act(() => link.click());
+    expect(onSelect).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(500));
+    act(() => link.click());
+    expect(onSelect).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("rail drag native click", () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+  it("cancels the link's default navigation even when the click is stopped at the document", () => {
+    const { container } = render(
+      <AppSidebar sparks={[makeSpark("a"), makeSpark("b")]} activeId={null} onSelect={() => {}} onAdd={() => {}} onReorder={() => {}} onOpenSettings={() => {}} onOpenSearch={() => {}} connected />
+    );
+    const link = container.querySelector<HTMLAnchorElement>('nav[aria-label="Sparks"] a')!;
+    // What dnd-kit does while a drag winds down.
+    const stop = (e: Event) => e.stopPropagation();
+    document.addEventListener("click", stop, true);
+    try {
+      act(() => markRailDrop());
+      const ev = new MouseEvent("click", { bubbles: true, cancelable: true });
+      link.dispatchEvent(ev);
+      expect(ev.defaultPrevented).toBe(true);
+      act(() => vi.advanceTimersByTime(500));
+      const later = new MouseEvent("click", { bubbles: true, cancelable: true });
+      link.dispatchEvent(later);
+      expect(later.defaultPrevented).toBe(false);
+    } finally {
+      document.removeEventListener("click", stop, true);
+    }
   });
 });
 
@@ -152,7 +238,7 @@ describe("MobileTabBar sheet", () => {
     expect(document.activeElement).toBe(opener);
   });
 
-  it("Stats opens Token totals, Fleet energy and Activity; Sparks no longer lists them; Showcase follows Prefill", () => {
+  it("Stats opens Token totals, Fleet energy, Temps and Activity; Sparks no longer lists them; Showcase follows Prefill", () => {
     const { container } = render(
       <MobileTabBar sparks={[makeSpark("a")]} activeId={null} onSelect={() => {}} onAdd={() => {}} onOpenSettings={() => {}} />
     );
@@ -160,7 +246,7 @@ describe("MobileTabBar sheet", () => {
     expect(tab("Search")).toBeUndefined();
     act(() => tab("Stats").click());
     let names = [...document.querySelectorAll(".sheet .rail-item__name")].map((n) => n.textContent);
-    expect(names).toEqual(["Token totals", "Fleet energy", "Activity"]);
+    expect(names).toEqual(["Token totals", "Cost compare", "Fleet energy", "Temps", "Activity"]);
     act(() => {
       document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     });

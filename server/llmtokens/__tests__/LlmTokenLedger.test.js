@@ -161,12 +161,22 @@ test("LlmTokenLedger: daily buckets credit deltas and serve ranged snapshots", (
   const all = ledger.snapshot("all", d2).series[0];
   assert.equal(all.models[0].completionTokens, 200);
 
-  // "today" (day of d2) only includes the d2 delta.
+  // "today" is a rolling last-24-hours window (hourly buckets), so the d1
+  // delta (23:00 UTC, 11 h before d2) is included.
   const today = ledger.snapshot("today", d2).series[0];
   assert.equal(today.models.length, 1);
-  assert.equal(today.models[0].completionTokens, 100);
-  assert.equal(today.models[0].promptTokens, 20);
+  assert.equal(today.models[0].completionTokens, 200);
+  assert.equal(today.models[0].promptTokens, 30);
   assert.equal(today.models[0].lastSeenAt, null);
+
+  // 6h window: d1 (11 h before d2) falls outside, only the d2 delta counts.
+  const six = ledger.snapshot("6h", d2).series[0];
+  assert.equal(six.models[0].completionTokens, 100);
+  assert.equal(six.models[0].promptTokens, 20);
+
+  // 1h window: same — only the d2 delta.
+  const one = ledger.snapshot("1h", d2).series[0];
+  assert.equal(one.models[0].completionTokens, 100);
 
   // 7d/14d/30d windows include both days.
   const seven = ledger.snapshot("7d", d2).series[0];
@@ -210,6 +220,75 @@ test("LlmTokenLedger: backends without the split keep cachedTokens at 0", () => 
   const s = ledger.snapshot().series[0];
   assert.equal(s.models[0].cachedTokens, 0);
   assert.equal(s.models[0].promptTokens, 1000);
+});
+
+test("LlmTokenLedger: an engine that never reports the split is flagged, not read as 0 % hits", () => {
+  const ledger = tmpLedger();
+  const t0 = Date.UTC(2026, 9, 28, 12, 0, 0);
+  ledger.record([obs("spark-a", 8888, "org/a", 100, 1000)], t0);
+  ledger.record([obs("spark-a", 8888, "org/a", 150, 2000)], t0 + 60_000);
+  const s = ledger.snapshot().series[0];
+  assert.equal(s.models[0].cachedTokens, 0);
+  assert.equal(s.models[0].cacheReported, false);
+  assert.equal(s.totals.cacheReported, false);
+  // Range buckets and the detailed history carry the same verdict.
+  assert.equal(ledger.snapshot("today", t0 + 120_000).series[0].models[0].cacheReported, false);
+  const row = ledger.history(t0 + 120_000).hour.at(-1);
+  assert.equal(row.cacheReported, false);
+});
+
+test("LlmTokenLedger: a reporting engine stays reported even when nothing hit", () => {
+  const ledger = tmpLedger();
+  const t0 = 1_730_000_000_000;
+  ledger.record([obs("spark-a", 8888, "org/a", 100, 1000, 0)], t0);
+  ledger.record([obs("spark-a", 8888, "org/a", 150, 2000, 0)], t0 + 60_000);
+  const s = ledger.snapshot().series[0];
+  assert.equal(s.models[0].cachedTokens, 0);
+  assert.equal(s.models[0].cacheReported, true); // a measured zero, i.e. real misses
+  assert.equal(s.totals.cacheReported, true);
+});
+
+test("LlmTokenLedger: the reported flag survives a restart", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llm-tokens-"));
+  const file = path.join(dir, "llm-token-totals.json");
+  const t0 = 1_730_000_000_000;
+  const first = new LlmTokenLedger(file);
+  first.record([obs("spark-a", 8888, "org/a", 100, 1000)], t0);
+  first.record([obs("spark-a", 8888, "org/a", 150, 2000)], t0 + 60_000);
+  first.close();
+  const second = new LlmTokenLedger(file);
+  assert.equal(second.snapshot().series[0].models[0].cacheReported, false);
+});
+
+test("LlmTokenLedger: legacy rows fall back to the endpoint's cached counter", () => {
+  // A file written before the flag existed carries no cacheReported anywhere.
+  const legacy = (counterCached, rowCached) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "llm-tokens-"));
+    const file = path.join(dir, "llm-token-totals.json");
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        series: {
+          "spark-a:8888": {
+            updatedAt: 1,
+            lastModelId: "org/a",
+            counters: { output: 100, prompt: 1000, cached: counterCached },
+            models: {
+              "org/a": { promptTokens: 1000, completionTokens: 100, cachedTokens: rowCached, lastSeenAt: 1 },
+            },
+          },
+        },
+      })
+    );
+    return new LlmTokenLedger(file).snapshot().series[0];
+  };
+  // Endpoint publishes the counter: a zero really is a cache miss.
+  assert.equal(legacy(0, 0).models[0].cacheReported, true);
+  // Endpoint never publishes it: the stored zero is not a measurement.
+  assert.equal(legacy(null, 0).models[0].cacheReported, false);
+  // Rows that did record cached tokens prove the backend reports the split.
+  assert.equal(legacy(null, 500).models[0].cacheReported, true);
 });
 
 test("LlmTokenLedger: daily buckets carry the cached split", () => {

@@ -10,6 +10,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDownIcon } from "../ui/icons";
+import { CardPreview } from "./CardPreview";
 import { shareCardFileName, type ShareCardModel } from "./benchShareCard";
 import { canCopyImages, copyCardImage, copyTextOnly, renderCardObjectUrl } from "./shareImage";
 
@@ -347,38 +348,19 @@ export function BenchCopyButton({
         )}
       {preview &&
         createPortal(
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="Benchmark share card"
-            className="card-preview"
-            onMouseDown={(e) => {
-              if (e.target === e.currentTarget) closePreview();
-            }}
-          >
-            <div className="card-preview__panel">
-              <div className="card-preview__head">
-                <h2>Share card</h2>
-                <button type="button" className="icon-circle" onClick={closePreview} aria-label="Close share card">
-                  ✕
-                </button>
-              </div>
-              {/* eslint-disable-next-line jsx-a11y/alt-text -- alt text is on the img below */}
-              <img src={preview} alt="Benchmark result card — right-click to copy it" className="card-preview__img" />
-              <p className="card-preview__hint">
+          <CardPreview
+            url={preview}
+            label="Benchmark share card"
+            imgAlt="Benchmark result card — right-click to copy it"
+            hint={
+              <>
                 Right-click → <strong>Copy Image</strong>, or drag the card into your post. Browsers only let a page copy
                 images over HTTPS or localhost, so the card is shown here for your browser to copy.
-              </p>
-              <div className="card-preview__actions">
-                <button type="button" className="btn" onClick={downloadPreview}>
-                  Download PNG
-                </button>
-                <button type="button" className="btn btn--primary" onClick={closePreview}>
-                  Close
-                </button>
-              </div>
-            </div>
-          </div>,
+              </>
+            }
+            onClose={closePreview}
+            onDownload={downloadPreview}
+          />,
           document.body
         )}
     </span>

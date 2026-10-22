@@ -1783,3 +1783,209 @@
 .set-token__state.is-set i {
   background: var(--color-success);
 }
+
+/* A row whose control sits under the text instead of beside it. */
+.set-row--stack {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.5rem;
+}
+.set-row--stack .set-row__control {
+  flex-direction: column;
+  align-items: flex-start;
+  flex-shrink: 1;
+  gap: 4px;
+}
+
+/* Settings → Time zone: input with suggestions, plus "Use browser". The message line is
+   always reserved, so showing it never moves the field. */
+.set-tz {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+}
+.set-tz .field-input {
+  width: min(16rem, 100%);
+  min-width: 0;
+}
+.set-tz .field-input[aria-invalid="true"] {
+  border-color: var(--color-danger);
+}
+.set-tz__msg {
+  display: block;
+  min-height: 1.4em;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: var(--color-danger);
+}
+
+/* GPU clock cap block in Edit unit */
+.gpu-clock {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
+}
+.gpu-clock__now {
+  margin: 0;
+  font-size: 12px;
+  color: var(--color-muted);
+}
+.gpu-clock__now b {
+  color: var(--color-text);
+}
+.gpu-clock__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.gpu-clock__row input[type="number"] {
+  width: 120px;
+}
+.gpu-clock__unit {
+  font-size: 12px;
+  color: var(--color-muted);
+}
+.gpu-clock__check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.gpu-clock__manual summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--color-muted);
+}
+.gpu-clock__command {
+  width: 100%;
+  font-family: var(--font-mono, "Geist Mono", ui-monospace, monospace);
+  font-size: 11px;
+  line-height: 1.4;
+  resize: vertical;
+}
+
+/* Settings → Tab badge / Desktop notifications: why a switch is unavailable. */
+.set-row__note {
+  display: block;
+  margin-top: 0.25rem;
+  color: var(--color-warning);
+}
+
+/* Settings → Alert notifications dialog */
+.alerts-fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.alerts-fieldset:disabled {
+  opacity: 0.55;
+}
+.alerts-off-note {
+  margin: 0.25rem 0 0.5rem;
+}
+.alerts-section {
+  margin-top: 1.1rem;
+}
+.alerts-section__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.alerts-section__title {
+  margin: 0;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-muted-strong);
+}
+.alerts-section__help {
+  margin: 0.3rem 0 0.4rem;
+  font-size: 0.7rem;
+  line-height: 1.45;
+  color: var(--color-muted);
+}
+.alerts-wait {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-right: 0.75rem;
+  font-size: 0.7rem;
+  color: var(--color-muted);
+}
+.modal-sheet .alerts-wait input[type="number"] {
+  width: 4.75rem;
+  min-height: 2rem;
+  padding: 0.3rem 0.5rem;
+  text-align: right;
+}
+.alerts-channel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+  padding: 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+}
+.alerts-channel__row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.modal-sheet .alerts-channel__row > select {
+  width: auto;
+  flex: 0 0 auto;
+}
+.modal-sheet .alerts-channel__row > .alerts-channel__name {
+  flex: 1 1 8rem;
+  width: auto;
+  min-width: 0;
+}
+.alerts-channel__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.alerts-list {
+  margin: 0.35rem 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 14rem;
+  overflow-y: auto;
+}
+.alerts-list > li {
+  padding: 0.4rem 0 0.4rem 0.6rem;
+  border-left: 2px solid var(--color-border-strong);
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: var(--color-text);
+}
+.alerts-list > li + li {
+  margin-top: 0.25rem;
+}
+.alerts-list > li small {
+  display: block;
+  color: var(--color-muted);
+  overflow-wrap: anywhere;
+}
+.alerts-list > li.is-critical {
+  border-left-color: var(--color-danger);
+}
+.alerts-list > li.is-warning {
+  border-left-color: var(--color-warning);
+}
+.alerts-list > li.is-ok {
+  border-left-color: var(--color-success);
+}
+.alerts-error {
+  margin: 0 1.35rem 0.75rem;
+}

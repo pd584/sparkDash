@@ -1,0 +1,307 @@
+import { test } from "node:test";
+import { strict as assert } from "node:assert";
+import { SystemCollector, collectionWasSuccessful } from "../SystemCollector.js";
+import {
+  WINDOWS_GPU_SCRIPT,
+  WINDOWS_SYSTEM_SCRIPT,
+  parseWindowsSystem,
+  powershellCommand,
+  windowsGpuAsLinuxOutput,
+} from "../windowsMetrics.js";
+import { SparkRegistry } from "../../sparks/SparkRegistry.js";
+
+const GPU_OUT = [
+  "62, 35, 120.50, 320.00, 2100, 2640, Not Active, Not Active, Not Active, Not Active, 0, NVIDIA GeForce RTX 4090, GPU-abc",
+  "---",
+  "2048, 24564",
+  "---",
+  "1234, C:\\Windows\\explorer.exe, [N/A], GPU-abc",
+  "---",
+  "NVIDIA GeForce RTX 4090, 560.94",
+].join("\r\n");
+
+const SYSTEM_OUT = [
+  "33449080\t18874368\t93784",
+  "---",
+  "17\tAMD Ryzen 9 7950X 16-Core Processor\t32",
+  "---",
+  "C:\tWindows\t1000000000000\t400000000000",
+  "D:\t\t2000000000000\t1500000000000",
+  "---",
+  "Ethernet",
+  "---",
+  "Ethernet\tUp\t1000000000\t5000000\t3000000\t192.168.1.122\tFalse",
+  "Wi-Fi\tDisconnected\t0\t0\t0\t\tFalse",
+  "vEthernet (WSL)\tUp\t10000000000\t9\t9\t172.20.0.1\tTrue",
+].join("\r\n");
+
+function windowsCollector() {
+  const collector = new SystemCollector({ id: "desktop", platform: "windows", kind: "host", isLocal: false, ssh: { host: "192.168.1.122", user: "me" } });
+  collector._windowsRun = async (key) => (key === "gpu" ? GPU_OUT : SYSTEM_OUT);
+  return collector;
+}
+
+test("commands are sent as an encoded PowerShell command that fits cmd.exe's line limit", () => {
+  for (const script of [WINDOWS_GPU_SCRIPT, WINDOWS_SYSTEM_SCRIPT]) {
+    const cmd = powershellCommand(script);
+    assert.ok(cmd.length < 8000, `${cmd.length} chars`);
+    assert.match(cmd, /^powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand [A-Za-z0-9+/=]+$/);
+    const encoded = cmd.split(" ").pop();
+    assert.equal(Buffer.from(encoded, "base64").toString("utf16le"), script);
+  }
+});
+
+test("parseWindowsSystem reads memory, load, disks and adapters", () => {
+  const s = parseWindowsSystem(SYSTEM_OUT);
+  assert.equal(s.totalMB, 32665);
+  assert.equal(s.availableMB, 18432);
+  assert.equal(s.uptimeSec, 93784);
+  assert.equal(s.cpuLoad, 17);
+  assert.equal(s.cpuName, "AMD Ryzen 9 7950X 16-Core Processor");
+  assert.equal(s.logicalCpus, 32);
+  assert.equal(s.disks.length, 2);
+  assert.equal(s.defaultInterface, "Ethernet");
+  assert.equal(s.adapters.length, 3);
+  assert.equal(s.adapters[2].virtual, true);
+});
+
+test("parseWindowsSystem tolerates empty and partial output", () => {
+  const s = parseWindowsSystem("");
+  assert.equal(s.totalMB, 0);
+  assert.equal(s.cpuLoad, null);
+  assert.deepEqual(s.disks, []);
+  assert.deepEqual(s.adapters, []);
+});
+
+test("a pipe or --- in a volume label or adapter name does not break parsing", () => {
+  const out = [
+    "1024\t512\t60",
+    "---",
+    "10\tCPU | Name\t8",
+    "---",
+    "E:\tA|B\t1000\t500",
+    "F:\t---\t2000\t1000",
+    "---",
+    "Eth|X",
+    "---",
+    "Eth|X\tUp\t1000000000\t10\t20\t10.0.0.2\tFalse",
+  ].join("\r\n");
+  const s = parseWindowsSystem(out);
+  assert.deepEqual(s.disks.map((d) => [d.id, d.label]), [["E:", "A|B"], ["F:", "---"]]);
+  assert.equal(s.adapters[0].name, "Eth|X");
+  assert.equal(s.adapters[0].ip, "10.0.0.2");
+  assert.equal(s.cpuName, "CPU | Name");
+});
+
+test("both scripts end with exit 0 so a failed native command is not read as a dead host", () => {
+  assert.match(WINDOWS_GPU_SCRIPT, /\nexit 0$/);
+  assert.match(WINDOWS_SYSTEM_SCRIPT, /\nexit 0$/);
+});
+
+test("GPU output is reshaped into the sections the shared Linux parser reads", () => {
+  const out = windowsGpuAsLinuxOutput(GPU_OUT);
+  assert.equal(out.split("---").length, 4);
+});
+
+test("collectGpu on a Windows unit parses nvidia-smi and skips the Linux kernel-journal reads", async () => {
+  const gpu = await windowsCollector().collectGpu();
+  assert.equal(gpu.temperature, 62);
+  assert.equal(gpu.usage, 35);
+  assert.equal(gpu.power.draw, 120.5);
+  assert.equal(gpu.vram.total, 24564);
+  assert.equal(gpu.vram.used, 2048);
+  assert.equal(gpu.vram.available, 24564 - 2048);
+  assert.equal(gpu.kernelErrors, null);
+  assert.equal(gpu.nvErrNoMemory, 0);
+  assert.equal(gpu.gpus.length, 1);
+  assert.deepEqual(gpu.processes, []); // the only process reports "[N/A]" memory under WDDM
+});
+
+test("CPU, RAM, storage, network and memory on a Windows unit", async () => {
+  const c = windowsCollector();
+  const cpu = await c.collectCpu();
+  assert.equal(cpu.usage, 17);
+  assert.ok(cpu.draw > 0 && cpu.tdp > 0);
+
+  const ram = await c.collectRam();
+  assert.equal(ram.total, 32665);
+  assert.equal(ram.used, 32665 - 18432);
+
+  const disks = await c.collectStorage();
+  assert.deepEqual(disks.map((d) => d.device), ["C:", "D:"]);
+  assert.equal(disks[0].total, 953674);
+  assert.equal(disks[0].percentage, 60);
+
+  const net = await c.collectNetwork();
+  assert.equal(net.primaryInterface, "Ethernet");
+  assert.equal(net.linkSpeedMbps, 1000);
+  assert.deepEqual(net.interfaces.map((i) => i.name), ["Ethernet", "Wi-Fi"]); // virtual adapter dropped
+  assert.equal(net.interfaces[1].operstate, "down");
+
+  const mem = await c.collectUnifiedMemory();
+  assert.equal(mem.total, 32665);
+  assert.equal(mem.gpuUsed, 2048);
+  // Used RAM is 14233 MB: 2048 of it counted as GPU, the rest CPU; never above the total.
+  assert.equal(mem.cpuUsed, 32665 - 18432 - 2048);
+  assert.equal(mem.used, 32665 - 18432);
+  assert.ok(mem.percentage <= 100);
+
+  assert.equal(await c.readWindowsUptime(), 93784);
+});
+
+test("network speeds come from the byte-counter delta between polls", async () => {
+  const c = windowsCollector();
+  await c.collectNetwork();
+  const before = c.lastNetworkStats.get("Ethernet");
+  c.lastNetworkStats.set("Ethernet", { ...before, time: before.time - 2000 });
+  c._windowsRun = async (key) =>
+    key === "gpu" ? GPU_OUT : SYSTEM_OUT.replace("Ethernet\tUp\t1000000000\t5000000\t3000000", "Ethernet\tUp\t1000000000\t5002000\t3001000");
+  const net = await c.collectNetwork();
+  const eth = net.interfaces.find((i) => i.name === "Ethernet");
+  // The test baseline is 2 s in the past, measured against the real clock: allow scheduling jitter.
+  assert.ok(Math.abs(eth.rxSpeed - 1000) <= 10, `rx ${eth.rxSpeed}`);
+  assert.ok(Math.abs(eth.txSpeed - 500) <= 5, `tx ${eth.txSpeed}`);
+});
+
+test("a failing PowerShell call degrades to defaults instead of throwing", async () => {
+  const c = windowsCollector();
+  c._windowsRun = async () => {
+    throw new Error("SSH to 192.168.1.122:22 failed: timed out");
+  };
+  assert.equal((await c.collectRam()).total, 0);
+  assert.deepEqual(await c.collectStorage(), []);
+  assert.equal((await c.collectCpu()).usage, 0);
+});
+
+test("the registry keeps platform windows, forces a host unit and drops bash-only probes", () => {
+  const registry = Object.create(SparkRegistry.prototype);
+  const spark = registry._normalizeConfig({
+    id: "desktop",
+    name: "Desktop",
+    platform: "windows",
+    kind: "spark",
+    lanIp: "192.168.1.122",
+    hermesMonitoring: true,
+    tailscaleMonitoring: true,
+  });
+  assert.equal(spark.platform, "windows");
+  assert.equal(spark.kind, "host");
+  assert.equal(spark.hermesMonitoring, false);
+  assert.equal(spark.tailscaleMonitoring, false);
+  assert.equal(registry._normalizeConfig({ id: "x", lanIp: "10.0.0.1" }).platform, "linux");
+});
+
+test("without nvidia-smi output the GPU collection is not successful (what the connection test checks)", async () => {
+  const c = windowsCollector();
+  assert.equal(collectionWasSuccessful(await c.collectGpu()), true);
+  c._windowsRun = async () => "";
+  assert.equal(collectionWasSuccessful(await c.collectGpu()), false);
+});
+
+test("an unfinished PowerShell call is reused however old, a finished one only for ~1.2 s", () => {
+  const c = new SystemCollector({ id: "w", platform: "windows", kind: "host", isLocal: false, ssh: { host: "10.0.0.5", user: "me" } });
+  const pending = Promise.resolve("pending");
+  c._windowsCache = new Map([["system", { at: Date.now() - 60_000, settled: false, promise: pending }]]);
+  assert.equal(c._windowsRun("system", "x"), pending);
+  const done = Promise.resolve("done");
+  c._windowsCache = new Map([["system", { at: Date.now() - 100, settled: true, promise: done }]]);
+  assert.equal(c._windowsRun("system", "x"), done);
+});
+
+test("AMD-iGPU output (no nvidia-smi) parses through the same Linux-shaped sections", async () => {
+  const amdOut = [
+    "0,100,,0,0,0,,,,,0,AMD Radeon(TM) 8060S Graphics",
+    "---",
+    "73148,98304",
+    "---",
+    "---",
+    "AMD Radeon(TM) 8060S Graphics,32.0.31041.3013",
+    "---",
+    "MemTotal: 32538408 kB",
+    "MemAvailable: 7636648 kB",
+  ].join("\r\n");
+  const collector = new SystemCollector({ id: "desktop", platform: "windows", kind: "host", isLocal: false, ssh: { host: "100.10.10.10", user: "tester" } });
+  collector._windowsRun = async (key) => (key === "gpu" ? amdOut : "");
+  const gpu = await collector.collectGpu();
+  assert.equal(gpu.usage, 100);
+  assert.equal(gpu.temperature, 0); // AMD publishes no GPU temperature to Windows
+  assert.equal(gpu.power.draw, 0);
+  assert.equal(gpu.vram.used, 73148);
+  assert.equal(gpu.vram.total, 98304); // from the driver's reported memory size
+  assert.equal(gpu.vram.available, 98304 - 73148);
+  assert.equal(gpu.gpus.length, 1);
+  assert.equal(gpu.gpus[0].vendor, "amd");
+  assert.equal(gpu.gpus[0].metricAvailability.usage, true);
+  assert.equal(gpu.gpus[0].metricAvailability.temperature, false);
+  assert.equal(gpu.gpus[0].metricAvailability.powerDraw, false);
+  assert.equal(gpu.metricAvailability.temperature, false);
+  assert.deepEqual(gpu.processes, []);
+});
+
+test("Windows AMD adapter uses OS memory as a shared-memory ceiling when driver capacity is missing", async () => {
+  const amdOut = [
+    "0,37,,0,0,0,,,,,0,AMD Radeon Graphics",
+    "---",
+    "4096,0",
+    "---",
+    "",
+    "---",
+    "AMD Radeon Graphics,driver",
+    "---",
+    "MemTotal: 67108864 kB",
+    "MemAvailable: 33554432 kB",
+  ].join("\n");
+  const collector = new SystemCollector({ id: "windows-shared-gpu", platform: "windows", kind: "host", isLocal: false });
+  collector._windowsRun = async () => amdOut;
+  const gpu = await collector.collectGpu();
+  assert.equal(gpu.gpus[0].vendor, "amd");
+  assert.equal(gpu.vram.used, 4096);
+  assert.equal(gpu.vram.total, 65536);
+  assert.equal(gpu.vram.available, 61440);
+  assert.equal(gpu.gpus[0].vram.total, 65536);
+  assert.equal(gpu.metricAvailability.vramTotal, true);
+  assert.equal(gpu.metricAvailability.powerDraw, false);
+});
+
+test("WINDOWS_GPU_SCRIPT carries the AMD fallback and clamps engine utilization", () => {
+  assert.match(WINDOWS_GPU_SCRIPT, /GPUPerformanceCounters_GPUEngine/);
+  assert.match(WINDOWS_GPU_SCRIPT, /GPUAdapterMemory/);
+  assert.match(WINDOWS_GPU_SCRIPT, /\ -gt 100/);
+  assert.match(WINDOWS_GPU_SCRIPT, /qwMemorySize/);
+});
+
+test("the AMD fallback runs only when nvidia-smi is not installed, never when it is installed but failing", () => {
+  // A PC with a broken NVIDIA driver must stay empty (and fail the connection test) rather than
+  // show a GPU invented from the performance counters.
+  assert.match(WINDOWS_GPU_SCRIPT, /if\(-not \$s\)\{\n  \$eng = /);
+  assert.doesNotMatch(WINDOWS_GPU_SCRIPT, /if\(-not \$gpu\)/);
+  // The NVSMI default path only counts when the file exists.
+  assert.match(WINDOWS_GPU_SCRIPT, /Test-Path \$p/);
+});
+
+test("Windows drives report read/write speed from cumulative counters and the counter's own clock", async () => {
+  const stamp = (ms) => String(ms * 10_000);
+  const run = (ioRows) =>
+    [SYSTEM_OUT, "---", ioRows.join("\r\n")].join("\r\n");
+  const c = windowsCollector();
+  // 5 s apart: C: read 10 MiB and wrote 20 MiB; D: idle.
+  c._windowsRun = async () => run(["C:\t1000\t2000\t" + stamp(100_000), "D:\t0\t0\t" + stamp(100_000)]);
+  const first = await c.collectStorage();
+  assert.deepEqual(first.map((d) => [d.device, d.readSpeed, d.writeSpeed]), [["C:", 0, 0], ["D:", 0, 0]]);
+  c._windowsRun = async () =>
+    run(["C:\t" + (1000 + 10 * 1048576) + "\t" + (2000 + 20 * 1048576) + "\t" + stamp(105_000)]);
+  const second = await c.collectStorage();
+  const cdrive = second.find((d) => d.device === "C:");
+  assert.equal(cdrive.readSpeed, 2 * 1048576);
+  assert.equal(cdrive.writeSpeed, 4 * 1048576);
+  // A drive with no counter row (D: here) stays at 0 rather than failing.
+  assert.equal(second.find((d) => d.device === "D:").readSpeed, 0);
+  // The same cached output read again does not turn into a 0 speed for C:.
+  const again = await c.collectStorage();
+  assert.equal(again.find((d) => d.device === "C:").readSpeed, 2 * 1048576);
+});
+
+test("the Windows system script reads per-drive disk counters and still fits the command-line limit", () => {
+  assert.match(WINDOWS_SYSTEM_SCRIPT, /Win32_PerfRawData_PerfDisk_LogicalDisk/);
+  assert.ok(powershellCommand(WINDOWS_SYSTEM_SCRIPT).length < 8000);
+});

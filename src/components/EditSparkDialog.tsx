@@ -9,10 +9,13 @@ import {
   updateSpark,
 } from "../api/client";
 import type { SparkConfig, SparkRole, SparkTestResponse } from "../api/types";
+import { deviceKindNoun, editDeviceTitle, UNIT_TYPE_OPTIONS, unitTypeOf, unitTypePatch, type UnitType } from "../shared/deviceKind";
 import { resolveSparkRole } from "../api/sparkRole";
 import { useModalPresence } from "../hooks/useModalPresence";
+import { useOverlayClose } from "../hooks/useOverlayClose";
 import { InfoIcon } from "./ui/icons";
 import { TestResultList } from "./TestResultList";
+import { GpuClockSection } from "./GpuClockSection";
 import { XIcon } from "./ui/icons";
 import "../styles/dialogs.css";
 
@@ -60,6 +63,7 @@ export function EditSparkDialog({
   useEscape(onClose);
 
   const { mounted, visible } = useModalPresence(open);
+  const overlayClose = useOverlayClose(onClose);
 
   // Prevent background scroll while the tall form is open (iOS)
   useEffect(() => {
@@ -189,6 +193,7 @@ export function EditSparkDialog({
         config.ssh?.auth !== savedConfig.ssh?.auth ||
         (config.ssh?.port ?? 22) !== (savedConfig.ssh?.port ?? 22) ||
         (config.kind ?? "spark") !== (savedConfig.kind ?? "spark") ||
+        (config.platform ?? "linux") !== (savedConfig.platform ?? "linux") ||
         config.role !== savedConfig.role ||
         Boolean(config.llmMonitoring) !== Boolean(savedConfig.llmMonitoring) ||
         Boolean(config.comfyMonitoring) !== Boolean(savedConfig.comfyMonitoring) ||
@@ -234,6 +239,7 @@ export function EditSparkDialog({
       const patch: Partial<SparkConfig> = {
         name: config.name,
         kind: config.kind ?? "spark",
+        platform: config.platform ?? "linux",
         lanIp: config.lanIp,
         cx7Ip: config.cx7Ip,
         macAddress: config.macAddress || null,
@@ -274,7 +280,7 @@ export function EditSparkDialog({
 
   const handleDelete = async () => {
     if (!config) return;
-    if (!confirm(`Remove Spark "${config.name}"? This cannot be undone.`)) return;
+    if (!confirm(`Remove ${deviceKindNoun(config.kind)} "${config.name}"? This cannot be undone.`)) return;
     setSaving(true);
     setError(null);
     try {
@@ -291,9 +297,7 @@ export function EditSparkDialog({
   return createPortal(
     <div
       className={`modal-overlay${visible ? " is-open" : ""}`}
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
+      {...overlayClose}
     >
       <div
         className="modal-sheet"
@@ -303,7 +307,7 @@ export function EditSparkDialog({
       >
         <div className="modal-sheet__header">
           <h2 className="modal-sheet__title" id="edit-spark-title">
-            Edit Spark
+            {editDeviceTitle(config?.kind)}
           </h2>
           <button type="button" className="modal-sheet__close" onClick={onClose} aria-label="Close">
             <XIcon className="h-4 w-4" />
@@ -318,11 +322,12 @@ export function EditSparkDialog({
               <div>
                 <label className="field-label">Unit type</label>
                 <select
-                  value={config.kind ?? "spark"}
-                  onChange={(e) => update({ kind: e.target.value as "spark" | "host" })}
+                  value={unitTypeOf(config)}
+                  onChange={(e) => update(unitTypePatch(e.target.value as UnitType, config))}
                 >
-                  <option value="spark">NVIDIA DGX Spark</option>
-                  <option value="host">Dedicated GPU host (Linux, nvidia-smi, not a Spark)</option>
+                  {UNIT_TYPE_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
                 </select>
               </div>
 
@@ -392,15 +397,16 @@ export function EditSparkDialog({
               </div>
               )}
 
-              <label className="check-row">
-                <input
-                  type="checkbox"
-                  checked={config.isLocal}
-                  onChange={(e) => update({ isLocal: e.target.checked })}
-                  
-                />
-                This host (local collectors — no SSH for metrics)
-              </label>
+              {config.platform !== "windows" && (
+                <label className="check-row">
+                  <input
+                    type="checkbox"
+                    checked={config.isLocal}
+                    onChange={(e) => update({ isLocal: e.target.checked })}
+                  />
+                  This host (local collectors — no SSH for metrics)
+                </label>
+              )}
 
               <div>
                 <label className="field-label field-label--row">
@@ -499,47 +505,51 @@ export function EditSparkDialog({
                 </div>
               </div>
 
-              <label className="check-row">
-                <input
-                  type="checkbox"
-                  checked={Boolean(config.hermesMonitoring)}
-                  onChange={(e) => update({ hermesMonitoring: e.target.checked })}
-                  
-                />
-                <span>Hermes Agent</span>
-                <span
-                  className="inline-flex shrink-0 cursor-help text-muted hover:text-text"
-                  title='Hermes Agent CLI is installed on this machine (nousresearch/hermes-agent). When enabled, sparkDash checks for updates (hermes update --check) and can run “hermes update” for you via SSH with one click.'
-                  aria-label='Hermes Agent CLI is installed on this machine; enable update monitoring and one-click updates.'
-                >
-                  <InfoIcon className="h-3.5 w-3.5" />
-                </span>
-              </label>
-              <p className="field-hint">
-                Checks for updates in the background (10 min) and adds an "Update Hermes" button
-                that runs{" "}
-                <code className="rounded bg-surface-elevated px-1">hermes update</code> on this
-                machine via SSH.
-              </p>
-
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
-                <label className="flex min-w-0 items-center gap-2">
+              {config.platform !== "windows" && (
+                <>
+                <label className="check-row">
                   <input
                     type="checkbox"
-                    checked={Boolean(config.tailscaleMonitoring)}
-                    onChange={(e) => update({ tailscaleMonitoring: e.target.checked })}
-                    
+                    checked={Boolean(config.hermesMonitoring)}
+                    onChange={(e) => update({ hermesMonitoring: e.target.checked })}
+                  
                   />
-                  <span>Tailnet monitoring</span>
+                  <span>Hermes Agent</span>
                   <span
                     className="inline-flex shrink-0 cursor-help text-muted hover:text-text"
-                    title="When enabled, run `tailscale status --json` on this host and show a Tailnet card. Catches a unit that is healthy on the LAN but has fallen off its tailnet. Requires the tailscale CLI. Default off."
-                    aria-label="Enable reporting this unit's tailnet presence."
+                    title='Hermes Agent CLI is installed on this machine (nousresearch/hermes-agent). When enabled, sparkDash checks for updates (hermes update --check) and can run “hermes update” for you via SSH with one click.'
+                    aria-label='Hermes Agent CLI is installed on this machine; enable update monitoring and one-click updates.'
                   >
                     <InfoIcon className="h-3.5 w-3.5" />
                   </span>
                 </label>
-              </div>
+                <p className="field-hint">
+                  Checks for updates in the background (10 min) and adds an "Update Hermes" button
+                  that runs{" "}
+                  <code className="rounded bg-surface-elevated px-1">hermes update</code> on this
+                  machine via SSH.
+                </p>
+
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted">
+                  <label className="flex min-w-0 items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={Boolean(config.tailscaleMonitoring)}
+                      onChange={(e) => update({ tailscaleMonitoring: e.target.checked })}
+                    
+                    />
+                    <span>Tailnet monitoring</span>
+                    <span
+                      className="inline-flex shrink-0 cursor-help text-muted hover:text-text"
+                      title="When enabled, run `tailscale status --json` on this host and show a Tailnet card. Catches a unit that is healthy on the LAN but has fallen off its tailnet. Requires the tailscale CLI. Default off."
+                      aria-label="Enable reporting this unit's tailnet presence."
+                    >
+                      <InfoIcon className="h-3.5 w-3.5" />
+                    </span>
+                  </label>
+                </div>
+                </>
+              )}
 
               {role === "worker" && (
                 <div className="space-y-3">
@@ -672,6 +682,10 @@ export function EditSparkDialog({
                     </div>
                   )}
                 </>
+              )}
+
+              {sparkId && config.kind !== "host" && config.platform !== "windows" && config.platform !== "darwin" && (
+                <GpuClockSection sparkId={sparkId} />
               )}
             </div>
           )}

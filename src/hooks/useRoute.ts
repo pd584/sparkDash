@@ -49,7 +49,7 @@ export interface RouteActions {
  *
  * URL scheme:
  *   /                      → Overview
- *   /tokens /energy /activity → dedicated fleet pages
+ *   /tokens /energy /activity /security → dedicated pages
  *   /spark/:id             → Spark detail page
  *   /bench/:type           → benchmark page
  *   /showcase/:id          → full-screen showcase (handled separately via useAppRoute)

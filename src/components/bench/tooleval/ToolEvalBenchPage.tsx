@@ -267,7 +267,7 @@ function ToolEvalBench({ type, spark }: { type: string; spark: SparkSnapshot }) 
         <div role="tabpanel" id={panelId(uid, "results")} aria-labelledby={tabId(uid, "results")}>
           {selectedRun ? (
             <section className="panel te-card te-card--result">
-              <ResultPanel sparkId={spark.id} type={type} run={selectedRun} lines={resultLines} errorCode={resultError} version={version + (settledRun?.id === selectedRun.id ? 1 : 0)} />
+              <ResultPanel sparkId={spark.id} sparkName={spark.name} type={type} run={selectedRun} lines={resultLines} errorCode={resultError} version={version + (settledRun?.id === selectedRun.id ? 1 : 0)} />
             </section>
           ) : (
             <div className="te-empty te-empty--big">
@@ -286,6 +286,7 @@ function ToolEvalBench({ type, spark }: { type: string; spark: SparkSnapshot }) 
           <History
             sparkId={spark.id}
             sparkName={spark.name}
+            type={type}
             runs={runner.runs}
             error={runner.listError}
             followedId={followed?.run.id ?? null}

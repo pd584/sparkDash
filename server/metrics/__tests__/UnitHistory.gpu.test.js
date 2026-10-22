@@ -1,0 +1,243 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { UnitHistory as GpuHistory, deviceReadings } from "../UnitHistory.js";
+
+const tmpFile = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), "gpuhist-")), "h.json");
+
+test("records readings, enforces a minimum gap and returns parallel arrays", () => {
+  const h = new GpuHistory({ minGapMs: 1000 });
+  assert.equal(h.record("a", 10_000, 50.04, 61, 40), true);
+  assert.equal(h.record("a", 10_500, 99, 99, 99), false, "too soon");
+  assert.equal(h.record("a", 12_000, 0, 62.26, null), true);
+  assert.equal(h.record("a", 11_000, 1, 1, 1), false, "goes back in time");
+  assert.deepEqual(h.get("a"), { t: [10_000, 12_000], u: [50, 0], c: [61, 62.3], p: [40, null], gpus: [] });
+  assert.deepEqual(h.get("a", 11_000), { t: [12_000], u: [0], c: [62.3], p: [null], gpus: [] });
+  assert.deepEqual(h.get("nope"), { t: [], u: [], c: [], p: [], gpus: [] });
+});
+
+test("stores unavailable fields as gaps and rejects a sample with no readings", () => {
+  const h = new GpuHistory();
+  assert.equal(h.record("a", 10_000, NaN, 50, null), true);
+  assert.equal(h.record("a", 12_000, null, null, null), false);
+  assert.deepEqual(h.get("a").u, [null]);
+  assert.deepEqual(h.get("a").c, [50]);
+});
+
+test("old readings are trimmed away", () => {
+  let now = 0;
+  const h = new GpuHistory({ maxAgeMs: 10 * 60_000, minGapMs: 1000, now: () => now });
+  for (let i = 0; i < 400; i++) h.record("a", i * 2000, 1, 1, 1);
+  const out = h.get("a");
+  assert.ok(out.t[0] >= 400 * 2000 - 10 * 60_000 - 60_000 - 2000, "oldest kept is within the window plus slack");
+  assert.equal(out.t.at(-1), 399 * 2000);
+});
+
+test("survives a restart through the file, dropping readings past the max age", () => {
+  const file = tmpFile();
+  let now = 1_000_000;
+  const a = new GpuHistory({ file, maxAgeMs: 100_000, minGapMs: 1, now: () => now });
+  a.record("a", now - 150_000, 1, 1, 1);
+  a.record("a", now - 50_000, 2, 2, 2);
+  a.record("b", now - 10_000, 3, 3, null);
+  a.flush();
+  const b = new GpuHistory({ file, maxAgeMs: 100_000, now: () => now });
+  assert.deepEqual(b.get("a").t, [now - 50_000]);
+  assert.deepEqual(b.get("b").p, [null]);
+});
+
+test("a corrupt or missing file starts empty", () => {
+  const file = tmpFile();
+  fs.writeFileSync(file, "{not json");
+  assert.deepEqual(new GpuHistory({ file }).get("a").t, []);
+  assert.deepEqual(new GpuHistory({ file: tmpFile() }).get("a").t, []);
+});
+
+test("a corrupt file is moved aside so the next save cannot destroy it", () => {
+  const file = tmpFile();
+  fs.writeFileSync(file, "{not json");
+  new GpuHistory({ file });
+  assert.equal(fs.existsSync(file), false);
+  const dir = path.dirname(file);
+  assert.ok(fs.readdirSync(dir).some((n) => n.startsWith("h.json.corrupt-")));
+});
+
+test("flush prunes series with no samples left in the window", () => {
+  const file = tmpFile();
+  let now = 1_000_000;
+  const h = new GpuHistory({ file, maxAgeMs: 100_000, minGapMs: 1, now: () => now });
+  h.record("gone", now, 1, 1, 1);
+  now += 500_000;
+  h.record("kept", now, 1, 1, 1);
+  h.flush();
+  const saved = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.deepEqual(Object.keys(saved.sparks), ["kept"]);
+});
+
+const card = (index, usage, temperature, draw, limit = 100, name = `Card ${index}`) => ({
+  index, name, usage, temperature, power: { draw, limit },
+});
+
+test("deviceReadings is vendor-neutral and only reports multi-card hosts", () => {
+  assert.deepEqual(deviceReadings(undefined), []);
+  assert.deepEqual(deviceReadings([card(0, 1, 2, 3)]), [], "one card is the aggregate");
+  const r = deviceReadings([card(0, 10, 50, 25, 100, "Vendor A"), { index: 1, usage: 5, temperature: 40, power: { draw: 5, limit: 0 } }, null]);
+  assert.deepEqual(r, [
+    { index: 0, name: "Vendor A", usage: 10, temperature: 50, powerPct: 25 },
+    { index: 1, name: null, usage: 5, temperature: 40, powerPct: null },
+  ]);
+});
+
+test("keeps one series per card next to the aggregate, parallel to t", () => {
+  const h = new GpuHistory({ minGapMs: 1000 });
+  const dev = (a, b) => deviceReadings([card(0, a, 50, 50), card(1, b, 60, 20)]);
+  h.record("a", 10_000, 30, 60, 50, dev(10, 30));
+  h.record("a", 12_000, 40, 61, 55, dev(20, 40));
+  const out = h.get("a");
+  assert.deepEqual(out.u, [30, 40]);
+  assert.equal(out.gpus.length, 2);
+  assert.deepEqual(out.gpus[0], { index: 0, name: "Card 0", u: [10, 20], c: [50, 50], p: [50, 50] });
+  assert.deepEqual(out.gpus[1], { index: 1, name: "Card 1", u: [30, 40], c: [60, 60], p: [20, 20] });
+  assert.deepEqual(h.get("a", 11_000).gpus[1].u, [40]);
+});
+
+test("a single-GPU host and an unknown Spark return an empty gpus list", () => {
+  const h = new GpuHistory();
+  h.record("a", 10_000, 1, 1, 1);
+  h.record("b", 10_000, 1, 1, 1, deviceReadings([card(0, 1, 1, 1)]));
+  assert.deepEqual(h.get("a").gpus, []);
+  assert.deepEqual(h.get("b").gpus, []);
+  assert.deepEqual(h.get("nope"), { t: [], u: [], c: [], p: [], gpus: [] });
+});
+
+test("a card that appears later is padded with nulls and the aggregate is untouched", () => {
+  const h = new GpuHistory({ minGapMs: 1000 });
+  h.record("a", 10_000, 30, 60, 50);
+  h.record("a", 12_000, 31, 61, 50);
+  h.record("a", 14_000, 32, 62, 50, deviceReadings([card(0, 5, 50, 10), card(1, 7, 55, 20)]));
+  const out = h.get("a");
+  assert.deepEqual(out.u, [30, 31, 32]);
+  assert.deepEqual(out.gpus.map((g) => g.u), [[null, null, 5], [null, null, 7]]);
+});
+
+test("a card that disappears gets nulls, and is dropped once it ages out of the window", () => {
+  let now = 0;
+  const h = new GpuHistory({ maxAgeMs: 10 * 60_000, minGapMs: 1000, now: () => now });
+  h.record("a", 0, 1, 1, 1, deviceReadings([card(0, 5, 50, 10), card(1, 7, 55, 20)]));
+  h.record("a", 2000, 2, 2, 1, [{ index: 0, usage: 6, temperature: 50, powerPct: 10 }]);
+  h.record("a", 4000, 3, 3, 1);
+  let out = h.get("a");
+  assert.deepEqual(out.u, [1, 2, 3], "aggregate keeps going");
+  assert.deepEqual(out.gpus.find((g) => g.index === 1).u, [7, null, null]);
+  assert.deepEqual(out.gpus.find((g) => g.index === 0).u, [5, 6, null]);
+  // Much later: only a card-0 reading remains in the window, card 1 has aged out.
+  now = 60 * 60_000;
+  h.record("a", now, 9, 9, 9, deviceReadings([card(0, 8, 50, 10), card(2, 1, 40, 5)]));
+  h._prune(now);
+  out = h.get("a");
+  assert.deepEqual(out.t, [now]);
+  assert.deepEqual(out.gpus.map((g) => g.index), [0, 2]);
+});
+
+test("per-card memory is bounded like the aggregate", () => {
+  let now = 0;
+  const h = new GpuHistory({ maxAgeMs: 10 * 60_000, minGapMs: 1000, now: () => now });
+  for (let i = 0; i < 1000; i++) {
+    now = i * 2000;
+    h.record("a", now, 1, 1, 1, deviceReadings([card(0, 1, 1, 1), card(1, 2, 2, 2)]));
+  }
+  const out = h.get("a");
+  assert.ok(out.t.length < 400, "trimmed to about the window");
+  for (const g of out.gpus) assert.equal(g.u.length, out.t.length);
+  // A bad payload cannot grow the card count without limit.
+  for (let i = 0; i < 40; i++) h.record("b", 10_000 + i * 2000, 1, 1, 1, [{ index: i, usage: 1, temperature: 1, powerPct: 1 }]);
+  assert.ok(h.get("b").gpus.length <= 16);
+});
+
+test("per-card series survive a restart through the file, and old files without them still load", () => {
+  const file = tmpFile();
+  const now = 1_000_000;
+  const a = new GpuHistory({ file, minGapMs: 1, now: () => now });
+  a.record("a", now - 4000, 1, 1, 1, deviceReadings([card(0, 5, 50, 10), card(1, 7, 55, 20)]));
+  a.record("a", now - 2000, 2, 2, 1, deviceReadings([card(0, 6, 50, 10), card(1, 8, 55, 20)]));
+  a.stop();
+  const b = new GpuHistory({ file, minGapMs: 1, now: () => now });
+  assert.deepEqual(b.get("a").gpus.map((g) => g.u), [[5, 6], [7, 8]]);
+  fs.writeFileSync(file, JSON.stringify({ version: 1, sparks: { a: { t: [now - 1000], u: [1], c: [2], p: [3] } } }));
+  const c = new GpuHistory({ file, minGapMs: 1, now: () => now });
+  assert.deepEqual(c.get("a"), { t: [now - 1000], u: [1], c: [2], p: [3], gpus: [] });
+});
+
+test("a week of minute samples is retained with the long-store config (day/week windows)", () => {
+  const week = 7 * 24 * 60 * 60_000;
+  let now = 0;
+  const h = new GpuHistory({ maxAgeMs: week, minGapMs: 60_000, now: () => now });
+  const samples = week / 60_000;
+  for (let i = 0; i < samples; i++) {
+    now = (i + 1) * 60_000;
+    h.record("a", now, 10, 20 + (i % 10), 5);
+  }
+  // The whole week survives, and a day-long sub-window slices it.
+  assert.equal(h.get("a", now - week).t.length, samples);
+  const day = h.get("a", now - 24 * 3600_000);
+  assert.equal(day.t.length, 24 * 60 + 1, "both ends of the window are inclusive at minute spacing");
+  assert.ok(day.t[0] >= now - 24 * 3600_000);
+});
+
+test("the default dense retention still caps at 8 hours", () => {
+  let now = 0;
+  const h = new GpuHistory({ minGapMs: 60_000, now: () => now });
+  for (let i = 0; i < 7 * 24 * 60; i++) {
+    now = (i + 1) * 60_000;
+    h.record("a", now, 10, 20, 5);
+  }
+  const kept = h.get("a", now - 7 * 24 * 3600_000).t.length;
+  // _trim keeps a small slack (chunked trimming), so allow a couple of extra minute samples.
+  assert.ok(kept >= 8 * 60 && kept <= 8 * 60 + 5, `only about the last 8 h kept (got ${kept})`);
+});
+
+test("the long series keeps a week of minute readings in its own file; window() picks dense or long", () => {
+  const file = tmpFile();
+  const longFile = path.join(path.dirname(file), "long.json");
+  const hour = 3600_000;
+  const day = 24 * hour;
+  let now = 10 * day;
+  const h = new GpuHistory({ file, longFile, now: () => now });
+  assert.equal(h.maxWindowMs, 7 * day);
+  // A reading every 30 s for two days: the dense series keeps the last 8 h of all of them, the
+  // long one a reading a minute for the whole span.
+  const start = now;
+  for (let at = start; at <= start + 2 * day; at += 30_000) {
+    now = at;
+    h.record("a", at, 10, 40 + ((at / 30_000) % 2), 5);
+  }
+  const dense = h.window("a", 8 * hour);
+  assert.equal(dense.t.length, 8 * 120 + 1, "8 h at 30 s spacing, both ends inclusive");
+  const long = h.window("a", day);
+  assert.equal(long.t.length, 24 * 60 + 1, "a day at minute spacing");
+  assert.ok(long.t.every((t, i) => i === 0 || t - long.t[i - 1] === 60_000));
+  assert.equal(h.window("a", 2 * day + hour).t[0], start, "the long series reaches back to the first reading");
+  assert.deepEqual(h.get("a", now - 8 * hour), dense, "get() is the dense series, as before");
+
+  assert.equal(h.flush(), true);
+  const saved = JSON.parse(fs.readFileSync(longFile, "utf8"));
+  assert.equal(saved.version, 1);
+  assert.equal(saved.sparks.a.t.length, 2 * 24 * 60 + 1, "the 2.40.1 file format, unchanged");
+  const reloaded = new GpuHistory({ file, longFile, now: () => now });
+  assert.deepEqual(reloaded.window("a", day), long);
+  assert.deepEqual(reloaded.window("a", 8 * hour), dense);
+
+  h.remove("a");
+  assert.deepEqual(h.window("a", day).t, []);
+  assert.deepEqual(h.window("a", hour).t, []);
+});
+
+test("without a long series every window is the dense one, capped at 8 h", () => {
+  let now = 100 * 3600_000;
+  const h = new GpuHistory({ now: () => now });
+  assert.equal(h.maxWindowMs, 8 * 3600_000);
+  h.record("a", now - 1000, 1, 2, 3);
+  assert.deepEqual(h.window("a", 24 * 3600_000).t, [now - 1000]);
+});

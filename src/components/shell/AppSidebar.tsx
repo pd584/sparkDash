@@ -18,9 +18,10 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import type { AuthMode, SparkSnapshot } from "../../api/types";
-import { ACTIVITY_ID, ENERGY_ID, OVERVIEW_ID, SHOWCASE_ID, TOKENS_ID, benchId, idToPath } from "../../constants";
+import { isWorkerSpark } from "../../api/sparkRole";
+import { ACTIVITY_ID, COST_ID, ENERGY_ID, OVERVIEW_ID, SHOWCASE_ID, TEMPS_ID, TOKENS_ID, benchId, idToPath } from "../../constants";
 import { BENCH_TYPES } from "../bench/benchCatalog";
-import { BoltIcon, ChevronDownIcon, GearIcon, GithubIcon, GlobeIcon, GridIcon, ListIcon, PanelLeftIcon, PlusIcon, SearchIcon, TerminalIcon, TokensIcon, XLogoIcon } from "../ui/icons";
+import { BoltIcon, ChevronDownIcon, CoinsIcon, GearIcon, GithubIcon, GlobeIcon, GridIcon, ListIcon, PanelLeftIcon, PlusIcon, SearchIcon, TerminalIcon, ThermometerIcon, TokensIcon, XLogoIcon } from "../ui/icons";
 import { OpenAccessChip } from "../OpenAccessChip";
 import { ThemeSwitch } from "../ThemeSwitch";
 import { isThrottling, railSubLabel } from "./sparkSummary";
@@ -68,9 +69,57 @@ function dotClass(spark: SparkSnapshot): string {
   return "sdot";
 }
 
+/**
+ * Strata exposes explicit activity flags when it has no current decode window.
+ * A zero decode rate during either state is not an idle throughput reading, so
+ * keep the rail from presenting it as a measured 0.0 tok/s.
+ */
+function sidebarSubLabel(spark: SparkSnapshot): string {
+  if (!spark.online) return railSubLabel(spark);
+  if (isWorkerSpark(spark)) return "worker";
+  const llm = Array.isArray(spark.metrics.llm) ? spark.metrics.llm.find((entry) => entry.available) : null;
+  if (llm?.backend === "strata" && !(Number.isFinite(llm.generationTps) && llm.generationTps > 0)) {
+    if (llm.prefillActive) return "prefilling";
+    if (llm.decodeActive) return "decoding";
+  }
+  return railSubLabel(spark);
+}
+
+/**
+ * A drag ends on pointer-up over the very link that was lifted, and the browser then fires a click on
+ * it. dnd-kit stops that click at the document (capture phase), so React's onClick never sees it and
+ * the browser follows the link's href on its own. A window-level capture listener runs before dnd-kit's
+ * and cancels the default action for a moment after a drop.
+ */
+const DROP_CLICK_GUARD_MS = 400;
+let lastDropAt = 0;
+let removeDropGuard: (() => void) | null = null;
+export function markRailDrop(now: number = Date.now()) {
+  lastDropAt = now;
+  removeDropGuard?.();
+  if (typeof window === "undefined") return;
+  const onClick = (e: Event) => {
+    e.preventDefault();
+  };
+  window.addEventListener("click", onClick, true);
+  const timer = window.setTimeout(() => removeDropGuard?.(), DROP_CLICK_GUARD_MS);
+  removeDropGuard = () => {
+    window.removeEventListener("click", onClick, true);
+    window.clearTimeout(timer);
+    removeDropGuard = null;
+  };
+}
+export function clickFollowsRailDrop(now: number = Date.now()): boolean {
+  return now - lastDropAt < DROP_CLICK_GUARD_MS;
+}
+
 /** Plain left-click navigates in-app; modified clicks and the context menu keep normal link behaviour. */
 function inApp(go: () => void) {
   return (e: MouseEvent<HTMLAnchorElement>) => {
+    if (clickFollowsRailDrop()) {
+      e.preventDefault();
+      return;
+    }
     if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     e.preventDefault();
     go();
@@ -109,7 +158,7 @@ function RailSpark({
         <i className={dotClass(spark)} aria-hidden />
         <span className="rail-item__name">{spark.name}</span>
       </a>
-      <span className="rail-item__sub">{railSubLabel(spark)}</span>
+      <span className="rail-item__sub">{sidebarSubLabel(spark)}</span>
     </div>
   );
 }
@@ -163,6 +212,7 @@ export function AppSidebar({
   const canReorder = Boolean(onReorder) && sparks.length > 1;
 
   const handleDragEnd = (event: DragEndEvent) => {
+    markRailDrop();
     setDragging(false);
     const { active, over } = event;
     if (!over || active.id === over.id) return;
@@ -224,7 +274,10 @@ export function AppSidebar({
             collisionDetection={closestCenter}
             onDragStart={() => setDragging(true)}
             onDragEnd={handleDragEnd}
-            onDragCancel={() => setDragging(false)}
+            onDragCancel={() => {
+              markRailDrop();
+              setDragging(false);
+            }}
           >
             <SortableContext items={items} strategy={verticalListSortingStrategy}>
               <nav className="rail-list" aria-label="Sparks">
@@ -247,7 +300,7 @@ export function AppSidebar({
                   <i className={dotClass(s)} aria-hidden />
                   <span className="rail-item__name">{s.name}</span>
                 </a>
-                <span className="rail-item__sub">{railSubLabel(s)}</span>
+                <span className="rail-item__sub">{sidebarSubLabel(s)}</span>
               </div>
             ))}
           </nav>
@@ -279,6 +332,15 @@ export function AppSidebar({
             <span className="rail-item__name">Token totals</span>
           </a>
           <a
+            href={idToPath(COST_ID)}
+            className={`rail-item ${activeId === COST_ID ? "is-active" : ""}`}
+            onClick={inApp(() => onSelect(COST_ID))}
+            aria-current={activeId === COST_ID ? "page" : undefined}
+          >
+            <CoinsIcon className="h-4 w-4" />
+            <span className="rail-item__name">Cost compare</span>
+          </a>
+          <a
             href={idToPath(ENERGY_ID)}
             className={`rail-item ${activeId === ENERGY_ID ? "is-active" : ""}`}
             onClick={inApp(() => onSelect(ENERGY_ID))}
@@ -286,6 +348,15 @@ export function AppSidebar({
           >
             <BoltIcon className="h-4 w-4" />
             <span className="rail-item__name">Fleet energy</span>
+          </a>
+          <a
+            href={idToPath(TEMPS_ID)}
+            className={`rail-item ${activeId === TEMPS_ID ? "is-active" : ""}`}
+            onClick={inApp(() => onSelect(TEMPS_ID))}
+            aria-current={activeId === TEMPS_ID ? "page" : undefined}
+          >
+            <ThermometerIcon className="h-4 w-4" />
+            <span className="rail-item__name">Temps</span>
           </a>
           <a
             href={idToPath(ACTIVITY_ID)}

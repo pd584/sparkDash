@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { addSpark, testSparkConfig } from "../api/client";
 import type { SparkConfig, SparkTestResponse } from "../api/types";
 import { useModalPresence } from "../hooks/useModalPresence";
+import { useOverlayClose } from "../hooks/useOverlayClose";
 import { useFocusTrap } from "../hooks/useFocusTrap";
 import { CheckIcon, ChevronRightIcon, XIcon } from "./ui/icons";
 import {
@@ -14,6 +15,7 @@ import {
   validateConnect,
   type AddStep,
 } from "./addSparkSteps";
+import { addDeviceLabel, UNIT_TYPE_OPTIONS, unitTypeOf, unitTypePatch, type UnitType } from "../shared/deviceKind";
 import { TestResultList } from "./TestResultList";
 import { resolveSparkRole } from "../api/sparkRole";
 import type { SparkRole } from "../api/types";
@@ -79,6 +81,13 @@ function Stepper({ step }: { step: AddStep }) {
   );
 }
 
+/** One-click ports for common servers. They only fill a port number; nothing is installed. */
+const SERVER_PRESETS = [
+  { name: "LM Studio", port: 1234 },
+  { name: "Ollama", port: 11434 },
+  { name: "TensorFold", port: 8888 },
+] as const;
+
 export function AddSparkDialog({ open, onClose, onAdded, defaultLlmPort = 8888 }: AddSparkDialogProps) {
   const [config, setConfig] = useState(defaultConfig);
   const [step, setStep] = useState<AddStep>(0);
@@ -92,6 +101,7 @@ export function AddSparkDialog({ open, onClose, onAdded, defaultLlmPort = 8888 }
 
   const { mounted, visible } = useModalPresence(open);
   const trapRef = useFocusTrap(mounted);
+  const overlayClose = useOverlayClose(onClose);
 
   useEffect(() => {
     if (!mounted) return;
@@ -116,6 +126,15 @@ export function AddSparkDialog({ open, onClose, onAdded, defaultLlmPort = 8888 }
 
   const update = (patch: Partial<Omit<SparkConfig, "id">>) => {
     setConfig((prev) => ({ ...prev, ...patch }));
+  };
+
+  /** Add a server's default port to the list (the untouched default port is replaced), keeping the text field in step. */
+  const addPresetPort = (port: number) => {
+    const current = parsePorts(portsText);
+    const untouched = current.length === 1 && current[0] === defaultLlmPort;
+    const next = untouched || current.length === 0 ? [port] : current.includes(port) ? current : [...current, port];
+    setPortsText(next.join(", "));
+    update({ llmPorts: next });
   };
 
   const updateSsh = (patch: Partial<SparkConfig["ssh"]>) => {
@@ -187,9 +206,7 @@ export function AddSparkDialog({ open, onClose, onAdded, defaultLlmPort = 8888 }
   return createPortal(
     <div
       className={`modal-overlay${visible ? " is-open" : ""}`}
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
+      {...overlayClose}
     >
       <div
         ref={trapRef}
@@ -216,22 +233,31 @@ export function AddSparkDialog({ open, onClose, onAdded, defaultLlmPort = 8888 }
                 <label htmlFor="add-spark-kind">Unit type</label>
                 <select
                   id="add-spark-kind"
-                  value={config.kind ?? "spark"}
-                  onChange={(e) => update({ kind: e.target.value as "spark" | "host" })}
+                  value={unitTypeOf(config)}
+                  onChange={(e) => update(unitTypePatch(e.target.value as UnitType, config))}
                 >
-                  <option value="spark">NVIDIA DGX Spark</option>
-                  <option value="host">Dedicated GPU host (Linux, nvidia-smi, not a Spark)</option>
+                  {UNIT_TYPE_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
                 </select>
               </div>
 
-              <label className="check-row">
-                <input
-                  type="checkbox"
-                  checked={config.isLocal}
-                  onChange={(e) => update({ isLocal: e.target.checked })}
-                />
-                <span>This host (local collectors, no SSH for metrics)</span>
-              </label>
+              {config.platform !== "windows" && (
+                <label className="check-row">
+                  <input
+                    type="checkbox"
+                    checked={config.isLocal}
+                    onChange={(e) => update({ isLocal: e.target.checked })}
+                  />
+                  <span>This host (local collectors, no SSH for metrics)</span>
+                </label>
+              )}
+              {config.platform === "windows" && (
+                <p className="field-hint">
+                  Needs the Windows OpenSSH Server and the NVIDIA driver (nvidia-smi). Metrics come from
+                  PowerShell over SSH; Hermes and Tailnet checks are not available for Windows.
+                </p>
+              )}
 
               <div className="field">
                 <label htmlFor="add-spark-lan-ip">
@@ -408,6 +434,20 @@ export function AddSparkDialog({ open, onClose, onAdded, defaultLlmPort = 8888 }
                     placeholder={String(defaultLlmPort)}
                   />
                   <p className="field-hint">Default: {defaultLlmPort}</p>
+                  <div role="group" aria-label="Server presets" className="sp-btns">
+                    <span className="eyebrow">Presets:</span>
+                    {SERVER_PRESETS.map((preset) => (
+                      <button
+                        key={preset.port}
+                        type="button"
+                        className="btn btn--sm"
+                        title={`Add ${preset.name}'s default port (${preset.port})`}
+                        onClick={() => addPresetPort(preset.port)}
+                      >
+                        {preset.name} :{preset.port}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               ) : (
                 <p className="field-hint">Workers have no local LLM API, so no ports are probed.</p>
@@ -440,30 +480,32 @@ export function AddSparkDialog({ open, onClose, onAdded, defaultLlmPort = 8888 }
                 </div>
               </div>
 
-              <div className="set-row">
-                <div className="set-row__text">
-                  <span className="set-row__title">Monitor Hermes updates</span>
-                  <small>Checks for new releases every 10 min and adds an Update Hermes button.</small>
-                </div>
-                <div className="set-row__control">
-                  <button
-                    type="button"
-                    role="switch"
-                    aria-checked={Boolean(config.hermesMonitoring)}
-                    aria-label="Monitor Hermes updates"
-                    onClick={() => update({ hermesMonitoring: !config.hermesMonitoring })}
-                    className={`toggle-track relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors${
-                      config.hermesMonitoring ? " is-on" : ""
-                    }`}
-                  >
-                    <span
-                      className={`toggle-dot inline-block h-4 w-4 transform rounded-full shadow transition-transform ${
-                        config.hermesMonitoring ? "translate-x-4" : "translate-x-0"
+              {config.platform !== "windows" && (
+                <div className="set-row">
+                  <div className="set-row__text">
+                    <span className="set-row__title">Monitor Hermes updates</span>
+                    <small>Checks for new releases every 10 min and adds an Update Hermes button.</small>
+                  </div>
+                  <div className="set-row__control">
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={Boolean(config.hermesMonitoring)}
+                      aria-label="Monitor Hermes updates"
+                      onClick={() => update({ hermesMonitoring: !config.hermesMonitoring })}
+                      className={`toggle-track relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors${
+                        config.hermesMonitoring ? " is-on" : ""
                       }`}
-                    />
-                  </button>
+                    >
+                      <span
+                        className={`toggle-dot inline-block h-4 w-4 transform rounded-full shadow transition-transform ${
+                          config.hermesMonitoring ? "translate-x-4" : "translate-x-0"
+                        }`}
+                      />
+                    </button>
+                  </div>
                 </div>
-              </div>
+              )}
             </>
           )}
 
@@ -492,7 +534,7 @@ export function AddSparkDialog({ open, onClose, onAdded, defaultLlmPort = 8888 }
                 disabled={saving || !stepReady}
                 className="btn btn--primary"
               >
-                {saving ? "Saving..." : "Add Spark"}
+                {saving ? "Saving..." : addDeviceLabel(config.kind)}
               </button>
             )}
           </div>

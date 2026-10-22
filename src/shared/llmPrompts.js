@@ -248,8 +248,9 @@ function pickDecodeCodePrompts(n) {
 
 /**
  * Decode-bench prompts for a workload type. Code uses one real task per stream.
- * Other types share one prompt; concurrent streams get a unique suffix so they
- * do not share a prefix-cache block. C1 is the exact prompt.
+ * Other types share one task, with stable request IDs before it to prevent
+ * prefix-cache sharing. Fraction labels such as 4/4 can look like task parts.
+ * C1 is the exact prompt.
  * @param {number} count
  * @param {unknown} [type]
  * @returns {string[]}
@@ -261,7 +262,7 @@ export function pickDecodeBenchPrompts(count, type) {
   if (n <= 1) return [base];
   const out = [];
   for (let i = 0; i < n; i++) {
-    out.push(`${base} (stream ${i + 1}/${n})`);
+    out.push(`Request ID: decode-${i + 1}\n${base}`);
   }
   return out;
 }

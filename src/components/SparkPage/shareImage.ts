@@ -38,7 +38,8 @@ function defaultCreateCanvas(): HTMLCanvasElement {
   return document.createElement("canvas");
 }
 
-async function defaultWriteClipboard(blob: Blob): Promise<void> {
+/** Put a PNG on the clipboard; rejects where the page cannot (see `canCopyImages`). */
+export async function copyPngToClipboard(blob: Blob): Promise<void> {
   if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) {
     throw new Error("clipboard image write unsupported");
   }
@@ -149,7 +150,7 @@ export async function copyCardImage(
 
   if (deps.writeClipboard !== null) {
     try {
-      await (deps.writeClipboard ?? defaultWriteClipboard)(png);
+      await (deps.writeClipboard ?? copyPngToClipboard)(png);
       return "copied";
     } catch {
       /* fall through to the download — the user still gets the image */

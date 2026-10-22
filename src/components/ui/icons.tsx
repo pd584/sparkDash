@@ -383,6 +383,16 @@ export function TokensIcon({ className = "" }: { className?: string }) {
   );
 }
 
+/** Shield with a check: security scans. */
+export function ShieldIcon({ className = "" }: { className?: string }) {
+  return (
+    <svg {...baseProps(className)}>
+      <path d="M12 3 4.5 6v5.5c0 4.4 3.1 8.1 7.5 9.5 4.4-1.4 7.5-5.1 7.5-9.5V6L12 3Z" />
+      <path d="m9 12 2.2 2.2L15.2 10" />
+    </svg>
+  );
+}
+
 export function ListIcon({ className = "" }: { className?: string }) {
   return (
     <svg {...baseProps(className)}>
@@ -399,6 +409,15 @@ export function GaugeIcon({ className = "" }: { className?: string }) {
       <path d="M4.9 19a9 9 0 1 1 14.2 0" />
       <path d="m12 14 4-5" />
       <circle cx="12" cy="14" r="1" />
+    </svg>
+  );
+}
+
+/** Thermometer: GPU temperatures (Temps page). */
+export function ThermometerIcon({ className = "" }: { className?: string }) {
+  return (
+    <svg {...baseProps(className)}>
+      <path d="M14 14.76V5a2 2 0 0 0-4 0v9.76a4 4 0 1 0 4 0" />
     </svg>
   );
 }
@@ -466,6 +485,17 @@ export function XLogoIcon({ className = "" }: { className?: string }) {
   return (
     <svg width={14} height={14} viewBox="0 0 24 24" fill="currentColor" aria-hidden className={className}>
       <path d="M18.244 2H21.5l-7.1 8.12L22.8 22h-6.55l-5.13-6.7L5.2 22H1.94l7.6-8.68L1.5 2h6.72l4.64 6.13L18.244 2zm-1.14 18h1.8L7.3 3.9H5.37L17.1 20z" />
+    </svg>
+  );
+}
+
+/** Stacked coins — used for the Cost compare page. */
+export function CoinsIcon({ className = "" }: { className?: string }) {
+  return (
+    <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden className={className}>
+      <circle cx="8.5" cy="8.5" r="5.5" />
+      <path d="M14.5 4.6a5.5 5.5 0 1 1-3.9 9.4" />
+      <path d="M7.5 18.4a5.5 5.5 0 1 0 7-7" />
     </svg>
   );
 }

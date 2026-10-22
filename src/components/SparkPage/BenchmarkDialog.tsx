@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { decodeBenchSamplingLabel } from "./decodeSampling";
 import { createPortal } from "react-dom";
 import "../../styles/dialogs.css";
 import {
@@ -29,6 +30,8 @@ import {
 const CONCURRENCY_OPTIONS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32] as const;
 const DEFAULT_SELECTED = [1, 2];
 const DEFAULT_MAX_TOKENS = 400;
+const DEFAULT_TEMPERATURE = 0.7;
+const DEFAULT_THINKING = true;
 const DEFAULT_PROMPT_TYPE: DecodeBenchPromptType = DECODE_BENCH_DEFAULT_TYPE;
 
 interface BenchmarkDialogProps {
@@ -40,6 +43,8 @@ interface BenchmarkDialogProps {
   sparkId: string;
   llmPort: number;
   modelId: string | null;
+  /** Exact served request IDs; undefined for targets without model discovery. */
+  models?: string[];
   remoteTarget?: LlmBenchTarget | null;
   /** Settings → Benchmark share image: the copy button also carries the card. */
   shareImage?: boolean;
@@ -106,7 +111,7 @@ function formatTtft(ms: number): string {
 function buildShareText(job: DecodeBenchJob, modelId: string | null): string {
   const name = modelId || "unknown model";
   const typeLabel = decodeBenchTypeLabel(job.config?.promptType);
-  const head = `${name} | decode tok/s results (${typeLabel}):`;
+  const head = `${name} | decode tok/s results (${typeLabel}, ${decodeBenchSamplingLabel(job.config)}):`;
 
   const lines = job.results
     .slice()
@@ -179,6 +184,7 @@ export function BenchmarkDialog({
   sparkId,
   llmPort,
   modelId,
+  models,
   remoteTarget = null,
   shareImage = false,
   sparkName = null,
@@ -193,6 +199,9 @@ export function BenchmarkDialog({
   const [selected, setSelected] = useState<number[]>([...DEFAULT_SELECTED]);
   const [maxTokensDraft, setMaxTokensDraft] = useState(String(DEFAULT_MAX_TOKENS));
   const [promptType, setPromptType] = useState<DecodeBenchPromptType>(DEFAULT_PROMPT_TYPE);
+  const [temperatureDraft, setTemperatureDraft] = useState(String(DEFAULT_TEMPERATURE));
+  const [thinking, setThinking] = useState(DEFAULT_THINKING);
+  const effectiveThinking = promptType === "prose" && thinking;
   const [job, setJob] = useState<DecodeBenchJob | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
@@ -200,6 +209,33 @@ export function BenchmarkDialog({
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const benchPort = remoteTarget?.port ?? llmPort;
+  const [selectedModel, setSelectedModel] = useState<string | null>(null);
+  const [modelNotice, setModelNotice] = useState<string | null>(null);
+  const selectionTargetRef = useRef<string | null>(null);
+  const selectionTarget = JSON.stringify([sparkId, llmPort, remoteTarget?.host, remoteTarget?.port, remoteTarget?.tls]);
+  const availableModels = useMemo(() => remoteTarget ? [] : [...new Set(
+    (models ?? []).filter((id) => typeof id === "string" && id.trim().length > 0)
+  )], [models, remoteTarget]);
+  const hasModelDiscovery = !remoteTarget && models !== undefined;
+  const modelSelectionValid = !hasModelDiscovery || (selectedModel !== null && availableModels.includes(selectedModel));
+
+  useEffect(() => {
+    if (!open) {
+      selectionTargetRef.current = null;
+      return;
+    }
+    const targetChanged = selectionTargetRef.current !== selectionTarget;
+    selectionTargetRef.current = selectionTarget;
+    if (!targetChanged && hasModelDiscovery && selectedModel && availableModels.includes(selectedModel)) return;
+    const next = hasModelDiscovery
+      ? (targetChanged && modelId && availableModels.includes(modelId) ? modelId : availableModels[0] ?? null)
+      : remoteTarget ? null : modelId;
+    if (targetChanged) setModelNotice(null);
+    else if (hasModelDiscovery && selectedModel && selectedModel !== next) {
+      setModelNotice(next ? `Selected model is no longer served. Switched to ${next}.` : "No models are currently served by this target.");
+    } else setModelNotice(null);
+    setSelectedModel(next);
+  }, [open, selectionTarget, hasModelDiscovery, availableModels, modelId, remoteTarget, selectedModel]);
 
   const stopPoll = useCallback(() => {
     if (pollRef.current != null) {
@@ -306,6 +342,7 @@ export function BenchmarkDialog({
       return;
     }
     setError(null);
+    setJob(null);
     let cancelled = false;
     setLoadingLast(true);
     listDecodeBench(sparkId, benchPort)
@@ -336,7 +373,7 @@ export function BenchmarkDialog({
       cancelled = true;
       stopPoll();
     };
-  }, [open, sparkId, benchPort, stopPoll, startPolling, applyJobConfig]);
+  }, [open, sparkId, benchPort, remoteTarget?.host, remoteTarget?.tls, stopPoll, startPolling, applyJobConfig]);
 
   useEffect(() => () => stopPoll(), [stopPoll]);
 
@@ -383,6 +420,10 @@ export function BenchmarkDialog({
 
   const handleStart = async () => {
     if (startLockRef.current) return;
+    if (!modelSelectionValid) {
+      setError("Select a currently served model before running the benchmark");
+      return;
+    }
     if (selected.length === 0) {
       setError("Select at least one concurrency level");
       return;
@@ -390,6 +431,11 @@ export function BenchmarkDialog({
     const maxTokens = parseInt(maxTokensDraft.trim(), 10);
     if (!Number.isInteger(maxTokens) || maxTokens < 64 || maxTokens > 2048) {
       setError("Max tokens must be an integer between 64 and 2048");
+      return;
+    }
+    const temperature = Number(temperatureDraft.trim());
+    if (temperatureDraft.trim() === "" || !Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
+      setError("Temperature must be a number between 0 and 2");
       return;
     }
     startLockRef.current = true;
@@ -401,8 +447,10 @@ export function BenchmarkDialog({
         port: benchPort,
         concurrencies: selected,
         maxTokens,
-        modelId: modelId || undefined,
+        modelId: selectedModel || undefined,
         promptType,
+        temperature,
+        thinking: effectiveThinking,
         ...(remoteTarget
           ? { host: remoteTarget.host, tls: remoteTarget.tls }
           : {}),
@@ -475,12 +523,36 @@ export function BenchmarkDialog({
     <>
           {showConfig && (
             <section className="bench-sheet__section">
+              {availableModels.length > 1 && (
+                <div className="bench-field">
+                  <div className="bench-field__head">
+                    <label htmlFor="bench-model-select" className="bench-sheet__section-title">Model</label>
+                    <p className="bench-sheet__hint">Select which model the benchmark targets.</p>
+                  </div>
+                  <select
+                    id="bench-model-select"
+                    className="bench-select"
+                    value={selectedModel ?? ""}
+                    disabled={isRunning || starting}
+                    onChange={(e) => {
+                      setSelectedModel(e.target.value);
+                      setModelNotice(null);
+                    }}
+                  >
+                    {availableModels.map((id) => <option key={id} value={id}>{id}</option>)}
+                  </select>
+                </div>
+              )}
+              {modelNotice && availableModels.length > 0 && <p className="bench-sheet__hint" role="status">{modelNotice}</p>}
+              {hasModelDiscovery && availableModels.length === 0 && (
+                <p className="bench-sheet__hint" role="status">No models are currently served by this target.</p>
+              )}
               <div className="bench-field">
                 <div className="bench-field__head">
                   <h3 className="bench-sheet__section-title">Type</h3>
                   <p className="bench-sheet__hint">
                     {DECODE_BENCH_TYPE_META.find((t) => t.id === promptType)?.hint}
-                    {" · temp 0, thinking off"}
+                    {` · temp ${temperatureDraft || "?"}, thinking ${effectiveThinking ? "on" : "off"}`}
                   </p>
                 </div>
                 <div
@@ -506,6 +578,54 @@ export function BenchmarkDialog({
                     );
                   })}
                 </div>
+              </div>
+
+              {promptType === "prose" && (
+              <div className="bench-field">
+                <div className="bench-field__head">
+                  <h3 className="bench-sheet__section-title">Thinking</h3>
+                  <p className="bench-sheet__hint">
+                    On by default. Reasoning tokens count toward decode tok/s.
+                  </p>
+                </div>
+                <div className="bench-type-grid" role="radiogroup" aria-label="Thinking">
+                  {([true, false] as const).map((on) => (
+                    <button
+                      key={String(on)}
+                      type="button"
+                      role="radio"
+                      aria-checked={thinking === on}
+                      disabled={isRunning || starting}
+                      onClick={() => setThinking(on)}
+                      className={`bench-conc-btn${thinking === on ? " is-on" : ""}`}
+                    >
+                      {on ? "With thinking" : "Without thinking"}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              )}
+
+              <div className="bench-field">
+                <div className="bench-field__head">
+                  <label htmlFor="bench-temperature" className="bench-sheet__section-title">
+                    Temperature
+                  </label>
+                  <p className="bench-sheet__hint">Default 0.7 · 0 is greedy · 0 to 2</p>
+                </div>
+                <input
+                  id="bench-temperature"
+                  type="text"
+                  inputMode="decimal"
+                  className="bench-input"
+                  size={6}
+                  disabled={isRunning || starting}
+                  value={temperatureDraft}
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    if (raw === "" || /^\d*\.?\d{0,2}$/.test(raw)) setTemperatureDraft(raw);
+                  }}
+                />
               </div>
 
               <div className="bench-field">
@@ -539,7 +659,7 @@ export function BenchmarkDialog({
                     Max tokens / stream
                   </label>
                   <p className="bench-sheet__hint">
-                    Default 400 · temp 0, thinking off
+                    Default 400
                     {promptType === "structured" ? " · count 1→200" : ""}
                   </p>
                 </div>
@@ -593,7 +713,7 @@ export function BenchmarkDialog({
                   <p className="bench-sheet__hint">{job.progress.message}</p>
                 ) : null}
               </div>
-              <LiveTps tps={liveTps} active />
+              <LiveTps tps={job.progress.liveTps ?? liveTps} active />
               {job.results.length > 0 && (
                 <div className="bench-results">
                   <div className="bench-results__caption">Completed levels</div>
@@ -619,6 +739,7 @@ export function BenchmarkDialog({
                 </span>
                 <span className="bench-status-meta">
                   {decodeBenchTypeLabel(job.config.promptType)} · {job.config.maxTokens} tok ·{" "}
+                  {decodeBenchSamplingLabel(job.config)} ·{" "}
                   {job.config.concurrencies.join(", ")} conc
                   {job.durationMs != null ? ` · ${formatDuration(job.durationMs)}` : ""}
                 </span>
@@ -849,7 +970,7 @@ export function BenchmarkDialog({
                 type="button"
                 className="bench-btn bench-btn--primary"
                 onClick={() => void handleStart()}
-                disabled={starting || selected.length === 0}
+                disabled={starting || selected.length === 0 || !modelSelectionValid}
               >
                 {starting ? "Starting…" : "Run benchmark"}
               </button>

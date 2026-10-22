@@ -9,6 +9,7 @@ import { MetricBar } from "../ui/MetricBar";
 import { VramBreakdownBar } from "../ui/VramBreakdownBar";
 import { useMetricsHistoryTail } from "../../hooks/metricsStore";
 import { formatMb } from "../../shared/formatBytes";
+import { shortGpuName } from "../../shared/gpuName";
 import { GpuHistoryChart, GPU_CHART_WINDOWS } from "./GpuHistoryChart";
 import {
   computeVramBreakdown,
@@ -37,12 +38,6 @@ interface GpuPanelProps {
 
 function celsiusToFahrenheit(c: number): number {
   return Math.round(c * 9 / 5 + 32);
-}
-
-/** "NVIDIA GeForce RTX 5080" → "RTX 5080" for the per-card rows. */
-function shortGpuName(name: string | null): string {
-  if (!name) return "";
-  return name.replace(/^NVIDIA\s+(GeForce\s+)?/i, "");
 }
 
 function throttleTag(reason: string | undefined): { label: string; tone: TagTone } {
@@ -77,7 +72,7 @@ function GpuDeviceRow({
   temperatureUnit: "celsius" | "fahrenheit";
 }) {
   // One card's own VRAM and processes; its KV pool is not knowable per card.
-  const breakdown = vramContext
+  const breakdown = vramContext && d.metricAvailability?.vramUsed !== false && d.metricAvailability?.vramTotal !== false
     ? computeVramBreakdown(d.vram, d.processes, {
         model: "discrete",
         unified: null,
@@ -87,7 +82,9 @@ function GpuDeviceRow({
   const usageHistory = useMetricsHistoryTail(sparkId, `gpu.${d.index}.usage`);
   const tempHistory = useMetricsHistoryTail(sparkId, `gpu.${d.index}.temp`);
   const temp = temperatureUnit === "fahrenheit" ? celsiusToFahrenheit(d.temperature) : d.temperature;
-  const tempLabel = temperatureUnit === "fahrenheit" ? `${temp}°F` : `${temp}°C`;
+  const tempLabel = d.metricAvailability?.temperature === false
+    ? "—"
+    : temperatureUnit === "fahrenheit" ? `${temp}°F` : `${temp}°C`;
   const tempColor = tempColorFor(d.temperature, "var(--color-accent)");
   const chip = throttleTag(d.throttle?.reason);
   const short = shortGpuName(d.name);
@@ -95,7 +92,7 @@ function GpuDeviceRow({
     <div className="sp-device space-y-1.5" title={d.throttle?.detail ?? undefined}>
       <div className="flex items-center justify-between gap-2 text-xs">
         <span className="min-w-0 truncate font-medium text-text" title={d.name ?? undefined}>
-          GPU {d.index}
+          {d.vendor === "amd" ? `AMD GPU ${d.physicalIndex ?? d.index}` : `GPU ${d.physicalIndex ?? d.index}`}
           {short ? ` · ${short}` : ""}
         </span>
         <Tag tone={chip.tone}>{chip.label}</Tag>
@@ -104,7 +101,7 @@ function GpuDeviceRow({
         <span className="text-muted">Usage</span>
         <div className="flex items-center gap-2">
           <Sparkline data={usageHistory} color="var(--color-accent)" width={84} height={16} />
-          <span className="font-tabular text-text">{d.usage}%</span>
+          <span className="font-tabular text-text">{d.metricAvailability?.usage === false ? "—" : `${d.usage}%`}</span>
         </div>
       </div>
       <div className="flex items-center justify-between gap-2 text-xs">
@@ -117,11 +114,18 @@ function GpuDeviceRow({
       <div className="flex justify-between gap-2 text-xs">
         <span className="text-muted">Power</span>
         <span className="font-tabular text-text">
-          {d.power.draw}W / {d.power.limit}W
+          {d.metricAvailability?.powerDraw === false ? "—" : `${d.power.draw}W`} / {d.metricAvailability?.powerLimit === false ? "—" : `${d.power.limit}W`}
         </span>
       </div>
-      {breakdown ? (
+      {d.vramSource === "pci-bar" ? (
+        <div className="flex justify-between text-xs" title="VRAM use could not be read on this card">
+          <span className="text-muted">VRAM</span>
+          <span className="font-tabular text-text">{formatMb(d.vram.total)} total</span>
+        </div>
+      ) : breakdown ? (
         <VramBreakdownBar label="VRAM" breakdown={breakdown} showLegend />
+      ) : d.metricAvailability?.vramUsed === false || d.metricAvailability?.vramTotal === false ? (
+        <div className="flex justify-between text-xs"><span className="text-muted">VRAM</span><span className="font-tabular text-text">—</span></div>
       ) : d.vram.total > 0 ? (
         <MetricBar
           label="VRAM"
@@ -154,6 +158,8 @@ export function GpuPanel({
   const windowMs = GPU_CHART_WINDOWS.find((w) => w.id === windowId)?.ms ?? GPU_CHART_WINDOWS[0].ms;
 
   const temperature = gpu?.temperature ?? 0;
+  const metrics = gpu?.metricAvailability;
+  const temperatureAvailable = metrics?.temperature ?? true;
   const displayTemp = temperatureUnit === "fahrenheit" ? celsiusToFahrenheit(temperature) : temperature;
   const tempUnit = temperatureUnit === "fahrenheit" ? "°F" : "°C";
   const usage = gpu?.usage ?? 0;
@@ -165,8 +171,9 @@ export function GpuPanel({
   const vramTotal = gpu?.vram?.total ?? 0;
   const devices = gpu?.gpus ?? [];
   const multiGpu = devices.length > 1;
+  const vramAvailable = metrics?.vramUsed !== false && metrics?.vramTotal !== false;
   const breakdown =
-    gpu && vramContext ? computeVramBreakdown(gpu.vram, gpu.processes, vramContext) : null;
+    gpu && vramAvailable && vramContext ? computeVramBreakdown(gpu.vram, gpu.processes, vramContext) : null;
 
   const t = gpu?.throttle;
   const thermal = t?.reason === "thermal";
@@ -208,23 +215,23 @@ export function GpuPanel({
           size={140}
           strokeWidth={11}
           color={ringColor}
-          label={`${usage}%`}
+          label={metrics?.usage === false ? "—" : `${usage}%`}
           caption="utilization"
           className="sp-gpu-top__ring"
         />
         <div className="sp-stat">
           <span className="eyebrow">Temperature</span>
           <div className="big-num">
-            {displayTemp}
-            <small>{tempUnit}</small>
+            {temperatureAvailable ? displayTemp : "—"}
+            {temperatureAvailable ? <small>{tempUnit}</small> : null}
           </div>
           <Tag tone={temp.tone}>{temp.label}</Tag>
         </div>
         <div className="sp-stat">
           <span className="eyebrow">{multiGpu ? "Power (all cards)" : "Power draw"}</span>
           <div className="big-num">
-            {powerDraw}
-            <small>{powerLimit > 0 ? `/ ${powerLimit} W` : "W"}</small>
+            {metrics?.powerDraw === false ? "—" : powerDraw}
+            {metrics?.powerDraw === false ? null : <small>{metrics?.powerLimit === false ? "W" : powerLimit > 0 ? `/ ${powerLimit} W` : "W"}</small>}
           </div>
           {systemDraw != null && systemDraw > 0 ? (
             <span className="sp-stat__sub mono">System ≈ {systemDraw} W</span>
@@ -237,15 +244,22 @@ export function GpuPanel({
             <small>{clock.unit}</small>
           </div>
           <Tag tone={throttle.tone}>{throttle.label}</Tag>
+          {t?.clockCapMHz != null ? (
+            <span className="sp-stat__sub mono" title="Locked with nvidia-smi -lgc">
+              cap {t.clockCapMHz} MHz
+            </span>
+          ) : null}
         </div>
       </div>
 
       <GpuHistoryChart sparkId={sparkId} gpu={gpu} windowMs={windowMs} />
-      <div className="legend">
-        <span className="c-accent">GPU utilization %</span>
-        <span className="c-violet">Power % of limit</span>
-        <span className="c-info">Temperature °C</span>
-      </div>
+      {!multiGpu && (
+        <div className="legend">
+          <span className="c-accent">GPU utilization %</span>
+          <span className="c-violet">Power % of limit</span>
+          <span className="c-info">Temperature °C</span>
+        </div>
+      )}
 
       {/* Per-card breakdown — only when the host has more than one GPU */}
       {multiGpu && (
@@ -268,7 +282,9 @@ export function GpuPanel({
       {/* GPU-allocated memory (shown here only when the Unified memory panel is not) */}
       {gpu && !hideMemory && (
         <div className="sp-section">
-          {breakdown ? (
+          {!vramAvailable ? (
+            <div className="sp-stat"><span className="eyebrow">VRAM</span><span className="mono">—</span></div>
+          ) : breakdown ? (
             <>
               <VramBreakdownBar
                 label={

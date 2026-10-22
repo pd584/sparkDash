@@ -1,6 +1,7 @@
 import { useEffect, useId, useState } from "react";
 import { createPortal } from "react-dom";
 import { useModalPresence } from "../../hooks/useModalPresence";
+import { useOverlayClose } from "../../hooks/useOverlayClose";
 import { useFocusTrap } from "../../hooks/useFocusTrap";
 import { addLauncher, updateLauncher } from "../../api/client";
 import type { LlmLauncher } from "../../api/types";
@@ -37,6 +38,7 @@ export function LlmLauncherDialog({ open, sparkId, sparkName, launcher, onClose,
   const [form, setForm] = useState({ name: "", dir: "", startScript: "start.sh", stopScript: "stop.sh", port: "", notes: "" });
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const overlayClose = useOverlayClose(onClose, !saving);
   const editing = Boolean(launcher);
 
   useEffect(() => {
@@ -99,9 +101,7 @@ export function LlmLauncherDialog({ open, sparkId, sparkName, launcher, onClose,
   return createPortal(
     <div
       className={`modal-overlay${visible ? " is-open" : ""}`}
-      onClick={(e) => {
-        if (!saving && e.target === e.currentTarget) onClose();
-      }}
+      {...overlayClose}
     >
       <div ref={trapRef} className="modal-sheet" role="dialog" aria-modal="true" aria-labelledby={titleId}>
         <div className="modal-sheet__header">

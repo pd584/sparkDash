@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { setConfiguredTimeZone } from "../../shared/timeZone";
 import type { TokenHistoryRow } from "../../api/types";
 import {
   RANGES,
@@ -15,6 +16,7 @@ import {
   entriesFromTotals,
   formatAgo,
   groupBuckets,
+  hitRate,
   lastSeenByModel,
   modelRows,
   pctChange,
@@ -53,6 +55,32 @@ describe("tally", () => {
     expect(cacheRate({ cached: 5, prompt: 4 })).toBe(1);
     expect(cacheRate({ cached: 1, prompt: 4 })).toBe(0.25);
   });
+  it("reports no hit rate when no row measured the cache split", () => {
+    const silent = tallyOf([
+      { sparkId: "a", port: 1, modelId: "m", promptTokens: 100, completionTokens: 10, cachedTokens: 0, cacheReported: false },
+    ]);
+    expect(silent.cacheReported).toBe(false);
+    expect(hitRate(silent)).toBeNull();
+    expect(summarize(silent, [{ key: "2026-10-07", total: 110 }], null).cacheRate).toBeNull();
+    expect(modelRows([{ sparkId: "a", port: 1, modelId: "m", promptTokens: 100, completionTokens: 10, cachedTokens: 0, cacheReported: false }])[0].cacheRate).toBeNull();
+    // A measured zero is still a real 0 % (prefix caching off), not "unknown".
+    const measured = tallyOf([
+      { sparkId: "a", port: 1, modelId: "m", promptTokens: 100, completionTokens: 10, cachedTokens: 0, cacheReported: true },
+    ]);
+    expect(measured.cacheReported).toBe(true);
+    expect(hitRate(measured)).toBe(0);
+  });
+  it("one reporting row is enough, and pre-flag rows keep their old reading", () => {
+    const mixed = tallyOf([
+      { sparkId: "a", port: 1, modelId: "m", promptTokens: 100, completionTokens: 10, cachedTokens: 50, cacheReported: true },
+      { sparkId: "a", port: 1, modelId: "m", promptTokens: 100, completionTokens: 10, cachedTokens: 0, cacheReported: false },
+    ]);
+    expect(mixed.cacheReported).toBe(true);
+    expect(hitRate(mixed)).toBe(0.25);
+    // No flag at all (data from an older server) behaves exactly as before.
+    expect(hitRate(tallyOf([row("2026-10-07")]))).toBeCloseTo(0.4);
+    expect(hitRate(tallyOf([row("2026-10-07", { cachedTokens: 0 })]))).toBe(0);
+  });
   it("handles generated-only rows (missing prompt data)", () => {
     const t = tallyOf([{ sparkId: "a", port: 1, modelId: "m", promptTokens: 0, completionTokens: 40, cachedTokens: 9 }]);
     expect(t).toMatchObject({ generated: 40, prompt: 0, cached: 0, total: 40 });
@@ -80,6 +108,16 @@ describe("keys and labels", () => {
     expect(bucketLabel("2026-10-07", "day")).toBe("7 Oct");
     expect(bucketTitle("2026-10-07", "day")).toBe("Wed 7 Oct 2026 (UTC)");
     expect(bucketTitle("2026-10-07T23", "hour", 120)).toBe("Thu 8 Oct, 01:00–02:00 (local)");
+  });
+  it("shows the minutes of half-hour zones, and follows the Settings time zone", () => {
+    expect(bucketLabel("2026-10-07T14", "hour", 330)).toBe("19:30");
+    expect(bucketTitle("2026-10-07T14", "hour", 330)).toBe("Wed 7 Oct, 19:30–20:30 (local)");
+    setConfiguredTimeZone("Asia/Kolkata");
+    try {
+      expect(bucketLabel("2026-10-07T14", "hour")).toBe("19:30");
+    } finally {
+      setConfiguredTimeZone(null);
+    }
   });
   it("passes malformed keys through", () => {
     expect(bucketLabel("garbage", "day")).toBe("garbage");
@@ -265,6 +303,11 @@ describe("insights", () => {
     const none = buildInsights(ctx([row("2026-10-07", { promptTokens: 0, cachedTokens: 0 })])).join("\n");
     expect(none).not.toContain("prompt tokens were read");
     expect(none).not.toContain("prefix cache");
+  });
+  it("says the counter is missing instead of claiming zero hits", () => {
+    const text = buildInsights(ctx([row("2026-10-07", { cachedTokens: 0, cacheReported: false })])).join("\n");
+    expect(text).toContain("does not publish a prefix-cache counter");
+    expect(text).not.toContain("No prompt tokens were served from the prefix cache");
   });
 });
 

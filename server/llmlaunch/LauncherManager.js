@@ -1,3 +1,4 @@
+import { scrubbedChildEnv } from "./childEnv.js";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
@@ -104,7 +105,12 @@ export function defaultSpawn(spark, cmd, opts = {}) {
   const stdio = [opts.stdin ? "pipe" : "ignore", "pipe", "pipe"];
   if (spark.isLocal) {
     const inv = resolveLocalInvocation(spark, cmd);
-    return spawn(inv.file, inv.args, { stdio, detached: true });
+    return spawn(inv.file, inv.args, { env: scrubbedChildEnv(), stdio, detached: true });
+  }
+  if (spark.platform === "windows") {
+    // Launcher scripts are bash (systemd user units); Windows units run their
+    // LLM servers themselves — surface a clear error instead of a cmd.exe mess.
+    throw new Error(`LLM launcher is not supported on Windows units (${spark.id})`);
   }
   const spec = sshCommandSpec(spark, {
     remoteArgv: [cmd],
@@ -115,10 +121,17 @@ export function defaultSpawn(spark, cmd, opts = {}) {
 }
 
 function defaultExec(spark, cmd, timeoutMs) {
-  if (!spark.isLocal) return sshExec(spark, cmd, { timeoutMs });
+  if (!spark.isLocal) {
+    if (spark.platform === "windows") {
+      return Promise.reject(
+        new Error(`LLM launcher is not supported on Windows units (${spark.id})`)
+      );
+    }
+    return sshExec(spark, cmd, { timeoutMs });
+  }
   const inv = resolveLocalInvocation(spark, cmd);
   return new Promise((resolve, reject) => {
-    execFile(inv.file, inv.args, { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (err, stdout) =>
+    execFile(inv.file, inv.args, { env: scrubbedChildEnv(), timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (err, stdout) =>
       err ? reject(err) : resolve(String(stdout).trim())
     );
   });

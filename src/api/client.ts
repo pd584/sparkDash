@@ -1,13 +1,21 @@
 import type {
+  AlertChannel,
+  AlertTestResult,
+  AlertsConfig,
+  AlertsConfigUpdate,
+  AlertsResponse,
   ActivityEvent,
   ActivityEventsPage,
   EnergyHistory,
+  MonthlyEnergy,
   TokenHistory,
   DecodeBenchJob,
   DecodeBenchListResponse,
   FleetEnergy,
   HealthResponse,
+  InferenceActivity,
   HermesBatchUpdateResponse,
+  GpuClockStatus,
   HermesUpdatesResponse,
   LauncherAction,
   LauncherJob,
@@ -17,6 +25,8 @@ import type {
   LlmLauncherInput,
   LlmMetrics,
   LlmDailyResponse,
+  MetricsHistoryRange,
+  MetricsHistoryResponse,
   Settings,
   ShowcaseListResponse,
   ShowcaseSessionState,
@@ -65,6 +75,11 @@ export function fetchFleetEnergy(): Promise<FleetEnergy> {
   return apiFetch("/api/fleet-energy");
 }
 
+/** Optional, sanitized inference request activity from a configured private source. */
+export function fetchInferenceActivity(): Promise<InferenceActivity> {
+  return apiFetch("/api/inference/activity");
+}
+
 /** Fleet activity log, newest first. */
 export async function fetchEvents(opts?: {
   limit?: number;
@@ -84,6 +99,16 @@ export async function fetchEvents(opts?: {
 export function clearEvents(olderThanMs?: number): Promise<{ removed: number }> {
   const qs = olderThanMs != null ? `?olderThanMs=${Math.floor(olderThanMs)}` : "";
   return apiFetch(`/api/events${qs}`, { method: "DELETE" });
+}
+
+/** Whether this server can restart itself (Docker with a restart policy). */
+export function fetchRestartAvailable(): Promise<{ available: boolean }> {
+  return apiFetch("/api/restart");
+}
+
+/** Ask the server to restart; Docker brings it back a few seconds later. */
+export function restartServer(): Promise<{ restarting: boolean }> {
+  return apiFetch("/api/restart", { method: "POST" });
 }
 
 /** Delete recorded fleet energy: everything, or only minutes older than `olderThanMs`. */
@@ -120,6 +145,11 @@ export function fetchTokenHistory(): Promise<TokenHistory> {
 /** Hourly fleet energy for up to 31 days, per node. */
 export function fetchEnergyHistory(): Promise<EnergyHistory> {
   return apiFetch("/api/fleet-energy/history");
+}
+
+/** Permanent per-month fleet energy (survives resets, restarts and fleet changes). */
+export function fetchMonthlyEnergy(): Promise<MonthlyEnergy> {
+  return apiFetch("/api/fleet-energy/monthly");
 }
 
 /** Latest metrics snapshot for one Spark (includes per-port LLM modelId). */
@@ -347,12 +377,16 @@ export function getQualityBench(
   return apiFetch(`/api/sparks/${id}/llm/quality-bench/${benchId}`);
 }
 
+/** `historyPort` scopes the saved-run list on its own: a port, or "all" for every endpoint on the unit. */
 export function listQualityBench(
   id: string,
-  port?: number
+  port?: number,
+  historyPort?: number | "all"
 ): Promise<QualityBenchListResponse> {
-  const q =
-    port != null && Number.isInteger(port) ? `?port=${encodeURIComponent(port)}` : "";
+  const params = new URLSearchParams();
+  if (port != null && Number.isInteger(port)) params.set("port", String(port));
+  if (historyPort != null) params.set("historyPort", String(historyPort));
+  const q = params.size ? `?${params}` : "";
   return apiFetch(`/api/sparks/${id}/llm/quality-bench${q}`);
 }
 
@@ -553,6 +587,43 @@ export function wakeAllSparks(): Promise<BatchPowerResult> {
   return apiFetch("/api/sparks/wake-all", { method: "POST" });
 }
 
+// ─── GPU clock cap (Spark units) ─────────────────────────
+export function fetchGpuClock(id: string): Promise<GpuClockStatus> {
+  return apiFetch(`/api/sparks/${encodeURIComponent(id)}/gpu-clock`);
+}
+
+/** Command to paste into a terminal on the unit itself: asks for the sudo password there. */
+export function fetchGpuClockCommand(
+  id: string,
+  q: { action: "apply"; maxMHz: number; persist: boolean } | { action: "reset" }
+): Promise<{ command: string }> {
+  const params = new URLSearchParams({ action: q.action });
+  if (q.action === "apply") {
+    params.set("maxMHz", String(q.maxMHz));
+    params.set("persist", q.persist ? "1" : "0");
+  }
+  return apiFetch(`/api/sparks/${encodeURIComponent(id)}/gpu-clock/command?${params}`);
+}
+
+/** Cap the GPU graphics clock now; `persist` also installs the boot service. */
+export function setGpuClock(
+  id: string,
+  body: { maxMHz: number; minMHz?: number; persist: boolean; sudoPassword?: string }
+): Promise<{ success: boolean; capMHz: number; persist: boolean }> {
+  return apiFetch(`/api/sparks/${encodeURIComponent(id)}/gpu-clock`, {
+    method: "PUT",
+    body: JSON.stringify(body),
+  });
+}
+
+/** Remove the cap and the boot service. */
+export function resetGpuClock(id: string, sudoPassword?: string): Promise<{ success: boolean }> {
+  return apiFetch(`/api/sparks/${encodeURIComponent(id)}/gpu-clock`, {
+    method: "DELETE",
+    ...(sudoPassword ? { body: JSON.stringify({ sudoPassword }) } : {}),
+  });
+}
+
 // ─── Hermes update preview ───────────────────────────────
 /** Per-Spark update preview (release + pending commits + resolved view). */
 export function fetchHermesUpdates(id: string): Promise<HermesUpdatesResponse> {
@@ -574,6 +645,33 @@ export function updateSettings(patch: Partial<Settings>): Promise<Settings> {
   return apiFetch("/api/settings", {
     method: "PUT",
     body: JSON.stringify(patch),
+  });
+}
+
+// ─── Alert notifications ─────────────────────────────────
+export function fetchAlerts(): Promise<AlertsResponse> {
+  return apiFetch("/api/alerts");
+}
+
+export function fetchAlertsConfig(): Promise<AlertsConfig> {
+  return apiFetch("/api/alerts/config");
+}
+
+export function updateAlertsConfig(update: AlertsConfigUpdate): Promise<AlertsConfig> {
+  return apiFetch("/api/alerts/config", {
+    method: "PUT",
+    body: JSON.stringify(update),
+  });
+}
+
+/**
+ * Send one test message. With `channel`, the unsaved draft is tested (a masked
+ * URL resolves against `channelId` on the server).
+ */
+export function testAlertChannel(channelId: string | undefined, channel?: AlertChannel): Promise<AlertTestResult> {
+  return apiFetch("/api/alerts/test", {
+    method: "POST",
+    body: JSON.stringify({ channelId, channel }),
   });
 }
 
@@ -734,11 +832,19 @@ export function cancelToolEvalWatch(sparkId: string): Promise<{ success: boolean
 /** Recent GPU history kept by the server (parallel arrays, oldest first; `p` is null where power was unknown). */
 export interface GpuHistoryResponse {
   t: number[];
-  u: number[];
-  c: number[];
+  /** Null where usage / temperature was unknown (e.g. a vendor tool reported no value). */
+  u: Array<number | null>;
+  c: Array<number | null>;
   p: Array<number | null>;
+  /** Per-card series of a multi-GPU host, parallel to `t` (null where the card had no reading). Absent on older servers. */
+  gpus?: Array<{ index: number; name: string | null; u: Array<number | null>; c: Array<number | null>; p: Array<number | null> }>;
 }
 
 export function getGpuHistory(sparkId: string, windowMs: number): Promise<GpuHistoryResponse> {
   return apiFetch<GpuHistoryResponse>(`/api/sparks/${encodeURIComponent(sparkId)}/gpu-history?windowMs=${Math.round(windowMs)}`);
+}
+
+/** The 48 h / 30 d unit history (Settings → Metrics history; `{ enabled: false }` while off). */
+export function getUnitHistory(sparkId: string, range: MetricsHistoryRange): Promise<MetricsHistoryResponse> {
+  return apiFetch<MetricsHistoryResponse>(`/api/sparks/${encodeURIComponent(sparkId)}/history?range=${range}`);
 }

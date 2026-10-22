@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { isolatedConfigEnv } from "../../__tests__/isolatedEnv.js";
 import { once } from "node:events";
 import fs from "node:fs";
 import { mkdtemp } from "node:fs/promises";
@@ -27,6 +28,7 @@ async function startServer(t) {
     cwd: path.resolve(import.meta.dirname, "../../.."),
     env: {
       ...process.env,
+      ...isolatedConfigEnv(tmp),
       HOME: tmp,
       BIND_HOST: "127.0.0.1",
       PORT: String(port),
@@ -36,8 +38,10 @@ async function startServer(t) {
       LLM_DAILY_JSON_PATH: path.join(tmp, "llm-daily.json"),
       LLM_TOKEN_JSON_PATH: path.join(tmp, "llm-tokens.json"),
       FLEET_ENERGY_JSON_PATH: path.join(tmp, "fleet-energy.json"),
+      FLEET_ENERGY_MONTHLY_JSON_PATH: path.join(tmp, "fleet-energy-monthly.json"),
       EVENTS_JSON_PATH: path.join(tmp, "events.json"),
       GPU_HISTORY_JSON_PATH: path.join(tmp, "gpu-history.json"),
+      GPU_HISTORY_LONG_JSON_PATH: path.join(tmp, "gpu-history-long.json"),
       LLM_LAUNCHERS_JSON_PATH: path.join(tmp, "llm-launchers.json"),
       TOOL_EVAL_RUNS_PATH: path.join(tmp, "tool-eval-runs.json"),
       TOOL_EVAL_RESULTS_DIR: path.join(tmp, "tool-eval-results"),
