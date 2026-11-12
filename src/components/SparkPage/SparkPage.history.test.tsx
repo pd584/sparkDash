@@ -11,7 +11,7 @@ vi.mock("./NetworkPanel", () => ({ NetworkPanel: () => null }));
 vi.mock("./TailscalePanel", () => ({ TailscalePanel: () => null }));
 vi.mock("./LlmPanel", () => ({ LlmPanel: () => null }));
 vi.mock("./ComfyPanel", () => ({ ComfyPanel: () => null }));
-vi.mock("./LlmModelsPanel", () => ({ LlmModelsPanel: () => null }));
+vi.mock("./LlmModelsPanel", () => ({ LlmModelsPanel: () => <section data-testid="models" /> }));
 vi.mock("./RocePanel", () => ({ RocePanel: () => null }));
 vi.mock("./UnifiedMemoryPanel", () => ({ UnifiedMemoryPanel: () => null }));
 vi.mock("./SparkHeader", () => ({ SparkHeader: () => null }));
@@ -33,6 +33,13 @@ beforeEach(() => {
 });
 
 describe("SparkPage History panel", () => {
+  it("places one Models control surface on an agent Mac", async () => {
+    const spark = { ...makeSpark(), kind: "mac" as const, macTransport: "agent" as const };
+    const { container } = render(<SparkPage spark={spark} temperatureUnit="celsius" />);
+    await flush();
+    expect(container.querySelectorAll('[data-testid="models"]')).toHaveLength(1);
+    expect(container.textContent).not.toContain("Runtime launcher");
+  });
   it("is absent while the setting is off — the page is unchanged", async () => {
     const { container } = render(<SparkPage spark={makeSpark()} temperatureUnit="celsius" />);
     await flush();
@@ -40,12 +47,15 @@ describe("SparkPage History panel", () => {
     expect(getUnitHistory).not.toHaveBeenCalled();
   });
 
-  it("appears under both columns, full width, with the setting on", async () => {
+  it("closes the hardware column with the setting on, last when the columns stack", async () => {
     const { container } = render(<SparkPage spark={makeSpark()} temperatureUnit="celsius" metricsHistory />);
     await flush();
-    const page = container.querySelector(".sp")!;
-    const panel = [...page.children].at(-1)!;
-    expect(panel.previousElementSibling?.className).toBe("sp-cols");
+    const [hardware] = container.querySelectorAll(".sp-cols > .sp-col");
+    const item = hardware.lastElementChild as HTMLElement;
+    const panel = item.querySelector(".sp-hist")!;
+    expect(panel).not.toBeNull();
+    const orders = [...container.querySelectorAll<HTMLElement>(".sp-item")].map((el) => Number(el.style.getPropertyValue("--o")));
+    expect(Number(item.style.getPropertyValue("--o"))).toBe(Math.max(...orders));
     expect(panel.querySelector(".panel-title")!.textContent).toContain("History · last hour");
     expect(getUnitHistory).toHaveBeenCalledWith("spark-1", "1h");
     expect(container.textContent).toContain("Metrics history is off on the server");

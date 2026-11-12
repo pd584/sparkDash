@@ -2,6 +2,7 @@ import { act } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { MonthlyEnergy } from "./MonthlyEnergy";
 import { flush, render } from "../../testing/render";
+import { setLocale } from "../../i18n";
 import type { MonthlyEnergy as MonthlyEnergyData, MonthlyEnergyMonth } from "../../api/types";
 
 vi.mock("../../api/client", () => ({
@@ -87,6 +88,24 @@ describe("MonthlyEnergy", () => {
     expect(container.querySelector('select[aria-label="Year"]')).toBeTruthy();
   });
 
+  it("shows each month's cost in the year tooltip when a price is set", async () => {
+    fetchMonthly.mockResolvedValue(data([month("2026-01", { a: 3000 }), month("2026-10", { a: 1000 })]));
+    const { container } = render(<MonthlyEnergy nameOf={nameOf} price={0.5} currency="$" />);
+    await flush();
+    const yearButton = [...container.querySelectorAll("button")].find((b) => b.textContent === "Year")!;
+    act(() => yearButton.click());
+    const bars = [...container.querySelectorAll<SVGRectElement>('svg[aria-label="Energy in kWh per month, 2026"] rect[tabindex]')];
+    expect(bars).toHaveLength(12);
+    act(() => {
+      bars[0].dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    });
+    const tip = container.querySelector(".chart__tip");
+    expect(tip?.textContent).toContain("January 2026");
+    expect(tip?.textContent).toContain("3.00 kWh");
+    // 3.00 kWh × $0.50, alongside the kWh the bar already shows.
+    expect(tip?.textContent).toContain("≈ $1.50");
+  });
+
   it("explains an empty archive and a failed load", async () => {
     fetchMonthly.mockResolvedValueOnce(data([]));
     const empty = render(<MonthlyEnergy nameOf={nameOf} price={null} currency="$" />);
@@ -109,5 +128,14 @@ describe("MonthlyEnergy", () => {
     await flush();
     expect(fetchMonthly.mock.calls.length).toBe(calls + 1);
     expect(container.textContent).toContain("9.00 kWh");
+  });
+
+  it("localizes month names in the picker and monthly summary", async () => {
+    fetchMonthly.mockResolvedValue(data([month("2026-10", { a: 1000 })]));
+    const { container } = render(<MonthlyEnergy nameOf={nameOf} price={null} currency="$" />);
+    await flush();
+    await act(() => setLocale("zh-CN"));
+    expect(container.querySelector('select[aria-label="月"]')?.textContent).toContain("2026年10月");
+    expect(container.textContent).toContain("2026年10月 的按节点能耗");
   });
 });

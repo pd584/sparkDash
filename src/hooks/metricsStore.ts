@@ -145,7 +145,10 @@ export function ingestSnapshots(sparks: SparkSnapshot[], at = Date.now()): void 
     const m = s.metrics;
     if (m.gpu) {
       if (m.gpu.metricAvailability?.usage !== false) pushHistory(`${s.id}:gpu.usage`, m.gpu.usage, at);
-      if (m.gpu.metricAvailability?.temperature !== false) pushHistory(`${s.id}:gpu.temp`, m.gpu.temperature, at);
+      // Skip a missing or zero reading. A privileged Mac collector can supply a real one.
+      if (m.gpu.metricAvailability?.temperature !== false && m.gpu.temperature != null && m.gpu.temperature > 0) {
+        pushHistory(`${s.id}:gpu.temp`, m.gpu.temperature, at);
+      }
       const draw = m.gpu.power?.draw;
       const limit = m.gpu.power?.limit;
       if (m.gpu.metricAvailability?.powerDraw !== false && m.gpu.metricAvailability?.powerLimit !== false && draw != null && limit != null && limit > 0) {
@@ -163,9 +166,9 @@ export function ingestSnapshots(sparks: SparkSnapshot[], at = Date.now()): void 
       }
     }
     if (m.cpu) {
-      pushHistory(`${s.id}:cpu.usage`, m.cpu.usage, at);
+      if (m.cpu.usageAvailable !== false) pushHistory(`${s.id}:cpu.usage`, m.cpu.usage, at);
       // Skip 0°C so a missing sensor does not draw a fake floor on the sparkline.
-      if (m.cpu.temperature > 0) {
+      if (m.cpu.temperature != null && m.cpu.temperature > 0) {
         pushHistory(`${s.id}:cpu.temp`, m.cpu.temperature, at);
       }
     }
@@ -179,8 +182,11 @@ export function ingestSnapshots(sparks: SparkSnapshot[], at = Date.now()): void 
         const llm = m.llm[i];
         const port = ports[i];
         const portKey = port != null ? `:${port}` : `:${i}`;
-        pushHistory(`${s.id}:llm${portKey}.tps`, llm.generationTps, at);
-        pushHistory(`${s.id}:llm${portKey}.prefill`, llm.prefillTps, at);
+        // An unreadable poll is a gap in the trend, not a dip to zero.
+        if (llm.measurementValid !== false) {
+          pushHistory(`${s.id}:llm${portKey}.tps`, llm.generationTps, at);
+          pushHistory(`${s.id}:llm${portKey}.prefill`, llm.prefillTps, at);
+        }
         // TTFT is sparse: vLLM reports live TTFT only while serving. It is NOT
         // index-aligned with the tick-dense series above — that is fine because
         // the ttft series feeds only the busy-sample average badge, never the

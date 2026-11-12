@@ -152,4 +152,85 @@ describe("ModelLauncher", () => {
     await flush();
     expect(fetchLaunchers).not.toHaveBeenCalled();
   });
+
+  describe("GPU busy with nothing serving", () => {
+    const clickByText = async (container: HTMLElement, text: string) => {
+      const b = [...container.querySelectorAll<HTMLButtonElement>("button")].find((x) => x.textContent === text)!;
+      await act(async () => b.click());
+    };
+
+    it("names the process holding the GPU instead of claiming something is loading", async () => {
+      fetchLaunchers.mockResolvedValue(list({ a: "stopped", b: "stopped" }));
+      const { container } = render(
+        <ModelLauncher spark={makeSpark("s1")} busy="In use by flare (107.7 GB) · 107.7 GB VRAM in use · GPU 96%" busyHolders />,
+      );
+      await flush();
+      expect(container.textContent).toContain("GPU is in use");
+      expect(container.textContent).toContain("flare (107.7 GB)");
+      expect(container.textContent).toContain("Add LLM port");
+      expect(container.textContent).not.toContain("Something is loading");
+      expect(container.querySelector(".ov-launch__hint--worker")).toBeNull();
+    });
+
+    it("suggests setting Worker role when flagged as part of a multi-node engine", async () => {
+      fetchLaunchers.mockResolvedValue(list({ a: "stopped", b: "stopped" }));
+      const { container } = render(
+        <ModelLauncher
+          spark={makeSpark("s1")}
+          busy="In use by tensorfold (90.0 GB) · 90.0 GB VRAM in use · GPU 95%"
+          busyHolders
+          suggestWorkerRole
+        />,
+      );
+      await flush();
+      expect(container.textContent).toContain("GPU is in use");
+      expect(container.querySelector(".ov-launch__hint--worker")?.textContent).toContain("Worker");
+    });
+
+    it("keeps the loading wording when no process is named", async () => {
+      fetchLaunchers.mockResolvedValue(list({ a: "stopped", b: "stopped" }));
+      const { container } = render(<ModelLauncher spark={makeSpark("s1")} busy="9 GB VRAM in use" />);
+      await flush();
+      expect(container.textContent).toContain("Something is loading");
+    });
+
+    it("asks twice before Start anyway when little memory is free", async () => {
+      fetchLaunchers.mockResolvedValue(list({ a: "stopped", b: "stopped" }));
+      const { container } = render(<ModelLauncher spark={makeSpark("s1")} busy="x" freeMb={7_000} lowFreeMb={8_192} />);
+      await flush();
+      await clickByText(container, "Start anyway…");
+      expect(container.textContent).toContain("probably run out of memory");
+      expect(container.querySelector("button.btn--primary")).toBeNull();
+      await clickByText(container, "Yes, start anyway");
+      expect(container.querySelectorAll("button.btn--primary").length).toBe(2);
+    });
+
+    it("starts anyway after one click when enough memory is free", async () => {
+      fetchLaunchers.mockResolvedValue(list({ a: "stopped", b: "stopped" }));
+      const { container } = render(<ModelLauncher spark={makeSpark("s1")} busy="x" freeMb={40_000} lowFreeMb={8_192} />);
+      await flush();
+      await clickByText(container, "Start anyway…");
+      expect(container.querySelectorAll("button.btn--primary").length).toBe(2);
+    });
+  });
+
+  it("keeps the GPU activity visible when launcher discovery fails", async () => {
+    // Discovery failing says nothing about the GPU: the busy evidence the collector
+    // supplied must not be discarded for a bare "Models unavailable".
+    fetchLaunchers.mockRejectedValue(new Error("launcher discovery unavailable"));
+    const { container } = render(
+      <ModelLauncher spark={makeSpark("busy-no-launchers")} busy="GPU 96% · 90 GB in use" busyHolders />
+    );
+    await flush();
+    expect(container.textContent).toContain("Models unavailable");
+    expect(container.textContent).toContain("GPU 96% · 90 GB in use");
+  });
+
+  it("says only that models are unavailable when there is no activity to report", async () => {
+    fetchLaunchers.mockRejectedValue(new Error("launcher discovery unavailable"));
+    const { container } = render(<ModelLauncher spark={makeSpark("quiet-no-launchers")} />);
+    await flush();
+    expect(container.textContent).toContain("Models unavailable");
+  });
+
 });

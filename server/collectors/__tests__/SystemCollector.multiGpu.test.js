@@ -127,3 +127,16 @@ test("_describeGpus: header label for one, identical, and mixed cards", () => {
   assert.equal(mixed.gpuCount, 2);
   assert.deepEqual(c._describeGpus(""), { gpuChip: null, gpuCount: 0, cudaDriver: null });
 });
+
+test("_parseComputeApps: a command line with commas keeps its memory and GPU fields", () => {
+  const line =
+    "10230, /opt/brave.com/brave/brave --type=gpu-process --enable-features=A,B --field-trial-handle=3,i, 804, GPU-85368d24-8210-aa5a-7f43-a21d11524352";
+  const [app] = collector()._parseComputeApps(line);
+  assert.equal(app.pid, 10230);
+  assert.equal(app.name, "/opt/brave.com/brave/brave --type=gpu-process --enable-features=A,B --field-trial-handle=3,i");
+  assert.equal(app.vramMB, 804);
+  assert.equal(app.gpuUuid, "GPU-85368d24-8210-aa5a-7f43-a21d11524352");
+  // The legacy three-field form (no GPU UUID) still reads.
+  const [legacy] = collector()._parseComputeApps("42, /usr/bin/python3, 512");
+  assert.deepEqual(legacy, { pid: 42, name: "/usr/bin/python3", vramMB: 512, gpuUuid: null });
+});

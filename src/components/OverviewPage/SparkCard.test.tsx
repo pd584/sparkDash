@@ -25,6 +25,39 @@ function head(online: boolean): SparkSnapshot {
 }
 
 describe("SparkCard", () => {
+  it("shows one bar per card on a multi-GPU host, with load, temperature and power under it", () => {
+    const spark = makeSpark("rtx");
+    const card = (index: number, used: number, temperature: number, draw: number) => ({
+      index, name: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", uuid: `GPU-${index}`, temperature, usage: 100,
+      power: { draw, limit: 300 }, vram: { used, total: 97887, percentage: Math.round((used / 97887) * 100), available: 97887 - used },
+    });
+    spark.metrics.gpu = {
+      ...spark.metrics.gpu!, usage: 100, temperature: 81, power: { draw: 600.08, limit: 600 },
+      vram: { used: 59426, total: 195774, percentage: 30, available: 136348 },
+      gpus: [card(0, 52646, 81, 300.04), card(1, 6780, 63, 299.97)],
+    };
+    const { container } = render(<SparkCard spark={spark} temperatureUnit="celsius" />);
+    const bars = [...container.querySelectorAll(".ov-lbl")].map((row) => row.textContent);
+    const stats = [...container.querySelectorAll(".ov-gpu-stats")].map((row) => row.textContent);
+    expect(bars.filter((b) => b?.startsWith("GPU"))).toEqual(["GPU 0 VRAM51.4 / 95.6 GB", "GPU 1 VRAM6.6 / 95.6 GB"]);
+    expect(stats).toEqual(["Load 100%Temp 81°CPower 300 / 300 W", "Load 100%Temp 63°CPower 300 / 300 W"]);
+    // Only the hot card's temperature is marked.
+    expect([...container.querySelectorAll(".ov-gpu-stats__hot")].map((el) => el.textContent)).toEqual(["81°C"]);
+    // No aggregate VRAM, usage, temperature or power rows next to the per-card bars.
+    expect(bars.some((b) => /^(VRAM|GPU temp|GPU power)/.test(b ?? ""))).toBe(false);
+  });
+
+  it("keeps the single GPU rows on a one-GPU unit", () => {
+    const spark = makeSpark("one");
+    spark.metrics.gpu = { ...spark.metrics.gpu!, gpus: [{ index: 0, name: "NVIDIA GB10", uuid: null, temperature: 55, usage: 42, power: { draw: 50, limit: 100 }, vram: { used: 1024, total: 4096, percentage: 25, available: 3072 } }] };
+    const { container } = render(<SparkCard spark={spark} temperatureUnit="celsius" />);
+    const bars = [...container.querySelectorAll(".ov-lbl")].map((row) => row.textContent);
+    expect(bars).toContain("GPU42%");
+    expect(bars).toContain("GPU temp55°C");
+    expect(bars).toContain("GPU power50 / 100 W");
+    expect(bars.some((b) => b?.startsWith("GPU 0"))).toBe(false);
+  });
+
   it.each([null, undefined, 0, 2])("renders queue %s without inventing a zero", (waiting) => {
     const spark = makeSpark("fixture");
     Object.assign(spark.metrics.llm[0], {
@@ -119,5 +152,68 @@ describe("SparkCard", () => {
     expect(container.textContent).not.toContain("big-model");
     expect(container.textContent).toContain("cfg-label");
     expect(container.textContent).toContain("Head is offline");
+  });
+
+  it("an online head with no available probe is unready, not known to have no model", () => {
+    // A head that is cold-starting or switching model produces the same empty probe
+    // state as an idle one, so residency is unknown and must not be asserted.
+    const unready = { ...head(true) } as SparkSnapshot;
+    unready.metrics = {
+      ...unready.metrics,
+      llm: [{ available: false, backend: "vllm", modelId: null, generationTps: 0, prefillTps: 0, contextLength: null }],
+    } as unknown as SparkSnapshot["metrics"];
+    const bare = { ...worker(), workerLabel: "", workerDerivedLabel: "" } as SparkSnapshot;
+    const { container } = render(<SparkCard spark={bare} headSpark={unready} temperatureUnit="celsius" />);
+    expect(container.textContent).not.toContain("No model");
+    expect(container.textContent).toContain("not ready");
+  });
+
+  it("says when no LLM port is watched on the head instead of claiming no model", () => {
+    const unwatched = { ...head(true) } as SparkSnapshot;
+    unwatched.metrics = { ...unwatched.metrics, llm: [] } as unknown as SparkSnapshot["metrics"];
+    const bare = { ...worker(), workerLabel: "", workerDerivedLabel: "" } as SparkSnapshot;
+    const { container } = render(<SparkCard spark={bare} headSpark={unwatched} temperatureUnit="celsius" />);
+    expect(container.textContent).not.toContain("No model");
+    expect(container.textContent).toContain("No LLM port is watched on the head");
+  });
+});
+
+describe("SparkCard per-stream decode rate", () => {
+  it("shows the per-stream rate when the engine reports one", () => {
+    const spark = head(true);
+    Object.assign(spark.metrics.llm[0], { generationTps: 40, perStreamTps: 18.5 });
+    const { container } = render(<SparkCard spark={spark} temperatureUnit="celsius" />);
+    expect(container.textContent).toContain("18.5 tok/s per stream");
+  });
+  it("omits the per-stream line when the engine has no histogram", () => {
+    const spark = head(true);
+    Object.assign(spark.metrics.llm[0], { generationTps: 40, perStreamTps: null });
+    const { container } = render(<SparkCard spark={spark} temperatureUnit="celsius" />);
+    expect(container.textContent).not.toContain("per stream");
+  });
+});
+
+describe("SparkCard effective prefill rate", () => {
+  it("does not present an unavailable live TensorFold prefill as measured zero", () => {
+    const spark = head(true);
+    Object.assign(spark.metrics.llm[0], { backend: "tensorfold", prefillTps: 0, perStreamTps: 40, requestsRunning: 3 });
+    const { container } = render(<SparkCard spark={spark} temperatureUnit="celsius" />);
+    expect(container.textContent).toContain("no live sample");
+    expect(container.textContent).toContain("Decode · total");
+    expect(container.textContent).toContain("40.0 tok/s · completed");
+    expect(container.textContent).not.toContain("tok/s per stream");
+  });
+  it("labels the completed prefill as including cached tokens", () => {
+    const spark = head(true);
+    Object.assign(spark.metrics.llm[0], { backend: "tensorfold", prefillTps: 2813, perStreamPrefillTps: 2813, prefillTpsSource: "completed-effective" });
+    const { container } = render(<SparkCard spark={spark} temperatureUnit="celsius" />);
+    expect(container.textContent).toContain("Prefill · completed");
+    expect(container.textContent).toContain("incl. cached tokens");
+  });
+  it("omits the prefill line when no request has finished", () => {
+    const spark = head(true);
+    Object.assign(spark.metrics.llm[0], { prefillTps: 0, perStreamPrefillTps: null });
+    const { container } = render(<SparkCard spark={spark} temperatureUnit="celsius" />);
+    expect(container.textContent).not.toContain("incl. cached tokens");
   });
 });

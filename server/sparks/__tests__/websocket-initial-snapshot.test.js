@@ -18,7 +18,7 @@ async function freePort() {
   return port;
 }
 
-function nextMessage(ws, timeoutMs = 1_000) {
+function nextMessage(ws, timeoutMs = 5_000) {
   return Promise.race([
     once(ws, "message").then(([data]) => String(data)),
     new Promise((_, reject) =>

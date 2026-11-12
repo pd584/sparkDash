@@ -32,13 +32,19 @@ function isDefaultCpu(cpu) {
  */
 export function memoryReading(snapshot, isFresh = () => true) {
   const m = snapshot?.metrics || {};
-  const unified = snapshot?.kind !== "host";
+  // A macOS host shares one pool too (see memoryModelFor in src/shared/vramBreakdown.ts): judging
+  // it as discrete would compute its free memory as total minus the GPU's share alone, hiding
+  // everything the CPU side holds and charting a Mac near OOM as comfortable.
+  const unified = snapshot?.kind !== "host" || snapshot?.platform === "darwin";
   const um = m.unifiedMemory;
   if (unified && isFresh("memory") && finite(um?.total) && um.total > 0) {
-    const used = Math.max(0, finite(um.gpuUsed) ? um.gpuUsed : 0) +
-      Math.max(0, finite(um.cpuUsed) ? um.cpuUsed : 0);
+    const gpuMB = Math.max(0, finite(um.gpuUsed) ? um.gpuUsed : 0);
+    const sysMB = Math.max(0, finite(um.cpuUsed) ? um.cpuUsed : 0);
+    const used = gpuMB + sysMB;
     const free = finite(um.available) ? Math.max(0, um.available) : Math.max(0, um.total - used);
-    return { usedMB: used, freeMB: free };
+    // Only a unified pool has two owners to split (GPU/model side vs everything else), so only
+    // here can a chart say what consumed the pool. A discrete card's `used` is the GPU's alone.
+    return { usedMB: used, freeMB: free, gpuMB, sysMB };
   }
   const vram = m.gpu?.vram;
   if (!isFresh("gpu") || isDefaultGpu(m.gpu) || !finite(vram?.total) || vram.total <= 0) {
@@ -105,6 +111,14 @@ export function extractSample(snapshot, isFresh = () => true) {
   if (mem) {
     set("memUsedMB", mem.usedMB);
     set("memFreeMB", mem.freeMB);
+    set("memGpuMB", mem.gpuMB);
+    set("memSysMB", mem.sysMB);
+  }
+
+  // Unlike legacy memFreeMB, this has no GPU or total-minus-used fallback.
+  const um = m.unifiedMemory;
+  if (isFresh("memory") && um?.availableSource === "linux-memavailable" && finite(um.available) && um.available >= 0) {
+    set("memAvailableMB", um.available);
   }
 
   const cpu = m.cpu;
@@ -132,6 +146,8 @@ export function extractSample(snapshot, isFresh = () => true) {
     m.llm.forEach((entry, i) => {
       const port = Number.isInteger(entry?.port) ? entry.port : ports[i];
       if (!Number.isInteger(port) || !ports.includes(port) || entry?.available !== true) return;
+      // The endpoint answered but its stats could not be read: a gap, not a zero rate.
+      if (entry.measurementValid === false) return;
       set(llmKey(port, "genTps"), entry.generationTps);
       set(llmKey(port, "prefillTps"), entry.prefillTps);
       if (finite(entry.kvCacheUsage)) {

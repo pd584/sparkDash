@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useId, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import type { HistoryStat } from "../../api/types";
 import "../../styles/charts.css";
@@ -19,7 +20,47 @@ const PAD_Y = 3;
 /** Consecutive buckets further apart than this many steps are a gap. */
 const GAP_STEPS = 1.5;
 
+/** avg / peak / low over the buckets that carry samples in the visible window. */
+export interface WindowStats {
+  avg: number | null;
+  peak: number | null;
+  low: number | null;
+  /** True when some bucket had no `min`, so `low` is the lowest bucket average. */
+  lowFromAvg: boolean;
+}
+
+/**
+ * Window summary for one series. `avg` is the mean of the bucket averages (every range
+ * returns uniform-width buckets, so that is the time-weighted mean; a partial newest
+ * bucket only skews it slightly). `peak` is the largest bucket max. `low` is the smallest
+ * bucket min where the server keeps one — today only memory headroom does — and otherwise
+ * the lowest bucket average, flagged so the label can say which it is.
+ */
+export function windowStats(values: ReadonlyArray<HistoryStat | null>): WindowStats {
+  let sum = 0;
+  let n = 0;
+  let peak = -Infinity;
+  let low = Infinity;
+  let missingMin = 0;
+  for (const st of values) {
+    if (!st) continue;
+    n += 1;
+    sum += st.avg;
+    if (st.max > peak) peak = st.max;
+    if (typeof st.min === "number" && Number.isFinite(st.min)) {
+      if (st.min < low) low = st.min;
+    } else {
+      missingMin += 1;
+      if (st.avg < low) low = st.avg;
+    }
+  }
+  if (n === 0) return { avg: null, peak: null, low: null, lowFromAvg: false };
+  return { avg: sum / n, peak, low, lowFromAvg: missingMin > 0 };
+}
+
 export interface HistoryChartSeries {
+  /** Configuration values remain steps, not interpolated intermediate configurations. */
+  step?: boolean;
   key: string;
   label: string;
   /** A theme token, e.g. `var(--color-accent)`. */
@@ -52,6 +93,8 @@ export interface HistoryChartProps {
   /** Round an auto y range to this unit (1024 for MB → whole GB, 5 for degrees). */
   yUnit?: number;
   thresholds?: readonly HistoryThreshold[];
+  /** Quantiles and ratios must not get a mean-of-bucket-values window summary. */
+  showWindowSummary?: boolean;
   /** The shared crosshair timestamp, or null. */
   cursorT: number | null;
   onCursor: (t: number | null) => void;
@@ -173,11 +216,13 @@ export function HistoryChart({
   yMax,
   yUnit,
   thresholds = [],
+  showWindowSummary = true,
   cursorT,
   onCursor,
   formatTime,
   formatAxisTime,
 }: HistoryChartProps) {
+  const { t } = useTranslation("hardware");
   const plotRef = useRef<HTMLDivElement>(null);
   /** This chart is the one under the pointer / keyboard focus: it shows the tooltip. */
   const [active, setActive] = useState(false);
@@ -233,13 +278,22 @@ export function HistoryChart({
   const crossPct = crossX != null ? (crossX / VIEW_W) * 100 : null;
   const showTooltip = hasCursor && active;
 
+  // One window summary per series, computed once: the stats row under the header
+  // and the tooltip's summary line read the same numbers.
+  const windowRows = (showWindowSummary ? series : []).flatMap((s) => {
+    const w = windowStats(s.values);
+    return w.avg == null
+      ? []
+      : [{ series: s, avg: w.avg, peak: w.peak, low: w.low, lowFromAvg: w.lowFromAvg }];
+  });
+
   const point = (i: number, v: number) => `${xOf(timeline[i]).toFixed(2)},${yOf(v).toFixed(2)}`;
 
   return (
     <div className="sp-hist-chart" data-chart={id}>
-      <div className="sp-hist-chart__head">
+      <div className="sp-hist-chart__head" style={{ flexWrap: "wrap" }}>
         <span className="eyebrow sp-clip">{title}</span>
-        <span className="sp-hist-chart__readouts mono">
+        <span className="sp-hist-chart__readouts mono" style={{ flexWrap: "wrap", minWidth: 0, maxWidth: "100%" }}>
           {series.map((s) => {
             const v = readIdx != null ? s.values[readIdx] : null;
             return (
@@ -251,6 +305,27 @@ export function HistoryChart({
           })}
         </span>
       </div>
+      <div className="sp-hist-chart__stats mono" aria-label={t("history.windowSummary")}>
+        {windowRows.map(({ series: s, avg, peak, low, lowFromAvg }) => (
+          <span key={s.key} className="sp-hist-chart__stat" data-stat={s.key}>
+            {series.length > 1 && <small>{s.label}</small>}
+            <span>{t("history.average", { value: format(avg) })}</span>
+            <span>{t("history.peak", { value: format(peak ?? avg) })}</span>
+            {low != null && (
+              <span
+                title={
+                  lowFromAvg
+                    ? t("history.lowFromAverage")
+                    : undefined
+                }
+              >
+                {t("history.low", { value: format(low) })}
+                {lowFromAvg ? "*" : ""}
+              </span>
+            )}
+          </span>
+        ))}
+      </div>
       <div className="sp-hist-chart__body">
         <div className="sp-hist-chart__yaxis mono" style={{ height: VIEW_H }} aria-hidden="true">
           <span data-axis="ymax">{domain ? format(domain.hi) : ""}</span>
@@ -261,7 +336,7 @@ export function HistoryChart({
           className="sp-hist-chart__plot"
           tabIndex={domain ? 0 : -1}
           role="group"
-          aria-label={`${title} from ${formatTime(from)} to ${formatTime(to)}. Use the arrow keys to read values; Escape clears.`}
+          aria-label={t("history.chartAria", { title, from: formatTime(from), to: formatTime(to) })}
           aria-describedby={showTooltip ? tooltipId : undefined}
           onKeyDown={onKeyDown}
           onPointerMove={onPointerMove}
@@ -314,7 +389,9 @@ export function HistoryChart({
             {domain &&
               series.map((s) =>
                 segmentRuns(timeline, s.values, stepMs).map((run, r) => {
-                  const avgPts = run.map((i) => point(i, s.values[i]!.avg));
+                  const avgPts = run.flatMap((i, k) => s.step && k > 0
+                    ? [point(i, s.values[run[k - 1]]!.avg), point(i, s.values[i]!.avg)]
+                    : [point(i, s.values[i]!.avg)]);
                   const bandPts = s.band
                     ? run.map((i) => {
                         const v = s.values[i]!;
@@ -401,7 +478,7 @@ export function HistoryChart({
                 />
               );
             })}
-          {!domain && <p className="chart__empty">No data in this range</p>}
+          {!domain && <p className="chart__empty">{t("history.chartEmpty")}</p>}
           {showTooltip && crossPct != null && (
             <div
               id={tooltipId}
@@ -431,11 +508,38 @@ export function HistoryChart({
                     .map((s) => {
                       const v = s.values[cursorIdx];
                       if (!v || !s.band) return null;
-                      const edge = s.band === "max" ? `max ${format(v.max)}` : v.min != null ? `min ${format(v.min)}` : null;
+                      const edge = s.band === "max" ? t("history.maximum", { value: format(v.max) }) : v.min != null ? t("history.minimum", { value: format(v.min) }) : null;
                       return edge && (series.length > 1 ? `${s.label} ${edge}` : edge);
                     })
                     .filter(Boolean)
                     .join(" · ")}
+                </div>
+              )}
+              {windowRows.length > 0 && (
+                <div className="chart__tip-foot sp-hist-chart__tip-window" data-window-summary="">
+                  {windowRows.map(({ series: s, avg, peak, low, lowFromAvg }) => {
+                    const parts = [t("history.average", { value: format(avg) }), t("history.peak", { value: format(peak ?? avg) })];
+                    if (low != null) parts.push(`${t("history.low", { value: format(low) })}${lowFromAvg ? "*" : ""}`);
+                    return (
+                      <div
+                        key={s.key}
+                        className="sp-hist-chart__tip-window-row"
+                        title={
+                          lowFromAvg
+                            ? t("history.lowFromAverageTitle")
+                            : undefined
+                        }
+                      >
+                        <span className="sp-hist-chart__tip-window-tag">{t("history.window")}</span>{" "}
+                        {series.length > 1 && (
+                          <>
+                            <span className="sp-hist-chart__tip-window-series">{s.label}</span>{" "}
+                          </>
+                        )}
+                        <span>{parts.join(" · ")}</span>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>

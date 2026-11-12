@@ -3,6 +3,7 @@ import boltSvg from "../../../assets/bolt.svg?raw";
 import type { DecodeBenchJob, PrefillBenchJob, QualityBenchJob } from "../../api/types";
 import {
   BOLT_POINTS,
+  DEFAULT_SHARE_CARD_LABELS,
   SHARE_CARD_MIN_HEIGHT,
   SHARE_CARD_WIDTH,
   buildDecodeShareCard,
@@ -153,6 +154,14 @@ function fakeContext(
 }
 
 describe("share card model", () => {
+  it("names the start context in the decode meta line only when one was set", () => {
+    const base = decodeJob();
+    const deep = decodeJob({ config: { ...base.config, contextTokens: 131072 } });
+    expect(buildDecodeShareCard(deep, { llmPort: 8888, modelId: "m", sparkName: "s" }).meta).toBe(
+      "Prose · 400 tok · temp 0 · thinking off · 128k start ctx · 1, 2 conc · 27.8 s"
+    );
+  });
+
   it("mirrors the decode table: sorted rows, aggregate + stream tok/s, TTFT and streams", () => {
     const job = decodeJob({ results: [decodeResult({ concurrency: 2, streamsOk: 1, streamsFailed: 1, aggregateDecodeTps: 56.83, meanDecodeTps: 28.6, meanTtftMs: 399 })] });
     const card = buildDecodeShareCard(job, { llmPort: 8888, modelId: "DeepSeek-v4.1-Flash-EXL3", sparkName: "spark-38bd" }, Date.UTC(2026, 8, 17));
@@ -172,6 +181,22 @@ describe("share card model", () => {
       primaryUnit: "tok/s",
       tone: "ok",
     });
+  });
+
+  it("changes localized card chrome without changing measured values or layout inputs", () => {
+    const job = decodeJob();
+    const english = buildDecodeShareCard(job, { llmPort: 8888, modelId: "raw/model:Q4" });
+    const chinese = buildDecodeShareCard(job, {
+      llmPort: 8888,
+      modelId: "raw/model:Q4",
+      labels: { ...DEFAULT_SHARE_CARD_LABELS, decodeTitle: "解码基准测试", load: "负载", aggregate: "总计", stream: "单流", completed: "已完成" },
+    });
+    expect(chinese.title).toBe("解码基准测试");
+    expect(chinese.columns).toEqual({ load: "负载", primary: "总计", secondary: "单流" });
+    expect(chinese.status.label).toBe("已完成");
+    expect(chinese.subtitle).toContain("raw/model:Q4");
+    expect(chinese.rows).toEqual(english.rows);
+    expect(shareCardHeight(chinese)).toBe(shareCardHeight(english));
   });
 
   it("sorts decode rows by concurrency regardless of arrival order", () => {
@@ -480,6 +505,15 @@ describe("copy formats", () => {
     expect(canvas.height).toBe(shareCardHeight(model) * 2);
   });
 
+  it("reports a blank bitmap as a failed render instead of encoding an empty card", async () => {
+    const { canvas, ctx } = fakeCanvas();
+    (ctx as unknown as { getImageData: () => ImageData }).getImageData = () => ({ data: new Uint8ClampedArray([0, 0, 0, 0]) }) as unknown as ImageData;
+    expect(await renderShareCardPng(model, { createCanvas: () => canvas })).toBeNull();
+    const painted = fakeCanvas();
+    (painted.ctx as unknown as { getImageData: () => ImageData }).getImageData = () => ({ data: new Uint8ClampedArray([10, 12, 15, 255]) }) as unknown as ImageData;
+    expect(await renderShareCardPng(model, { createCanvas: () => painted.canvas })).not.toBeNull();
+  });
+
   it("copies text through the async clipboard", async () => {
     const writeText = vi.fn(async () => {});
     await copyTextOnly("summary text", { writeText });
@@ -558,7 +592,7 @@ describe("quality share card", () => {
     expect(m.quality?.overall).toBe(91.2);
     expect(m.quality?.tiles.map((t) => [t.label, t.pct, t.detail])).toEqual([
       ["QA", 90, "45/50 items"],
-      ["GSM8K", 50, "10/20 items"],
+      ["GSM8K (Platinum)", 50, "10/20 items"],
     ]);
     expect(m.quality?.summary).toBe("2 categories · 70 items · 1m 0s");
     expect([m.quality?.modelName, m.quality?.target, m.quality?.runLabel]).toEqual(["m", "Port 8888", "fp8"]);
@@ -616,7 +650,7 @@ describe("tool eval share card", () => {
   const run = { status: "completed" as const, startedAt: 1_000, finishedAt: 125_000, model: null };
 
   it("carries the headline numbers, the outcome split and a tile per category", () => {
-    const m = buildToolEvalShareCard(result(), run, { sparkName: "spark-38bd" }, Date.UTC(2026, 8, 17, 12));
+    const m = buildToolEvalShareCard(result(), run, { sparkName: "spark-38bd" }, new Date(2026, 8, 17, 12).getTime());
     const te = m.toolEval!;
     expect([m.title, m.host, m.status.label]).toEqual(["Tool Eval Bench", "spark-38bd", "COMPLETED"]);
     expect([te.score, te.rating, te.stars, te.modelName]).toEqual([82.46, "Good", 4, "org/model"]);
@@ -632,6 +666,14 @@ describe("tool eval share card", () => {
       { id: "B", name: "Params", pct: 20, detail: "" },
     ]);
     expect(shareCardFileName(m, "tool-eval")).toBe("sparkdash-tool-eval-spark-38bd-2026-09-17.png");
+  });
+
+  it("preserves STOPPED for tool runs and keeps cancelled benchmark status separate", () => {
+    const stopped = { ...run, status: "stopped" as const };
+    expect(buildToolEvalShareCard(result(), stopped, {}, 0).status).toEqual({ label: "STOPPED", tone: "warn" });
+    const labels = { ...DEFAULT_SHARE_CARD_LABELS, stopped: "已停止" };
+    expect(buildToolEvalShareCard(result(), stopped, { labels }, 0).status.label).toBe("已停止");
+    expect(shareCardStatus("cancelled").label).toBe("CANCELLED");
   });
 
   it("falls back to the score tier and the run's model when the result has no rating or model", () => {
@@ -671,6 +713,25 @@ describe("tool eval share card", () => {
     expect(shareCardHeight(sixteen)).toBeGreaterThan(shareCardHeight(m));
   });
 
+  it("uses optional caller labels for hand-painted card chrome without changing raw safety text", () => {
+    const labels = {
+      ...DEFAULT_SHARE_CARD_LABELS,
+      toolEvalBench: "工具评测",
+      score: "得分",
+      scenarioOutcomes: "场景结果",
+      safetyWarnings: (count: number) => `安全警告 ${count}`,
+      more: (count: number) => `另有 ${count} 项`,
+    };
+    const m = buildToolEvalShareCard(result({ safety_warnings: ["raw warning"] }), run, { labels }, 0);
+    const ctx = fakeContext();
+    paintShareCard(ctx, m, "dark");
+    expect(ctx.texts).toContain("工具评测");
+    expect(ctx.texts).toContain("得分");
+    expect(ctx.texts).toContain("场景结果");
+    expect(ctx.texts).toContain("安全警告 1");
+    expect(ctx.texts).toContain("•  raw warning");
+  });
+
   it("copes with a result that has no score, no categories and no model", () => {
     const r = normalizeToolResult({ scores: { scenario_results: [{ scenario_id: "x", status: "pass" }] } })!;
     const m = buildToolEvalShareCard(r, { ...run, finishedAt: null }, {}, 0);
@@ -699,7 +760,8 @@ describe("tool eval comparison card", () => {
       },
       ...over,
     })!;
-  const run = { label: "", startedAt: Date.UTC(2026, 8, 10), model: null, baseUrl: "http://x", options: {}, type: "tool-eval" };
+  // Local noon: shareCardDate formats in local time, so a UTC-midnight start is the 9th west of UTC.
+  const run = { label: "", startedAt: new Date(2026, 8, 10, 12).getTime(), model: null, baseUrl: "http://x", options: {}, type: "tool-eval" };
   const a = () => side(60, [50, 80], ["pass", "fail", "partial", "pass"]);
   const b = () => side(72.5, [70, 75], ["pass", "pass", "fail", "pass"], { deployability: 71, responsiveness: 85 });
 

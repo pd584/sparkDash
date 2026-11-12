@@ -23,9 +23,22 @@ describe("history rows", () => {
     } as unknown as DecodeBenchJob;
     const row = decodeHistoryRow(job);
     expect(row.headline).toBe("90.0 tok/s");
-    expect(row.detail).toBe("peak at ×4 · 30.0/stream at ×1");
+    expect(row.detail).toBe("peak at ×4 · 30.0/stream at ×1 · temp 0 · thinking off");
     expect(row.label).toBe("×1, 4");
     expect(row.model).toBe("qwen");
+  });
+
+  it("decode names the start context only when one was set", () => {
+    const job = (contextTokens?: number) =>
+      ({
+        benchId: "d3",
+        startedAt: 1,
+        status: "completed",
+        config: { concurrencies: [4], modelId: "qwen", ...(contextTokens ? { contextTokens } : {}) },
+        results: [level(4, 90, 25)],
+      }) as unknown as DecodeBenchJob;
+    expect(decodeHistoryRow(job(131072)).detail).toBe("peak at ×4 · temp 0 · thinking off · 128k start ctx");
+    expect(decodeHistoryRow(job()).detail).not.toContain("start ctx");
   });
 
   it("decode shows a dash when nothing decoded", () => {
@@ -60,12 +73,16 @@ describe("history rows", () => {
       benchId: "q1",
       startedAt: 1,
       status: "completed",
-      config: { label: "fp4 KV", modelId: "m" },
-      results: { overallPct: 71.234, categories: { qa: {}, code: {} } },
+      config: { label: "fp4 KV", modelId: "m", profile: "default" },
+      results: { overallPct: 71.234, overallCi: [66.1, 75.9], categories: { qa: {}, code: {} } },
     } as unknown as QualityBenchJob;
     const row = qualityHistoryRow(job);
     expect(row.headline).toBe("71.2%");
     expect(row.label).toBe("fp4 KV");
-    expect(row.detail).toBe("2 categories");
+    expect(row.detail).toBe("2 categories · 66.1–75.9 · suite v1 · scoring v1");
+    // WP1: a partial run (custom categories, or saved before profiles) carries no headline.
+    const partial = { ...job, config: { label: "qa only", modelId: "m", categories: ["qa"] } } as unknown as QualityBenchJob;
+    expect(qualityHistoryRow(partial).headline).toBe("—");
+    expect(qualityHistoryRow(partial).detail).toBe("2 categories · suite v1 · scoring v1");
   });
 });

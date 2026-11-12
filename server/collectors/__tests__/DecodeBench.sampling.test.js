@@ -15,7 +15,7 @@ function startAndCancel(extra) {
   return config;
 }
 
-test("decode bench defaults to temperature 0.7, with thinking on for prose only", () => {
+test("decode bench defaults to temperature 0.7, with thinking on for every type", () => {
   assert.equal(DECODE_BENCH_DEFAULTS.defaultTemperature, 0.7);
   assert.equal(DECODE_BENCH_DEFAULTS.defaultThinking, true);
   const prose = startAndCancel({ promptType: "prose" });
@@ -23,17 +23,18 @@ test("decode bench defaults to temperature 0.7, with thinking on for prose only"
   assert.equal(prose.thinking, true);
   const structured = startAndCancel({});
   assert.equal(structured.temperature, 0.7);
-  assert.equal(structured.thinking, false);
+  assert.equal(structured.thinking, true);
 });
 
-test("temperature can be chosen per run, thinking only for prose", () => {
+test("temperature and thinking can be chosen per run for every type", () => {
   const off = startAndCancel({ promptType: "prose", temperature: 0, thinking: false });
   assert.equal(off.temperature, 0);
   assert.equal(off.thinking, false);
   const on = startAndCancel({ promptType: "prose", thinking: true });
   assert.equal(on.thinking, true);
   for (const promptType of ["structured", "code", "json"]) {
-    assert.equal(startAndCancel({ promptType, thinking: true }).thinking, false, promptType);
+    assert.equal(startAndCancel({ promptType, thinking: true }).thinking, true, promptType);
+    assert.equal(startAndCancel({ promptType, thinking: false }).thinking, false, promptType);
   }
 });
 

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useTranslation } from "react-i18next";
 import "../../styles/dialogs.css";
 import {
   cancelPrefillBench,
@@ -14,13 +15,14 @@ import { BenchCopyButton } from "./BenchCopyButton";
 import { BenchSwitcher, type BenchKind } from "./BenchSwitcher";
 import { XIcon } from "../ui/icons";
 import { buildPrefillShareCard, shareCardFileName } from "./benchShareCard";
+import { useShareCardLabels } from "../bench/tooleval/shareCardLabels";
 import {
   PREFILL_CONTEXT_SIZES,
   PREFILL_DEFAULT_CONTEXT_SIZES,
-  PREFILL_MAX_CONTEXT_SIZE,
   PREFILL_MIN_CONTEXT_SIZE,
   formatContextSize,
   parseContextSize,
+  prefillCeilingFor,
 } from "../../shared/prefillBench.js";
 import { prefillFitsContext } from "../../shared/contextFit.js";
 import { HistoryTable, PageCard, PageEmpty, PageLayout } from "../bench/sparkdash/pageParts";
@@ -148,9 +150,10 @@ function prefillTitle(r: PrefillRow): string | undefined {
 }
 
 function ResultRow({ r, max }: { r: PrefillRow; max: number }) {
+  const { t } = useTranslation("benchmarks");
   const failed = rowFailed(r);
   const partial = rowPartial(r);
-  const reason = r.error || "No prefill rate was measured";
+  const reason = r.error || t("prefill.noRate");
   // A failed row has no bar at all (a 2% sliver reads as "very slow", not "failed").
   const pct = !failed && max > 0 ? Math.max(2, Math.round((r.prefillTps / max) * 100)) : 0;
   return (
@@ -159,23 +162,23 @@ function ResultRow({ r, max }: { r: PrefillRow; max: number }) {
         <span className="bench-result-row__badge">{formatContextSize(r.targetTokens)}</span>
         <div className="bench-result-row__facts">
           <span>
-            TTFT <strong>{r.ttftMs > 0 ? formatTtft(r.ttftMs) : "—"}</strong>
+            {t("prefill.ttft")} <strong>{r.ttftMs > 0 ? formatTtft(r.ttftMs) : "—"}</strong>
           </span>
           <span className="bench-result-row__sep" aria-hidden>
             ·
           </span>
           <span>
             <strong>{r.promptTokens > 0 ? r.promptTokens.toLocaleString() : "—"}</strong>{" "}
-            tokens
+            {t("prefill.tokens")}
           </span>
         </div>
       </div>
 
       <div className="bench-result-row__speeds">
         <div className="bench-result-row__metric">
-          <span className="bench-result-row__label">Prefill</span>
+          <span className="bench-result-row__label">{t("catalog.prefill.label")}</span>
           {failed ? (
-            <span className="bench-result-row__value">failed</span>
+            <span className="bench-result-row__value">{t("prefill.failed")}</span>
           ) : (
             <span className="bench-result-row__value bench-result-row__value--accent">
               {r.prefillTps.toFixed(1)}
@@ -184,7 +187,7 @@ function ResultRow({ r, max }: { r: PrefillRow; max: number }) {
           )}
         </div>
         <div className="bench-result-row__metric">
-          <span className="bench-result-row__label">TTFT</span>
+          <span className="bench-result-row__label">{t("prefill.ttft")}</span>
           <span className="bench-result-row__value">{r.ttftMs > 0 ? formatTtft(r.ttftMs) : "—"}</span>
         </div>
       </div>
@@ -226,6 +229,9 @@ export function PrefillBenchDialog({
   posture = null,
   onSwitchBench,
 }: PrefillBenchDialogProps) {
+  const { t } = useTranslation("benchmarks");
+  const shareCardLabels = useShareCardLabels();
+  const historyLabels = { peakAt: t("history.peakAt"), streamAtOne: t("history.streamAtOne"), startContext: t("history.startContext"), bestAt: t("history.bestAt"), category: t("history.category"), categories: t("history.categories") };
   const isPage = variant === "page";
   const open = isPage || openProp;
   const [history, setHistory] = useState<PrefillBenchJob[]>([]);
@@ -373,6 +379,9 @@ export function PrefillBenchDialog({
     []
   );
 
+  // The model's context is the real ceiling: the presets stop at 300k, but a long-context model
+  // may be asked for more by typing it out (#343).
+  const ceiling = prefillCeilingFor(contextLength);
   const sizeFits = (n: number) => prefillFitsContext(n, contextLength);
 
   const toggleSize = (n: number) => {
@@ -388,16 +397,19 @@ export function PrefillBenchDialog({
 
   const addCustomSize = () => {
     if (isRunning || starting) return;
-    const n = parseContextSize(customDraft);
+    const n = parseContextSize(customDraft, ceiling);
     if (n == null) {
       setError(
-        `Custom size must be an integer between ${PREFILL_MIN_CONTEXT_SIZE.toLocaleString()} and ${PREFILL_MAX_CONTEXT_SIZE.toLocaleString()} tokens`
+        t("prefill.errorCustomSize", {
+          min: PREFILL_MIN_CONTEXT_SIZE.toLocaleString(),
+          max: ceiling.toLocaleString(),
+        })
       );
       return;
     }
     if (!sizeFits(n)) {
       setError(
-        `Custom size plus template and reply does not fit the model context (${contextLength?.toLocaleString()} tokens)`
+        t("prefill.errorDoesNotFit", { context: contextLength?.toLocaleString() })
       );
       return;
     }
@@ -434,7 +446,7 @@ export function PrefillBenchDialog({
     if (startLockRef.current) return;
     const sizes = selected.filter(sizeFits);
     if (sizes.length === 0) {
-      setError("Select at least one context size that fits this model");
+      setError(t("prefill.errorSelectFittingSize"));
       return;
     }
     startLockRef.current = true;
@@ -515,8 +527,8 @@ export function PrefillBenchDialog({
   const showResults = job && job.status !== "running";
   const ctxHint =
     contextLength != null && contextLength > 0
-      ? `Model context ${formatContextSize(contextLength)} — larger sizes are disabled.`
-      : "Unique-prefix prompts; TTFT is time to first token. 128k–300k can take tens of minutes.";
+      ? t("prefill.contextLimit", { context: formatContextSize(contextLength) })
+      : t("prefill.contextUnknownHint");
 
   const configNode = (
     <>
@@ -524,10 +536,10 @@ export function PrefillBenchDialog({
             <section className="bench-sheet__section">
               <div className="bench-field">
                 <div className="bench-field__head">
-                  <h3 className="bench-sheet__section-title">Context size</h3>
-                  <p className="bench-sheet__hint">{ctxHint} Type a custom token count to add it.</p>
+                  <h3 className="bench-sheet__section-title">{t("prefill.contextSize")}</h3>
+                  <p className="bench-sheet__hint">{ctxHint} {t("prefill.contextHint")}</p>
                 </div>
-                <div className="bench-conc-grid" role="group" aria-label="Context sizes">
+                <div className="bench-conc-grid" role="group" aria-label={t("prefill.contextSizes")}>
                   {PREFILL_CONTEXT_SIZES.map((n: number) => {
                     const on = selected.includes(n);
                     const fits = sizeFits(n);
@@ -539,8 +551,8 @@ export function PrefillBenchDialog({
                         aria-pressed={on}
                         title={
                           fits
-                            ? `${n.toLocaleString()} tokens`
-                            : `Does not fit the model context (${contextLength?.toLocaleString()} tokens) once the template and reply are added`
+                            ? t("prefill.contextOption", { count: n.toLocaleString() })
+                            : t("prefill.contextTooLarge", { context: contextLength?.toLocaleString() })
                         }
                         onClick={() => toggleSize(n)}
                         className={`bench-conc-btn${on ? " is-on" : ""}`}
@@ -570,15 +582,16 @@ export function PrefillBenchDialog({
                   <input
                     id="prefill-custom-size"
                     type="text"
-                    inputMode="numeric"
-                    pattern="[0-9]*"
+                    inputMode="text"
+                    pattern="[0-9]+(\.[0-9]+)?[kKmM]?"
                     disabled={isRunning || starting}
                     value={customDraft}
-                    placeholder="Custom"
-                    aria-label="Custom context size in tokens"
+                    placeholder={t("prefill.custom")}
+                    aria-label={t("prefill.customAria")}
                     onChange={(e) => {
                       const raw = e.target.value;
-                      if (raw === "" || /^\d+$/.test(raw)) setCustomDraft(raw);
+                      // Digits, or the k/m suffix the hint suggests ("200k", "1m").
+                      if (raw === "" || /^\d+(?:\.\d+)?\s*[km]?$/i.test(raw)) setCustomDraft(raw);
                     }}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") {
@@ -595,7 +608,7 @@ export function PrefillBenchDialog({
                     disabled={isRunning || starting || customDraft.trim() === ""}
                     onClick={addCustomSize}
                   >
-                    Add
+                    {t("prefill.add")}
                   </button>
                 </div>
               </div>
@@ -611,7 +624,7 @@ export function PrefillBenchDialog({
               <div className="bench-progress">
                 <div className="bench-progress__row">
                   <span className="bench-progress__status" role="status" aria-live="polite">
-                    Running
+                    {t("dialog.running")}
                     {job.progress.currentContext != null
                       ? ` · ${formatContextSize(job.progress.currentContext)}`
                       : ""}
@@ -624,7 +637,7 @@ export function PrefillBenchDialog({
                 <div
                   className="bench-progress__track"
                   role="progressbar"
-                  aria-label="Prefill benchmark progress"
+                  aria-label={t("prefill.progressAria")}
                   aria-valuemin={0}
                   aria-valuemax={100}
                   aria-valuenow={Math.min(100, progressPct)}
@@ -641,7 +654,7 @@ export function PrefillBenchDialog({
               </div>
               {job.results.length > 0 && (
                 <div className="bench-results">
-                  <div className="bench-results__caption">Completed sizes</div>
+                  <div className="bench-results__caption">{t("prefill.completedSizes")}</div>
                   {job.results.map((r) => (
                     <ResultRow key={r.targetTokens} r={r} max={maxPrefill} />
                   ))}
@@ -671,10 +684,10 @@ export function PrefillBenchDialog({
               {job.results.length > 0 && (
                 <div className="bench-results bench-results--table">
                   <div className="bench-results__head" aria-hidden="true">
-                    <span>Context</span>
+                    <span>{t("prefill.context")}</span>
                     <span className="bench-results__head-speeds">
-                      <span>Prefill</span>
-                      <span>TTFT</span>
+                      <span>{t("catalog.prefill.label")}</span>
+                      <span>{t("prefill.ttft")}</span>
                     </span>
                   </div>
                   {job.results.map((r) => (
@@ -685,14 +698,7 @@ export function PrefillBenchDialog({
 
               {job.results.length > 0 && (
                 <p className="bench-legend">
-                  <strong>Prefill</strong> — the server&apos;s own prompt-processing timing when it
-                  reports one, otherwise tokens computed ÷ (TTFT − calibrated request overhead),
-                  with prefix-cache hits excluded and the correction capped at half the TTFT.{" "}
-                  <strong>TTFT</strong> — request start to first streamed token. Tokens, TTFT and
-                  tok/s are from the median-rate sample of each size. Each size uses a unique
-                  prefix so prefix-cache does not inflate later sizes.{" "}
-                  <strong>Low confidence</strong> — the overhead was over 30% of the TTFT, so the
-                  rate leans on the calibration; <strong>n/m samples</strong> — some repeats failed.
+                  {t("prefill.legend")}
                 </p>
               )}
             </section>
@@ -712,6 +718,7 @@ export function PrefillBenchDialog({
             engine,
             posture,
             remoteHost: remoteTarget?.host ?? null,
+            labels: shareCardLabels,
           })
         }
         kind="prefill"
@@ -725,14 +732,14 @@ export function PrefillBenchDialog({
       <PageLayout
         config={
           <>
-            {loadingLast && !job && <p className="bench-sheet__hint">Loading last results…</p>}
+            {loadingLast && !job && <p className="bench-sheet__hint">{t("dialog.loadingLast")}</p>}
             {configNode}
           </>
         }
         runBar={
           isRunning ? (
             <button type="button" className="btn" onClick={() => void handleCancel()}>
-              Cancel run
+              {t("dialog.cancelRun")}
             </button>
           ) : (
             <button
@@ -741,16 +748,16 @@ export function PrefillBenchDialog({
               onClick={() => void handleStart()}
               disabled={starting || selected.filter(sizeFits).length === 0}
             >
-              {starting ? "Starting…" : "Run benchmark"}
+              {starting ? t("dialog.starting") : t("dialog.run")}
             </button>
           )
         }
       >
         {error && <p className="bench-sheet__error">{error}</p>}
-        {isRunning && <PageCard title="Progress">{progressNode}</PageCard>}
+        {isRunning && <PageCard title={t("dialog.progress")}>{progressNode}</PageCard>}
         {showResults && (
           <PageCard
-            title="Results"
+            title={t("dialog.results")}
             tools={
               <>
                 {copyButton}
@@ -759,9 +766,9 @@ export function PrefillBenchDialog({
                     type="button"
                     className="btn btn--sm btn--ghost"
                     onClick={() => void handleClear()}
-                    title="Clear saved results for this port"
+                    title={t("dialog.clearTitle")}
                   >
-                    Clear history
+                    {t("dialog.clearHistory")}
                   </button>
                 )}
               </>
@@ -771,17 +778,16 @@ export function PrefillBenchDialog({
           </PageCard>
         )}
         {!job && !loadingLast && (
-          <PageEmpty title="No runs yet">
-            Choose the context sizes to test, then run. Each size sends a unique prompt and reports prefill tok/s and
-            time to first token.
+          <PageEmpty title={t("dialog.noRuns")}>
+            {t("prefill.emptyBody")}
           </PageEmpty>
         )}
         {history.length > 0 && (
-          <PageCard title={`History · ${history.length}`}>
+          <PageCard title={t("dialog.history", { count: history.length })}>
             <HistoryTable
-              rows={history.map(prefillHistoryRow)}
+              rows={history.map((entry) => prefillHistoryRow(entry, historyLabels))}
               activeId={job?.benchId ?? null}
-              labelHeader="Context sizes"
+              labelHeader={t("prefill.contextSizes")}
               onView={handleView}
               busy={isRunning || starting}
             />
@@ -796,7 +802,7 @@ export function PrefillBenchDialog({
       <button
         type="button"
         className="bench-overlay__scrim"
-        aria-label="Close dialog"
+        aria-label={t("dialog.closeDialog")}
         onClick={() => {
           if (!isRunning) onClose();
         }}
@@ -811,7 +817,7 @@ export function PrefillBenchDialog({
         <header className="bench-sheet__header">
           <div className="bench-sheet__header-text">
             <h2 id="prefill-bench-title" className="bench-sheet__title">
-              Prefill benchmark
+              {t("prefill.title")}
             </h2>
             <p className="bench-sheet__subtitle">
               {remoteTarget
@@ -825,7 +831,7 @@ export function PrefillBenchDialog({
             type="button"
             className="bench-sheet__close"
             onClick={onClose}
-            aria-label="Close"
+            aria-label={t("dialog.close")}
           >
             <XIcon className="h-4 w-4" />
           </button>
@@ -833,7 +839,7 @@ export function PrefillBenchDialog({
 
         <div className="bench-sheet__body">
           {loadingLast && !job && (
-            <p className="bench-sheet__hint">Loading last results…</p>
+            <p className="bench-sheet__hint">{t("dialog.loadingLast")}</p>
           )}
 
           {configNode}
@@ -852,7 +858,7 @@ export function PrefillBenchDialog({
               className="bench-btn bench-btn--ghost"
               onClick={() => void handleCancel()}
             >
-              Cancel
+              {t("dialog.cancel")}
             </button>
           ) : job ? (
             <>
@@ -861,9 +867,9 @@ export function PrefillBenchDialog({
                   type="button"
                   className="bench-btn bench-btn--ghost"
                   onClick={() => void handleClear()}
-                  title="Clear saved results for this port"
+                  title={t("dialog.clearTitle")}
                 >
-                  Clear
+                  {t("dialog.clear")}
                 </button>
               )}
               {job.results.length > 0 && (
@@ -877,6 +883,7 @@ export function PrefillBenchDialog({
                       engine,
                       posture,
                       remoteHost: remoteTarget?.host ?? null,
+                      labels: shareCardLabels,
                     })
                   }
                   kind="prefill"
@@ -885,16 +892,16 @@ export function PrefillBenchDialog({
                 />
               )}
               <button type="button" className="bench-btn bench-btn--ghost" onClick={onClose}>
-                Done
+                {t("dialog.done")}
               </button>
               <button type="button" className="bench-btn bench-btn--primary" onClick={handleNewRun}>
-                Run again
+                {t("dialog.runAgain")}
               </button>
             </>
           ) : (
             <>
               <button type="button" className="bench-btn bench-btn--ghost" onClick={onClose}>
-                Close
+                {t("dialog.close")}
               </button>
               <button
                 type="button"
@@ -902,7 +909,7 @@ export function PrefillBenchDialog({
                 onClick={() => void handleStart()}
                 disabled={starting || selected.filter(sizeFits).length === 0}
               >
-                {starting ? "Starting…" : "Run benchmark"}
+                {starting ? t("dialog.starting") : t("dialog.run")}
               </button>
             </>
           )}

@@ -48,7 +48,7 @@ describe("decode served-model selection", () => {
     choose("beta");
     await act(async () => { button("Run benchmark").click(); button("Run benchmark").click(); });
     expect(startDecodeBench).toHaveBeenCalledTimes(1);
-    expect(startDecodeBench).toHaveBeenCalledWith("spark-a", { port: 8888, modelId: "beta", maxTokens: 400, concurrencies: [1, 2], promptType: "structured", temperature: 0.7, thinking: false });
+    expect(startDecodeBench).toHaveBeenCalledWith("spark-a", { port: 8888, modelId: "beta", maxTokens: 400, concurrencies: [1, 2], promptType: "structured", temperature: 0.7, thinking: true });
     expect(picker()!.disabled).toBe(true);
   });
 
@@ -133,5 +133,50 @@ describe("decode served-model selection", () => {
     expect(button("Copy results").dataset.shareText).toContain(`${expected} | decode`);
     await click("Copy results");
     expect(buildDecodeShareCard).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ modelId: expected }));
+  });
+});
+
+describe("decode start context", () => {
+  it("shows the start context in the results header and on each level", async () => {
+    const deep = job("alpha");
+    deep.config.contextTokens = 131072;
+    deep.results[0].contextTokens = 131072;
+    deep.results[0].warning = "1 of 1 streams re-prefilled";
+    vi.mocked(listDecodeBench).mockResolvedValue({ active: null, last: deep, history: [] } as unknown as Awaited<ReturnType<typeof listDecodeBench>>);
+    render(<BenchmarkDialog {...props} />);
+    await flush();
+    const text = document.body.textContent ?? "";
+    expect(text).toContain("128k ctx");
+    expect(document.querySelector(".bench-result-row__facts")?.textContent).toContain("ctx 128k");
+    expect(text).toContain("re-prefilled");
+  });
+
+  it("starts empty by default", async () => {
+    render(<BenchmarkDialog {...props} />);
+    await flush();
+    await click("Run benchmark");
+    expect(vi.mocked(startDecodeBench).mock.calls[0][1]).not.toHaveProperty("contextTokens");
+  });
+
+  it("sends contextTokens when a preset is picked", async () => {
+    render(<BenchmarkDialog {...props} />);
+    await flush();
+    await click("128k");
+    await click("Run benchmark");
+    expect(startDecodeBench).toHaveBeenCalledWith("spark-a", expect.objectContaining({ contextTokens: 131072 }));
+  });
+
+  it("refuses a context outside the supported range without starting", async () => {
+    render(<BenchmarkDialog {...props} />);
+    await flush();
+    const input = document.getElementById("bench-start-context") as HTMLInputElement;
+    const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    await act(async () => {
+      set.call(input, "100");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await click("Run benchmark");
+    expect(startDecodeBench).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("Start context must be");
   });
 });

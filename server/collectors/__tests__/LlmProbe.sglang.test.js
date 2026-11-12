@@ -305,6 +305,7 @@ test("_sglangStickyThroughput: expires to 0 after live window", () => {
 test("_applySglangServerInfo: prefers total_* counter diffs over last_gen", () => {
   const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 30000);
   probe.lastTokenCounts = { input: 100, output: 50 };
+  probe._tokenCountsSeeded = true; // seeded baseline
   probe._applySglangServerInfo(
     {
       total_input_tokens: 300,
@@ -583,6 +584,7 @@ test("_applySglangMetrics: prompt − cached fallback without per-mode counters"
 test("SGLang gen_throughput is the live rate while generation_tokens_total is flat", () => {
   const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 30000);
   probe.lastTokenCounts = { input: 100, output: 2924 };
+  probe._tokenCountsSeeded = true; // seeded baseline
   probe._sglangTokenSource = "prometheus";
   probe._applySglangMetrics(
     [
@@ -611,6 +613,7 @@ test("SGLang gen_throughput is the live rate while generation_tokens_total is fl
 test("SGLang uses /v1/loads gen_throughput when the Prometheus gauge is absent", () => {
   const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 30000);
   probe.lastTokenCounts = { input: 10, output: 10 };
+  probe._tokenCountsSeeded = true; // seeded baseline
   probe._sglangTokenSource = "prometheus";
   probe._sglangLoadGenTps = 41.5;
   probe.requestsRunning = 1;
@@ -719,13 +722,17 @@ test("probe: first SGLang poll seeds the prompt baseline, not a lifetime spike (
   assert.equal(snap.generationTps, 0);
 });
 
-test("probe: server_info totals stay authoritative over Prometheus counters", async () => {
+test("probe: server_info totals stay authoritative over Prometheus counters", async (t) => {
+  // Freeze the clock: the rate divides by the real elapsed ms since lastProbeTime, and
+  // scheduler jitter under load turned the exact 50 into 49.98.
+  t.mock.method(Date, "now", () => 1_800_000_000_000);
   const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 30000);
   probe.serverIsOpenAI = true;
   probe.backendType = "sglang";
   probe.authOpen = true;
   probe._lastDetectAt = Date.now();
   probe.lastTokenCounts = { input: 100, output: 50 };
+  probe._tokenCountsSeeded = true; // seeded baseline
   const json = (payload) => ({
     ok: true,
     status: 200,
@@ -765,6 +772,7 @@ test("probe: server_info totals stay authoritative over Prometheus counters", as
 test("_applySglangPrefillSplit does not clobber server_info tok/s", () => {
   const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 30000);
   probe.lastTokenCounts = { input: 100, output: 50 };
+  probe._tokenCountsSeeded = true; // seeded baseline
   probe._applySglangServerInfo(
     { total_input_tokens: 300, total_output_tokens: 150 },
     2

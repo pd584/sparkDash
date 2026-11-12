@@ -1,16 +1,25 @@
+import { i18n, setLocale } from "../../i18n";
 import { act } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const fetchLaunchers = vi.fn();
 const runLauncher = vi.fn();
+const reorderLaunchers = vi.fn();
+const fetchRuntimeControl = vi.fn();
 vi.mock("../../api/client", () => ({
+  fetchRuntimeControl: (...a: unknown[]) => fetchRuntimeControl(...a),
+  startMacRuntime: vi.fn(),
+  stopMacRuntime: vi.fn(),
   fetchLaunchers: (...a: unknown[]) => fetchLaunchers(...a),
   runLauncher: (...a: unknown[]) => runLauncher(...a),
+  reorderLaunchers: (...a: unknown[]) => reorderLaunchers(...a),
   removeLauncher: vi.fn(),
   addLauncher: vi.fn(),
   updateLauncher: vi.fn(),
   readLauncherJob: vi.fn(() => new Promise(() => {})),
   cancelLauncherJob: vi.fn(),
+  // The Add-a-model dialog scans on open; keep it pending so the validation alert is the only one.
+  discoverModels: vi.fn(() => new Promise(() => {})),
 }));
 
 import type { LauncherJob } from "../../api/types";
@@ -19,8 +28,26 @@ import { appendLines } from "../../hooks/useLauncherJob";
 import { makeSpark } from "../../testing/fixtures";
 import { flush, render } from "../../testing/render";
 import { terminalText } from "../ui/LiveTerminal";
-import { validateLauncherForm } from "./LlmLauncherDialog";
-import { formatElapsed, jobHeadline, jobTone, LlmModelsPanel } from "./LlmModelsPanel";
+import { LlmLauncherDialog, validateLauncherForm } from "./LlmLauncherDialog";
+import { addLauncher } from "../../api/client";
+import { formatElapsed, jobHeadline as localizedJobHeadline, jobTone, LlmModelsPanel } from "./LlmModelsPanel";
+
+const jobHeadline = (job: LauncherJob) => localizedJobHeadline(job, i18n.getFixedT("en", "hardware"));
+
+describe("Mac Models profiles", () => {
+  it("uses the authenticated profile catalog instead of script registration on agent Macs", async () => {
+    fetchRuntimeControl.mockResolvedValue({ state: "ready", serving: [], targets: [] });
+    fetchLaunchers.mockClear();
+    const spark = { ...makeSpark("mac"), kind: "mac" as const, macTransport: "agent" as const };
+    const { container } = render(<LlmModelsPanel spark={spark} />);
+    await flush();
+    expect(container.querySelector(".panel-title")?.textContent).toBe("Models");
+    expect(container.querySelector('[data-testid="runtime-launcher"]')).not.toBeNull();
+    expect(container.textContent).not.toContain("Add your first model");
+    expect(fetchLaunchers).not.toHaveBeenCalled();
+    expect(fetchRuntimeControl).toHaveBeenCalledWith("mac");
+  });
+});
 
 const job = (over: Partial<LauncherJob>): LauncherJob => ({
   id: "j1",
@@ -79,14 +106,48 @@ describe("terminal buffer", () => {
 });
 
 describe("add model form validation", () => {
+  it("translates validation while retaining draft input and an in-flight save", async () => {
+    const initialLocale = i18n.language;
+    await setLocale("en");
+    vi.mocked(addLauncher).mockClear();
+    vi.mocked(addLauncher).mockImplementation(() => new Promise(() => {}));
+    try {
+      render(<LlmLauncherDialog open sparkId="s1" sparkName="Raw host" onClose={vi.fn()} onSaved={vi.fn()} />);
+      const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!;
+      const inputs = [...dialog.querySelectorAll<HTMLInputElement>("input")];
+      const set = (input: HTMLInputElement, value: string) => act(() => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      set(inputs[0], "Raw model");
+      set(inputs[1], "relative/path");
+      act(() => dialog.querySelector<HTMLButtonElement>('[type="submit"]')!.click());
+      expect(dialog.querySelector('[role="alert"]')?.textContent).toContain("must start with");
+      await act(async () => { await setLocale("zh-CN"); });
+      expect(dialog.querySelector('[role="alert"]')?.textContent).toContain("目录必须以");
+      expect(inputs[0].value).toBe("Raw model");
+      expect(inputs[1].value).toBe("relative/path");
+      expect(addLauncher).not.toHaveBeenCalled();
+      set(inputs[1], "/models/raw");
+      act(() => dialog.querySelector<HTMLButtonElement>('[type="submit"]')!.click());
+      expect(addLauncher).toHaveBeenCalledTimes(1);
+      await act(async () => { await setLocale("en"); });
+      expect(addLauncher).toHaveBeenCalledTimes(1);
+      expect(dialog.querySelector<HTMLButtonElement>('[type="submit"]')!.disabled).toBe(true);
+      expect(inputs[0].value).toBe("Raw model");
+    } finally {
+      await act(async () => { await i18n.changeLanguage(initialLocale); });
+    }
+  });
+
   it("accepts a normal form and flags the common mistakes", () => {
     expect(validateLauncherForm({ name: "GLM", dir: "/home/me/glm", port: "8888" })).toBeNull();
     expect(validateLauncherForm({ name: "GLM", dir: "~/glm", port: "" })).toBeNull();
-    expect(validateLauncherForm({ name: " ", dir: "/x", port: "" })).toMatch(/name/i);
-    expect(validateLauncherForm({ name: "a", dir: "", port: "" })).toMatch(/directory/i);
-    expect(validateLauncherForm({ name: "a", dir: "relative/x", port: "" })).toMatch(/start with/);
-    expect(validateLauncherForm({ name: "a", dir: "/with space", port: "" })).toMatch(/Spaces/);
-    expect(validateLauncherForm({ name: "a", dir: "/x", port: "99999" })).toMatch(/Port/);
+    expect(validateLauncherForm({ name: " ", dir: "/x", port: "" })).toBe("name");
+    expect(validateLauncherForm({ name: "a", dir: "", port: "" })).toBe("directory");
+    expect(validateLauncherForm({ name: "a", dir: "relative/x", port: "" })).toBe("absolute");
+    expect(validateLauncherForm({ name: "a", dir: "/with space", port: "" })).toBe("spaces");
+    expect(validateLauncherForm({ name: "a", dir: "/x", port: "99999" })).toBe("port");
   });
 });
 
@@ -133,5 +194,96 @@ describe("starting a model while another one runs", () => {
     await flush();
     expect(runLauncher).toHaveBeenCalledTimes(1);
     expect(runLauncher).toHaveBeenCalledWith("s1", "a", "stop");
+  });
+});
+
+describe("reordering the model list", () => {
+  const launcher = (id: string, name: string) => ({ id, name, dir: "/m", startScript: "start.sh", stopScript: "stop.sh", port: 8000, notes: "" });
+  const list = [launcher("a", "Alpha"), launcher("b", "Beta"), launcher("c", "Gamma")];
+  const names = (root: HTMLElement) => [...root.querySelectorAll(".sp-launch__title b")].map((b) => b.textContent);
+  const grips = (root: HTMLElement) => [...root.querySelectorAll<HTMLButtonElement>("button.sp-launch__grip")];
+
+  const rowSlot = (row: HTMLElement) => [...(row.parentElement?.querySelectorAll(".sp-launch") ?? [])].indexOf(row);
+
+  beforeEach(() => {
+    _resetLauncherCache();
+    reorderLaunchers.mockReset();
+    fetchLaunchers.mockResolvedValue({ launchers: list, job: null, statuses: { a: "stopped", b: "stopped", c: "stopped" } });
+    // jsdom has no layout; give each row its own vertical slot so dnd-kit can tell which row is next.
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("sp-launch") ? new DOMRect(0, rowSlot(this) * 60, 400, 56) : new DOMRect(0, 0, 0, 0);
+    });
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  const press = (target: Element, code: string) =>
+    act(() => {
+      target.dispatchEvent(new KeyboardEvent("keydown", { code, key: code, bubbles: true, cancelable: true }));
+    });
+  const tick = () =>
+    act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+  /** Pick a row up by its grip, move it one place down, drop it. */
+  async function moveDown(grip: HTMLElement) {
+    press(grip, "Space");
+    await tick();
+    press(document.body, "ArrowDown");
+    await tick();
+    press(document.body, "Space");
+    await tick();
+  }
+
+  async function open() {
+    const view = render(<LlmModelsPanel spark={makeSpark("s1")} />);
+    await flush();
+    return view.container;
+  }
+
+  it("gives each row a labelled handle when there is something to reorder", async () => {
+    const container = await open();
+    expect(names(container)).toEqual(["Alpha", "Beta", "Gamma"]);
+    expect(grips(container).map((g) => g.getAttribute("aria-label"))).toEqual(["Reorder Alpha", "Reorder Beta", "Reorder Gamma"]);
+    await act(async () => { await setLocale("zh-CN"); });
+    expect(grips(container).map((g) => g.getAttribute("aria-label"))).toEqual(["重新排序 Alpha", "重新排序 Beta", "重新排序 Gamma"]);
+    await act(async () => { await setLocale("en"); });
+  });
+
+  it("shows no handle for a single model", async () => {
+    fetchLaunchers.mockResolvedValue({ launchers: [list[0]], job: null, statuses: { a: "stopped" } });
+    const container = await open();
+    expect(names(container)).toEqual(["Alpha"]);
+    expect(grips(container)).toHaveLength(0);
+  });
+
+  it("saves the full new order and shows the list the server returns", async () => {
+    reorderLaunchers.mockImplementation(async (_spark: string, ids: string[]) => ({ launchers: ids.map((id) => list.find((l) => l.id === id)) }));
+    const container = await open();
+    await moveDown(grips(container)[0]);
+    await flush();
+    expect(reorderLaunchers).toHaveBeenCalledTimes(1);
+    expect(reorderLaunchers).toHaveBeenCalledWith("s1", ["b", "a", "c"]);
+    expect(names(container)).toEqual(["Beta", "Alpha", "Gamma"]);
+  });
+
+  it("puts the old order back and says so when the save fails", async () => {
+    reorderLaunchers.mockRejectedValue(new Error("Disk full"));
+    const container = await open();
+    await moveDown(grips(container)[0]);
+    await flush();
+    expect(names(container)).toEqual(["Alpha", "Beta", "Gamma"]);
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe("Disk full");
+  });
+
+  it("does not save when a row is dropped where it started", async () => {
+    const container = await open();
+    const grip = grips(container)[1];
+    press(grip, "Space");
+    await tick();
+    press(document.body, "Space");
+    await tick();
+    expect(reorderLaunchers).not.toHaveBeenCalled();
+    expect(names(container)).toEqual(["Alpha", "Beta", "Gamma"]);
   });
 });

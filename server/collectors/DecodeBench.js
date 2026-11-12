@@ -37,6 +37,13 @@ import {
   DECODE_CODE_WARMUP_PROMPT,
 } from "../../src/shared/llmPrompts.js";
 import { formatLlmBaseUrl } from "../../src/shared/llmTarget.js";
+import {
+  PREFILL_MAX_CONTEXT_SIZE,
+  PREFILL_MIN_CONTEXT_SIZE,
+  formatContextSize,
+  parseContextSize,
+} from "../../src/shared/prefillBench.js";
+import { assessContextCache, buildContextPrompt, timeoutMsForSize } from "./contextFill.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -113,7 +120,7 @@ function decodeRequestBody(
   modelId,
   prompt,
   maxTokens,
-  { temperature = DEFAULT_TEMPERATURE, thinking = DEFAULT_THINKING } = {}
+  { temperature = DEFAULT_TEMPERATURE, thinking = DEFAULT_THINKING, topK = null } = {}
 ) {
   const body = {
     model: modelId || undefined,
@@ -124,6 +131,9 @@ function decodeRequestBody(
     stream: true,
     stream_options: { include_usage: true },
   };
+  // TensorFold's native sampler requires top_k for non-greedy sampling.
+  // Only the detected backend opts in; strict OpenAI-compatible servers may reject it.
+  if (topK != null) body.top_k = topK;
   applyThinkingFlags(body, modelId, thinking);
   return body;
 }
@@ -141,12 +151,13 @@ async function warmupDecode({
   promptType = DECODE_BENCH_DEFAULT_TYPE,
   temperature = DEFAULT_TEMPERATURE,
   thinking = DEFAULT_THINKING,
+  topK = null,
 }) {
   const url = `${baseUrl}/v1/chat/completions`;
   const kind = normalizeDecodeBenchType(promptType);
   const warmupPrompt =
     kind === "code" ? DECODE_CODE_WARMUP_PROMPT : decodeBenchPromptForType(kind);
-  const body = decodeRequestBody(modelId, warmupPrompt, WARMUP_MAX_TOKENS, { temperature, thinking });
+  const body = decodeRequestBody(modelId, warmupPrompt, WARMUP_MAX_TOKENS, { temperature, thinking, topK });
   const ctrl = new AbortController();
   const onParentAbort = () => ctrl.abort();
   if (abortSignal) {
@@ -167,6 +178,71 @@ async function warmupDecode({
     clearTimeout(timeout);
     if (abortSignal) abortSignal.removeEventListener("abort", onParentAbort);
   }
+}
+
+/**
+ * Prefill each stream's context into the server's KV, one stream at a time (so a big context
+ * is never evicted by its neighbours' prefills and a failure names the stream). Each request is
+ * the exact prompt of the measured pass with a one-token reply, so the measured pass can reuse
+ * the prefix cache.
+ * @returns {Promise<{ results: object[], error: string | null }>}
+ */
+async function prefillContexts({
+  baseUrl,
+  modelId,
+  prompts,
+  contextTokens,
+  abortSignal,
+  apiKey,
+  temperature,
+  thinking,
+  topK = null,
+  onProgress = null,
+}) {
+  const url = `${baseUrl}/v1/chat/completions`;
+  const timeoutMs = timeoutMsForSize(contextTokens);
+  const results = [];
+  for (let i = 0; i < prompts.length; i += 1) {
+    if (abortSignal?.aborted) return { results, error: "Cancelled" };
+    onProgress?.(i, prompts.length);
+    const ctrl = new AbortController();
+    const onParentAbort = () => ctrl.abort();
+    abortSignal?.addEventListener("abort", onParentAbort, { once: true });
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      ctrl.abort();
+    }, timeoutMs);
+    try {
+      const body = decodeRequestBody(modelId, prompts[i], 1, { temperature, thinking, topK });
+      const r = await runStreamingRequest(url, body, ctrl.signal, {
+        retryOnThinking400: true,
+        thinking,
+        apiKey,
+      });
+      results.push(r);
+      const hasTiming = r.ttftMs > 0 || r.serverPromptMs > 0;
+      if (timedOut || r.error || !hasTiming) {
+        const why = timedOut
+          ? `timed out after ${Math.round(timeoutMs / 1000)}s`
+          : r.error || "no first token";
+        return {
+          results,
+          error: `Context prefill failed for stream ${i + 1} of ${prompts.length} at ${formatContextSize(contextTokens)}: ${why}`,
+        };
+      }
+    } catch (err) {
+      return {
+        results,
+        error: `Context prefill failed for stream ${i + 1} of ${prompts.length}: ${err?.message || err}`,
+      };
+    } finally {
+      clearTimeout(timeout);
+      abortSignal?.removeEventListener("abort", onParentAbort);
+    }
+  }
+  onProgress?.(prompts.length, prompts.length);
+  return { results, error: null };
 }
 
 /**
@@ -225,6 +301,7 @@ function streamPublicResult(r, index, prompt, reqMeta, debug = false) {
     completionTokens: r?.completionTokens ?? 0,
     prefillTps: r?.prefillTps ?? 0,
     prefillTokens: r?.prefillTokens ?? 0,
+    cachedTokens: r?.cachedPromptTokens ?? 0,
     totalMs: r?.totalMs ?? 0,
     error: r?.error ?? null,
   };
@@ -262,6 +339,22 @@ function streamPublicResult(r, index, prompt, reqMeta, debug = false) {
  * and EXL3 `/health` totals), and does not exist for a Remote target. Calls `onLive(tps)`
  * once a second while tokens flow, and `onLive(null)` when the wave ends.
  */
+/**
+ * The engine serving `port`, from a unit's LLM snapshot list.
+ *
+ * Matched on each entry's own `port` rather than by position in the configured-port array: the
+ * configured list is raw while the snapshot follows SparkMonitor._llmPorts(), which drops
+ * invalid entries, and the snapshot is the previous poll's, so right after a port is added or
+ * removed the two lists are offset. A positional read would then hand back another port's
+ * engine, and the backend decides the request shape — sending a sampler field a strict
+ * OpenAI-compatible server rejects, or omitting the one TensorFold requires. An unmatched port
+ * stays null: an engine that was not identified must not be guessed at.
+ */
+export function backendForPort(llmList, port) {
+  if (!Array.isArray(llmList)) return null;
+  return llmList.find((entry) => Number(entry?.port) === Number(port))?.backend || null;
+}
+
 export function createLiveRate(streams, onLive, { now = () => performance.now(), intervalMs = 1000, windowMs = 2000 } = {}) {
   const counts = new Array(streams).fill(0);
   const samples = []; // [time, total]
@@ -318,11 +411,47 @@ export async function runConcurrencyWave({
   promptType = DECODE_BENCH_DEFAULT_TYPE,
   temperature = DEFAULT_TEMPERATURE,
   thinking = DEFAULT_THINKING,
+  topK = null,
   onLive = null,
+  contextTokens = 0,
+  contextSalt = randomUUID(),
+  onPrefill = null,
 }) {
   const url = `${baseUrl}/v1/chat/completions`;
+  // `prompts` are the task prompts (what debug traces show); `sendPrompts` are what goes on the wire.
   const prompts = pickBenchPrompts(concurrency, promptType);
+  const deep = contextTokens > 0;
+  const sendPrompts = deep
+    ? prompts.map((task, i) => buildContextPrompt(contextTokens, `${contextSalt}-${i}`, task))
+    : prompts;
   const reqMeta = { url, modelId, maxTokens };
+
+  let fillResults = [];
+  let contextPrefillMs = 0;
+  if (deep) {
+    const fillStart = performance.now();
+    const fill = await prefillContexts({
+      baseUrl,
+      modelId,
+      prompts: sendPrompts,
+      contextTokens,
+      abortSignal,
+      apiKey,
+      temperature,
+      thinking,
+      topK,
+      onProgress: onPrefill,
+    });
+    contextPrefillMs = round2(performance.now() - fillStart);
+    fillResults = fill.results;
+    if (fill.error) {
+      const empty = emptyWaveResult(concurrency, 0, [], modelId, fill.error, prompts, debug);
+      empty.contextTokens = contextTokens;
+      empty.contextPrefillMs = contextPrefillMs;
+      return empty;
+    }
+  }
+
   const live = createLiveRate(concurrency, onLive);
 
   const wallStart = performance.now();
@@ -353,7 +482,7 @@ export async function runConcurrencyWave({
     }
 
     const body = {
-      ...decodeRequestBody(modelId, prompts[streamIndex], maxTokens, { temperature, thinking }),
+      ...decodeRequestBody(modelId, sendPrompts[streamIndex], maxTokens, { temperature, thinking, topK }),
       min_tokens: maxTokens,
       ignore_eos: true,
       stop: [],
@@ -419,11 +548,15 @@ export async function runConcurrencyWave({
       waveMs,
       results,
       modelId,
-      `Wave timed out after ${WAVE_TIMEOUT_MS}ms`,
+      `Wave timed out after ${WAVE_TIMEOUT_MS}ms${deep ? " (is prefix caching enabled? The prefilled context may have been recomputed)" : ""}`,
       prompts,
       debug
     );
     if (debug) empty.hardwareSamples = hardwareSamples;
+    if (deep) {
+      empty.contextTokens = contextTokens;
+      empty.contextPrefillMs = contextPrefillMs;
+    }
     return empty;
   }
 
@@ -492,6 +625,35 @@ export async function runConcurrencyWave({
     model,
   };
   if (debug) wave.hardwareSamples = hardwareSamples;
+  if (deep) {
+    // A deep-context number only counts when the measured pass decoded from the prefilled KV.
+    const verdicts = results.map((r, i) =>
+      r.error
+        ? "unknown"
+        : assessContextCache({
+            promptTokens: r.prefillTokens,
+            cachedTokens: r.cachedPromptTokens,
+            ttftMs: r.ttftMs,
+            fillTtftMs: fillResults[i]?.ttftMs,
+          })
+    );
+    const count = (v) => verdicts.filter((x) => x === v).length;
+    wave.contextTokens = contextTokens;
+    wave.contextPrefillMs = contextPrefillMs;
+    wave.contextCache = {
+      cached: count("cached"),
+      partial: count("partial"),
+      uncached: count("uncached"),
+      unknown: count("unknown"),
+    };
+    wave.streams.forEach((st, i) => {
+      st.contextCache = verdicts[i];
+    });
+    const bad = count("partial") + count("uncached");
+    if (bad > 0) {
+      wave.warning = `${bad} of ${concurrency} streams re-prefilled part of the ${formatContextSize(contextTokens)} context (prefix cache miss), so their tok/s is not a clean deep-context decode. Enable prefix caching or raise its capacity.`;
+    }
+  }
   return wave;
 }
 
@@ -553,6 +715,13 @@ export class DecodeBenchManager {
     if (!id) return null;
     const job = this.jobs.get(id);
     return job ? publicJob(job) : null;
+  }
+
+  /** Rolling token rate for this unit's own benchmark, never a custom remote target. */
+  getLiveDecodeTps(sparkId, port) {
+    const job = this.jobs.get(this.activeBySpark.get(sparkId));
+    if (!job || job.status !== "running" || job.config.port !== port || job.config.host) return null;
+    return Number.isFinite(job.progress.liveTps) ? Math.max(0, job.progress.liveTps) : 0;
   }
 
   getHistory(sparkId) {
@@ -771,6 +940,7 @@ export class DecodeBenchManager {
    *   lanIp: string,
    *   port: number,
    *   modelId: string | null,
+   *   backend?: string | null,
    *   concurrencies: number[],
    *   maxTokens?: number,
    *   promptType?: string,
@@ -792,11 +962,13 @@ export class DecodeBenchManager {
       lanIp,
       port,
       modelId,
+      backend = null,
       concurrencies: rawConc,
       maxTokens: rawMax,
       promptType: rawType,
       temperature: rawTemp,
       thinking: rawThinking,
+      contextTokens: rawContext,
       debug = false,
       sampleHardware = null,
       apiKey = null,
@@ -842,14 +1014,18 @@ export class DecodeBenchManager {
       throw err;
     }
     temperature = Math.round(temperature * 100) / 100;
+    let contextTokens = 0;
+    if (rawContext != null && rawContext !== "" && Number(rawContext) !== 0) {
+      contextTokens = parseContextSize(rawContext);
+      if (contextTokens == null) {
+        const err = new Error(`contextTokens must be an integer between ${PREFILL_MIN_CONTEXT_SIZE} and ${PREFILL_MAX_CONTEXT_SIZE}, or 0 to start empty`);
+        err.status = 400;
+        throw err;
+      }
+    }
     const promptType = normalizeDecodeBenchType(rawType);
-    // Only prose is selectable: structured/code/json need the format-bound answer inside the token budget.
     const thinking =
-      promptType !== "prose"
-        ? false
-        : rawThinking == null
-          ? DEFAULT_THINKING
-          : rawThinking === true || rawThinking === "true";
+      rawThinking == null ? DEFAULT_THINKING : rawThinking === true || rawThinking === "true";
     const debugOn = Boolean(debug);
     const benchId = randomUUID();
     const abort = new AbortController();
@@ -867,6 +1043,8 @@ export class DecodeBenchManager {
         promptType,
         temperature,
         thinking,
+        ...(backend === "tensorfold" ? { topK: 20 } : {}),
+        ...(contextTokens > 0 ? { contextTokens } : {}),
         ...(debugOn ? { debug: true } : {}),
         ...(rawHost
           ? { host: String(rawHost).trim(), tls: Boolean(rawTls) }
@@ -951,6 +1129,7 @@ export class DecodeBenchManager {
           promptType: job.config.promptType,
           temperature: job.config.temperature,
           thinking: job.config.thinking,
+          topK: job.config.topK,
         });
       }
       for (const c of job.config.concurrencies) {
@@ -979,10 +1158,22 @@ export class DecodeBenchManager {
           promptType: job.config.promptType,
           temperature: job.config.temperature,
           thinking: job.config.thinking,
+          topK: job.config.topK,
+          contextTokens: job.config.contextTokens || 0,
+          contextSalt: job.benchId,
+          onPrefill: (done, total) => {
+            job.progress.prefill = { done, total };
+            job.progress.message =
+              done < total
+                ? `Prefilling ${formatContextSize(job.config.contextTokens)} context ${done + 1}/${total} for ×${c}…`
+                : `Running concurrency ${c}…`;
+            this._checkpointActive();
+          },
           onLive: (tps) => {
             job.progress.liveTps = tps;
           },
         });
+        job.progress.prefill = null;
 
         if (job._abort.signal.aborted) {
           // Keep partial wave only if it fully succeeded before cancel
@@ -1096,4 +1287,6 @@ export const DECODE_BENCH_DEFAULTS = {
   minTemperature: MIN_TEMPERATURE,
   maxTemperature: MAX_TEMPERATURE,
   defaultThinking: DEFAULT_THINKING,
+  minContextTokens: PREFILL_MIN_CONTEXT_SIZE,
+  maxContextTokens: PREFILL_MAX_CONTEXT_SIZE,
 };

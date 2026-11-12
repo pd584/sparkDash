@@ -5,8 +5,8 @@ export interface FleetTotals {
   online: number;
   /** Sum of generation tok/s across every available LLM endpoint. */
   decodeTps: number;
-  /** Sum of GPU power draw (W) across online units. */
-  powerW: number;
+  /** Sum of GPU power draw (W) across online units that report it; null when none does. */
+  powerW: number | null;
   /** Unified memory / VRAM in use (MB) across online units. */
   memUsedMb: number;
   /** Unified memory / VRAM capacity (MB) across all units that report it. */
@@ -15,16 +15,21 @@ export interface FleetTotals {
 
 /** Aggregate live fleet numbers from one snapshot list (pure). */
 export function computeFleetTotals(sparks: readonly SparkSnapshot[]): FleetTotals {
-  const t: FleetTotals = { total: sparks.length, online: 0, decodeTps: 0, powerW: 0, memUsedMb: 0, memTotalMb: 0 };
+  const t: FleetTotals = { total: sparks.length, online: 0, decodeTps: 0, powerW: null, memUsedMb: 0, memTotalMb: 0 };
   for (const s of sparks) {
     const total = s.metrics?.gpu?.vram?.total || s.metrics?.unifiedMemory?.total || 0;
     t.memTotalMb += total;
     if (!s.online) continue;
     t.online += 1;
-    t.powerW += s.metrics?.gpu?.power?.draw ?? 0;
+    // A unit without power telemetry adds nothing, so a fleet with none reads "—", not a measured 0 W.
+    const gpu = s.metrics?.gpu;
+    const draw = gpu?.power?.draw;
+    if (gpu?.metricAvailability?.powerDraw !== false && typeof draw === "number" && Number.isFinite(draw)) {
+      t.powerW = (t.powerW ?? 0) + draw;
+    }
     t.memUsedMb += s.metrics?.gpu?.vram?.used ?? s.metrics?.unifiedMemory?.used ?? 0;
     if (Array.isArray(s.metrics?.llm)) {
-      for (const llm of s.metrics.llm) if (llm.available) t.decodeTps += llm.generationTps || 0;
+      for (const llm of s.metrics.llm) if (llm.available && llm.measurementValid !== false) t.decodeTps += llm.generationTps || 0;
     }
   }
   return t;
@@ -49,16 +54,32 @@ export function trendDeltaPct(series: readonly number[], minSamples = 8): number
 }
 
 /** Work that a fleet shutdown would interrupt, from signals already in the snapshot. */
-export function shutdownWarnings(sparks: readonly SparkSnapshot[]): string[] {
+export interface ShutdownWarningCopy {
+  inFlight: (sparkName: string, count: number) => string;
+  comfyJob: (sparkName: string) => string;
+  hermesUpdate: (sparkName: string) => string;
+}
+
+const defaultShutdownWarningCopy: ShutdownWarningCopy = {
+  inFlight: (sparkName, count) => `${sparkName}: ${count} in-flight LLM request${count === 1 ? "" : "s"}`,
+  comfyJob: (sparkName) => `${sparkName}: ComfyUI job running`,
+  hermesUpdate: (sparkName) => `${sparkName}: Hermes update in progress`,
+};
+
+/**
+ * Work that a fleet shutdown would interrupt. Callers may provide presentation
+ * copy, while this function remains the sole source of the underlying signals.
+ */
+export function shutdownWarnings(sparks: readonly SparkSnapshot[], copy: ShutdownWarningCopy = defaultShutdownWarningCopy): string[] {
   const out: string[] = [];
   for (const s of sparks) {
     if (!s.online) continue;
     const llmBusy = Array.isArray(s.metrics?.llm)
       ? s.metrics.llm.reduce((n, l) => n + Math.max(l.slotsActive || 0, l.requestsRunning || 0), 0)
       : 0;
-    if (llmBusy > 0) out.push(`${s.name}: ${llmBusy} in-flight LLM request${llmBusy === 1 ? "" : "s"}`);
-    if ((s.metrics?.comfy?.queueRunning ?? 0) > 0) out.push(`${s.name}: ComfyUI job running`);
-    if (s.hermes?.status === "running") out.push(`${s.name}: Hermes update in progress`);
+    if (llmBusy > 0) out.push(copy.inFlight(s.name, llmBusy));
+    if ((s.metrics?.comfy?.queueRunning ?? 0) > 0) out.push(copy.comfyJob(s.name));
+    if (s.hermes?.status === "running") out.push(copy.hermesUpdate(s.name));
   }
   return out;
 }

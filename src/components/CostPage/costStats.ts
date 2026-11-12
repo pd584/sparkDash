@@ -83,12 +83,12 @@ export function costBuckets(
 export function fmtMoney(v: number): string {
   const n = Number.isFinite(v) ? v : 0;
   const digits = n !== 0 && Math.abs(n) < 0.01 ? 4 : 2;
-  return `$${n.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
+  return `$${n.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
 }
 
 /** Human price line for pickers: "$3.00 / 1M in · $15.00 / 1M out". */
 export function priceLabel(p: Pick<ModelPrice, "inputCostPerToken" | "outputCostPerToken">): string {
-  const perM = (v: number) => `$${(v * 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  const perM = (v: number) => `$${(v * 1_000_000).toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
   return `${perM(p.inputCostPerToken)} / 1M in · ${perM(p.outputCostPerToken)} / 1M out`;
 }
 

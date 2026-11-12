@@ -63,6 +63,12 @@ const DEFAULTS = Object.freeze({
    */
   prometheusExport: false,
   /**
+   * Let a sudo password be typed in the dashboard over plain http from another machine. Off by
+   * default: the password would cross the network unencrypted, so it is otherwise only accepted over
+   * https or from the machine itself. For a LAN you trust.
+   */
+  allowPlainSudoPassword: false,
+  /**
    * Let the Intel (xe) probe read root-only debugfs VRAM through `sudo -n`.
    * Off by default: without it VRAM falls back to the PCI BAR size and no sudo runs.
    */
@@ -80,10 +86,79 @@ const DEFAULTS = Object.freeze({
    * is evaluated or sent, and the alert config / test routes refuse.
    */
   alertsEnabled: false,
+  /**
+   * Publish the EventLog stream and per-Spark availability to an MQTT broker.
+   * Off by default. The broker password never lives here (settings.json is
+   * world-readable) — it comes from the SPARKDASH_MQTT_PASSWORD env var.
+   */
+  mqttEnabled: false,
+  /** Broker URL: mqtt://host:port, mqtts://… or ws(s)://… */
+  mqttUrl: "",
+  /** Username the broker requires, if any. */
+  mqttUsername: "",
+  /** Topic root for everything published (no wildcards, no slashes at the edges). */
+  mqttTopicPrefix: "sparkdash",
+  /** Publish Home Assistant MQTT discovery configs (requires MQTT publishing). */
+  mqttDiscovery: false,
+  /** Discovery prefix — match the integration's setting in Home Assistant. */
+  mqttDiscoveryPrefix: "homeassistant",
+  /**
+   * Show the read-only API Keys page (LiteLLM virtual keys via a host-side bridge on a unix
+   * socket). Off by default. The bridge socket and token never live here (settings.json is
+   * world-readable) — they come from SPARKDASH_APIKEYS_BRIDGE_SOCKET / _TOKEN.
+   */
+  apiKeysEnabled: false,
+  /**
+   * Hide harness sessions older than this. Finite: 1 minute through 14 days.
+   * A missing or out-of-range value becomes 12 hours. There is no unlimited value.
+   */
+  occupancyMaxAgeMs: 12 * 60 * 60 * 1000,
+  /**
+   * GPU temperature (°C) at which the Health "thermal" finding warns, and at
+   * which it turns critical. Alerts reuse that finding, so these also decide
+   * when a notification goes out. Warn must stay below critical.
+   */
+  healthTempWarnC: 85,
+  healthTempCriticalC: 90,
+  /**
+   * Stream-sample engines without gauges (Settings → LLM). Off by default: while on, the
+   * probe of a gauge-less engine (Pico) sends one tiny streamed completion every 15 s and
+   * measures its own decode tok/s from the token window. Sampling pauses while a bench,
+   * showcase or model launch owns the unit.
+   */
+  llmStreamSample: false,
 });
 
 const POLL_INTERVAL_MIN_MS = 500;
 const POLL_INTERVAL_MAX_MS = 60_000;
+export const OCCUPANCY_AGE_MIN_MS = 60 * 1000;
+export const OCCUPANCY_AGE_MAX_MS = 14 * 24 * 60 * 60 * 1000;
+export const OCCUPANCY_AGE_DEFAULT_MS = 12 * 60 * 60 * 1000;
+export const HEALTH_TEMP_MIN_C = 40;
+export const HEALTH_TEMP_MAX_C = 110;
+
+/** A finite temperature inside the accepted range, otherwise null. */
+function healthTemp(value) {
+  if (value == null || value === "" || typeof value === "boolean") return null;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= HEALTH_TEMP_MIN_C && n <= HEALTH_TEMP_MAX_C ? n : null;
+}
+
+/**
+ * Reject a settings write that would leave the thermal thresholds unusable:
+ * a value that is not a number in range, or a warning that is not below the
+ * critical value. Only checked when the patch touches one of the two keys.
+ */
+function assertHealthTemps(current, patch) {
+  if (!("healthTempWarnC" in patch) && !("healthTempCriticalC" in patch)) return;
+  const merged = { ...current, ...patch };
+  const range = `between ${HEALTH_TEMP_MIN_C} and ${HEALTH_TEMP_MAX_C} °C`;
+  const warn = healthTemp(merged.healthTempWarnC);
+  const critical = healthTemp(merged.healthTempCriticalC);
+  if (warn == null) throw new Error(`healthTempWarnC must be a number ${range}`);
+  if (critical == null) throw new Error(`healthTempCriticalC must be a number ${range}`);
+  if (warn >= critical) throw new Error("healthTempWarnC must be lower than healthTempCriticalC");
+}
 
 /** "" (follow the browser) or an IANA zone name this runtime knows. */
 export function isValidTimeZone(value) {
@@ -95,6 +170,52 @@ export function isValidTimeZone(value) {
     return true;
   } catch {
     return false;
+  }
+}
+
+/** A usable MQTT topic root: no wildcards, no slashes at the edges, bounded length. */
+function isValidMqttPrefix(value) {
+  if (typeof value !== "string") return false;
+  const v = value.trim();
+  return (
+    v.length > 0 &&
+    v.length <= 128 &&
+    !v.includes("+") &&
+    !v.includes("#") &&
+    !v.startsWith("/") &&
+    !v.endsWith("/")
+  );
+}
+
+/**
+ * The broker URL, normalised, or "" when it is not usable: an mqtt(s):// or
+ * ws(s):// URL with a host and no embedded credentials. settings.json is
+ * world-readable, so `mqtt://user:secret@host` is refused outright — the
+ * username has its own setting and the password comes from the environment.
+ */
+function normalizeMqttUrl(value) {
+  if (typeof value !== "string") return "";
+  const v = value.trim();
+  if (!v || v.length > 256 || !/^(mqtt|ws)s?:\/\//i.test(v)) return "";
+  let url;
+  try {
+    url = new URL(v);
+  } catch {
+    return "";
+  }
+  if (!url.hostname || url.username || url.password) return "";
+  return v;
+}
+
+/** Whether a raw broker URL carries a username or password in its authority. */
+function mqttUrlHasCredentials(value) {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value.trim());
+    return Boolean(url.username || url.password);
+  } catch {
+    // Unparseable, but an "@" before the host still means credentials were typed in.
+    return /^[a-z]+:\/\/[^/]*@/i.test(value.trim());
   }
 }
 
@@ -146,9 +267,39 @@ function _clampSettings(settings) {
   s.timeZone = isValidTimeZone(s.timeZone) ? String(s.timeZone).trim() : "";
   s.showVramBreakdown = Boolean(s.showVramBreakdown);
   s.prometheusExport = Boolean(s.prometheusExport);
+  // Only a real `true` turns it on: a string like "false" must not count as enabled.
+  s.allowPlainSudoPassword = s.allowPlainSudoPassword === true;
   s.intelVramSudo = Boolean(s.intelVramSudo);
   s.metricsHistory = Boolean(s.metricsHistory);
   s.alertsEnabled = Boolean(s.alertsEnabled);
+  s.mqttEnabled = Boolean(s.mqttEnabled);
+  s.apiKeysEnabled = Boolean(s.apiKeysEnabled);
+  s.mqttUrl = normalizeMqttUrl(s.mqttUrl);
+  s.mqttUsername = typeof s.mqttUsername === "string" ? s.mqttUsername.trim().slice(0, 128) : "";
+  // Trailing slashes are normal while typing; strip them instead of rejecting.
+  const prefix = typeof s.mqttTopicPrefix === "string" ? s.mqttTopicPrefix.trim().replace(/\/+$/, "") : "";
+  s.mqttTopicPrefix = isValidMqttPrefix(prefix) ? prefix : DEFAULTS.mqttTopicPrefix;
+  s.mqttDiscovery = Boolean(s.mqttDiscovery);
+  const discoveryPrefix = typeof s.mqttDiscoveryPrefix === "string" ? s.mqttDiscoveryPrefix.trim().replace(/\/+$/, "") : "";
+  s.mqttDiscoveryPrefix = isValidMqttPrefix(discoveryPrefix) ? discoveryPrefix : DEFAULTS.mqttDiscoveryPrefix;
+  const age = Number(s.occupancyMaxAgeMs);
+  s.occupancyMaxAgeMs =
+    Number.isFinite(age) && age >= OCCUPANCY_AGE_MIN_MS && age <= OCCUPANCY_AGE_MAX_MS
+      ? Math.round(age)
+      : OCCUPANCY_AGE_DEFAULT_MS;
+  // A hand-edited settings.json can hold unusable thresholds; updateSettings()
+  // rejects them on write, so here both fall back together to keep warn < critical.
+  const warnC = healthTemp(s.healthTempWarnC);
+  const criticalC = healthTemp(s.healthTempCriticalC);
+  if (warnC != null && criticalC != null && warnC < criticalC) {
+    s.healthTempWarnC = warnC;
+    s.healthTempCriticalC = criticalC;
+  } else {
+    s.healthTempWarnC = DEFAULTS.healthTempWarnC;
+    s.healthTempCriticalC = DEFAULTS.healthTempCriticalC;
+  }
+  // Ensure the stream-sample switch is boolean
+  s.llmStreamSample = Boolean(s.llmStreamSample);
   // Ensure temperatureUnit is valid
   if (s.temperatureUnit !== "celsius" && s.temperatureUnit !== "fahrenheit") {
     s.temperatureUnit = DEFAULTS.temperatureUnit;
@@ -162,10 +313,17 @@ function _clampSettings(settings) {
 
 /** Load settings from disk, falling back to defaults. */
 export function loadSettings() {
+  let parsed = null;
   try {
     const raw = fs.readFileSync(SETTINGS_PATH, "utf-8");
-    const parsed = JSON.parse(raw);
+    parsed = JSON.parse(raw);
     _settings = _clampSettings({ ...DEFAULTS, ..._whitelist(parsed) });
+    // A broker URL with credentials written by an older build (or by hand) is
+    // dropped above; rewrite the file so the secret does not linger on disk.
+    if (mqttUrlHasCredentials(parsed?.mqttUrl)) {
+      console.warn("[settings] Removed an MQTT broker URL containing credentials from settings.json");
+      saveSettings();
+    }
   } catch (err) {
     if (err.code === "ENOENT") {
       _settings = { ...DEFAULTS };
@@ -196,10 +354,12 @@ export function getSettings() {
 
 /**
  * Apply a partial patch, persist, and return the new settings.
+ * Throws when the GPU temperature thresholds in the patch are not usable.
  * @param {Partial<typeof DEFAULTS>} patch
  * @returns {typeof DEFAULTS}
  */
 export function updateSettings(patch) {
+  assertHealthTemps(_settings, _whitelist(patch));
   const merged = _clampSettings({ ..._settings, ..._whitelist(patch) });
   _settings = merged;
   saveSettings();

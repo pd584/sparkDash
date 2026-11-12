@@ -180,7 +180,7 @@ test("handler retries a failed refresh at most once per retry window and shares 
   assert.equal(res.statusCode, 502);
 });
 
-test("disabled handler never fetches and points at MODEL_PRICES_FETCH in the 502", async () => {
+test("disabled handler returns an empty catalog without fetching on a fresh install", async () => {
   let fetches = 0;
   const handler = createModelPricesHandler({
     enabled: false,
@@ -196,8 +196,8 @@ test("disabled handler never fetches and points at MODEL_PRICES_FETCH in the 502
   const res = fakeRes();
   await handler({}, res);
   assert.equal(fetches, 0);
-  assert.equal(res.statusCode, 502);
-  assert.match(res.body.error, /MODEL_PRICES_FETCH/);
+  assert.deepEqual(res.body.models, []);
+  assert.equal(res.statusCode, 200);
 });
 
 test("default fetch disables redirects and caps the body size", async () => {

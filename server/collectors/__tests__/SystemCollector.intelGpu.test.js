@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { IntelSudoGate, IntelVramCache } from "../intelGpu.js";
+import { IntelSudoGate, IntelVramCache, INTEL_PROBE_SCRIPT } from "../intelGpu.js";
+import { spawnSync } from "node:child_process";
 
 // The sudo debugfs read is opt-in; these tests run with it on (the off case is tested below).
 const settingsDir = fs.mkdtempSync(path.join(os.tmpdir(), "sparkdash-intel-settings-"));
@@ -417,4 +418,121 @@ test("local: no nvidia-smi on the host and an Intel card is still Intel-only and
   const gpu = await localIntel(false).collectGpu();
   assert.equal(nvidiaSideFailed(gpu), false);
   assert.equal(collectionWasSuccessful(gpu), true);
+});
+
+// ── The same probe under zsh: an unmatched glob must never abort the script ──
+
+const zshAvailable = spawnSync("zsh", ["-c", "true"]).error == null;
+
+function buildXeTree({ energy = true, temps = true, card = true } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "intel-probe-zsh-"));
+  const w = (rel, text) => {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), text);
+  };
+  if (card) {
+    const dev = "sys/devices/pci/0000:3a:00.0";
+    fs.mkdirSync(path.join(root, "sys/bus/pci/drivers/xe"), { recursive: true });
+    fs.mkdirSync(path.join(root, "sys/class/drm/card0"), { recursive: true });
+    fs.mkdirSync(path.join(root, dev), { recursive: true });
+    fs.symlinkSync("../../../devices/pci/0000:3a:00.0", path.join(root, "sys/class/drm/card0/device"));
+    fs.symlinkSync("../../../bus/pci/drivers/xe", path.join(root, `${dev}/driver`));
+    w(`${dev}/device`, "0xe223\n");
+    w(`${dev}/hwmon/hwmon3/name`, "xe\n");
+    w(`${dev}/hwmon/hwmon3/power1_cap`, "200000000\n");
+    if (energy) {
+      w(`${dev}/hwmon/hwmon3/energy1_input`, "5000000000\n");
+      w(`${dev}/hwmon/hwmon3/energy1_label`, "card\n");
+    }
+    if (temps) {
+      w(`${dev}/hwmon/hwmon3/temp2_input`, "60000\n");
+      w(`${dev}/hwmon/hwmon3/temp2_label`, "pkg\n");
+    }
+    w(`${dev}/tile0/gt0/freq0/cur_freq`, "2400\n");
+    w(`${dev}/tile0/gt0/gtidle/idle_residency_ms`, "800000\n");
+    w("sys/kernel/debug/dri/0000:3a:00.0/tile0/vram_mm", "  size: 8589934592\n  usage: 1073741824\n");
+    w("proc/uptime", "1000.00 4000.00\n");
+  }
+  return root;
+}
+
+const runZsh = (root) =>
+  spawnSync("zsh", ["-c", INTEL_PROBE_SCRIPT], { env: { ...process.env, INTEL_PROBE_ROOT: root }, encoding: "utf8" });
+
+test("zsh: a full xe fixture reads energy, temps and VRAM and runs to the end", { skip: !zshAvailable }, () => {
+  const root = buildXeTree();
+  try {
+    const run = runZsh(root);
+    assert.equal(run.status, 0);
+    assert.doesNotMatch(run.stderr, /no matches found/);
+    assert.match(run.stdout, /energy card 5000000000/);
+    assert.match(run.stdout, /temp pkg 60000/);
+    assert.match(run.stdout, /cur 2400/);
+    assert.match(run.stdout, /idle 800000/);
+    assert.match(run.stdout, /vram size: 8589934592/);
+    assert.match(run.stdout, /vram usage: 1073741824/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("zsh: the hwmon start point itself is never treated as a sensor (mindepth)", { skip: !zshAvailable }, () => {
+  const root = buildXeTree();
+  try {
+    // Give the parent hwmon dir an xe name and a cap: without -mindepth 1 the
+    // find emits the parent first, the loop reads it, and the real hwmon3 is lost.
+    const parent = "sys/devices/pci/0000:3a:00.0/hwmon";
+    fs.writeFileSync(path.join(root, parent, "name"), "xe\n");
+    fs.writeFileSync(path.join(root, parent, "power1_cap"), "111\n");
+    fs.writeFileSync(path.join(root, "sys/devices/pci/0000:3a:00.0/hwmon/hwmon3/power1_cap"), "999\n");
+    const run = runZsh(root);
+    assert.equal(run.status, 0);
+    assert.match(run.stdout, /cap 999/);
+    assert.doesNotMatch(run.stdout, /cap 111/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("zsh: multi-tile VRAM reads in sorted tile order (sort)", { skip: !zshAvailable }, () => {
+  const root = buildXeTree();
+  try {
+    const v = "sys/kernel/debug/dri/0000:3a:00.0";
+    // Create tile1 before tile0 so an unsorted readdir is likely to pick tile1.
+    fs.mkdirSync(path.join(root, v, "tile1"), { recursive: true });
+    fs.writeFileSync(path.join(root, v, "tile1/vram_mm"), "  size: 4294967296\n  usage: 0\n");
+    fs.writeFileSync(path.join(root, v, "tile0/vram_mm"), "  size: 8589934592\n  usage: 1073741824\n");
+    const run = runZsh(root);
+    assert.equal(run.status, 0);
+    assert.match(run.stdout, /vram size: 8589934592/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("zsh: no card at all completes with exit 0", { skip: !zshAvailable }, () => {
+  const root = buildXeTree({ card: false });
+  try {
+    const run = runZsh(root);
+    assert.equal(run.status, 0);
+    assert.doesNotMatch(run.stderr, /no matches found/);
+    assert.equal(run.stdout.trim(), "");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("zsh: an xe hwmon with no energy or temp sensor files still runs to the end", { skip: !zshAvailable }, () => {
+  const root = buildXeTree({ energy: false, temps: false });
+  try {
+    const run = runZsh(root);
+    assert.equal(run.status, 0);
+    assert.doesNotMatch(run.stderr, /no matches found/);
+    // Sections after the energy/temp loops must survive: cap and the tile reads.
+    assert.match(run.stdout, /cap 200000000/);
+    assert.match(run.stdout, /cur 2400/);
+    assert.match(run.stdout, /vram size: 8589934592/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

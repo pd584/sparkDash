@@ -14,11 +14,11 @@ import { fileURLToPath } from "url";
 import { atomicWrite } from "../util/atomicWrite.js";
 import {
   applyThinkingFlags,
-  estimateTokenCount,
   round2,
   runStreamingRequest,
 } from "./LlmStreaming.js";
 import { decodeBenchManager } from "./DecodeBench.js";
+import { buildPrefillPrompt, timeoutMsForSize } from "./contextFill.js";
 import {
   PREFILL_CONTEXT_SIZES,
   PREFILL_DEFAULT_CONTEXT_SIZES,
@@ -30,7 +30,7 @@ import {
 import { formatLlmBaseUrl } from "../../src/shared/llmTarget.js";
 import { prefillFitsContext } from "../../src/shared/contextFit.js";
 
-export { formatContextSize };
+export { formatContextSize, buildPrefillPrompt, timeoutMsForSize };
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -42,7 +42,10 @@ const ACTIVE_PATH =
   process.env.PREFILL_BENCH_ACTIVE_PATH ||
   path.join(ROOT, "config", "prefill-bench-active.json");
 
-/** Preset chip sizes (tokens). Custom integers in 256–300k are also allowed. */
+/**
+ * Preset chip sizes (tokens). Custom sizes are accepted up to the absolute bound; a size that
+ * does not fit the model's context is skipped with a row explaining why.
+ */
 export const ALLOWED_CONTEXT_SIZES = PREFILL_CONTEXT_SIZES;
 export const DEFAULT_CONTEXT_SIZES = PREFILL_DEFAULT_CONTEXT_SIZES;
 
@@ -53,42 +56,6 @@ const HISTORY_LIMIT = 10;
 export const MAX_OVERHEAD_CORRECTION = 0.5;
 /** Above this overhead share of TTFT the corrected rate is mostly calibration, so the row is flagged. */
 export const LOW_CONFIDENCE_OVERHEAD_SHARE = 0.3;
-
-/**
- * Common short English words, each one BPE token with a leading space in the
- * mainstream tokenizers. Cycled in a fixed pseudo-random order so the filler is
- * less degenerate than one repeated token (attention/MoE routing look closer
- * to real text) while the token count stays ~1 per word.
- */
-const FILLER_WORDS =
-  "the of and to in is you that it he was for on are as with his they at be this have from or one had by word but not what all were we when your can said there use an each which she do how their if will up other about out many then them these so some her would make like him into time".split(
-    " "
-  );
-
-function fillerText(count) {
-  const words = new Array(count);
-  let state = 0x2545f491;
-  for (let i = 0; i < count; i += 1) {
-    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
-    words[i] = FILLER_WORDS[(state >>> 8) % FILLER_WORDS.length];
-  }
-  return " " + words.join(" ");
-}
-
-/**
- * Unique-prefix prompt aimed at `targetTokens` (estimateTokenCount / 4 chars).
- * Salt at the start so a previous size is not a prefix-cache hit.
- * @param {number} targetTokens
- * @param {string} salt
- */
-export function buildPrefillPrompt(targetTokens, salt) {
-  const n = Math.max(8, Math.round(Number(targetTokens) || 0));
-  const header = `[prefill-bench ${salt}]\nIgnore the filler below. Reply with the single word OK.\n`;
-  const footer = "\nReply OK.";
-  const reserved = estimateTokenCount(header + footer);
-  const fillTokens = Math.max(1, n - reserved);
-  return header + fillerText(fillTokens) + footer;
-}
 
 /** Tiny prompt used to measure fixed per-request overhead (network, queue, first decode step). */
 const CALIBRATION_TOKENS = 16;
@@ -150,21 +117,11 @@ export function rateFromSample(s, overheadMs = 0) {
   };
 }
 
-/**
- * Per-size request timeout: 90s floor, ~8 ms/token (~125 tok/s), 45 min cap.
- * 256k at a slow ~200 tok/s is ~22 min — the old 12 min cap aborted those runs.
- * @param {number} tokens
- */
-export function timeoutMsForSize(tokens) {
-  const n = Math.max(0, Number(tokens) || 0);
-  return Math.min(2_700_000, Math.max(90_000, 60_000 + n * 8));
-}
-
-export function normalizeContextSizes(raw) {
+export function normalizeContextSizes(raw, maxTokens = PREFILL_MAX_CONTEXT_SIZE) {
   if (!Array.isArray(raw)) return [];
   const out = [];
   for (const v of raw) {
-    const n = parseContextSize(v);
+    const n = parseContextSize(v, maxTokens);
     if (n == null || out.includes(n)) continue;
     out.push(n);
   }
@@ -684,10 +641,17 @@ export class PrefillBenchManager {
       throw err;
     }
 
-    const contextSizes = normalizeContextSizes(rawSizes);
+    const ctxKnown = Number.isFinite(Number(contextLength)) && Number(contextLength) > 0;
+    // Structural bound only: a size that does not fit the model's context is skipped with a row
+    // below, so a known context needs no ceiling here. An unknown one falls back to the preset
+    // ceiling — the only bound we have without a model context.
+    const structuralCeiling = ctxKnown ? Infinity : PREFILL_MAX_CONTEXT_SIZE;
+    const contextSizes = normalizeContextSizes(rawSizes, structuralCeiling);
     if (!contextSizes.length) {
       const err = new Error(
-        `Select at least one context size (${PREFILL_MIN_CONTEXT_SIZE}–${PREFILL_MAX_CONTEXT_SIZE.toLocaleString()} tokens)`
+        ctxKnown
+          ? `Select at least one context size (${PREFILL_MIN_CONTEXT_SIZE} tokens or more)`
+          : `Select at least one context size (${PREFILL_MIN_CONTEXT_SIZE}–${PREFILL_MAX_CONTEXT_SIZE.toLocaleString()} tokens)`
       );
       err.status = 400;
       throw err;
@@ -822,7 +786,8 @@ export class PrefillBenchManager {
         }
 
         if (!prefillFitsContext(size, job.config.contextLength)) {
-          // Same rule the dialog uses to disable the chip; a stale/other client still gets a clear row.
+          // The dialog disables chips that do not fit; a size that still lands here (a stale
+          // client, or one within the template/reply reserve of the context) gets a clear row.
           job.results.push({
             targetTokens: size,
             promptTokens: 0,
@@ -934,5 +899,6 @@ export const PREFILL_BENCH_DEFAULTS = {
   allowedContextSizes: [...ALLOWED_CONTEXT_SIZES],
   defaultContextSizes: [...DEFAULT_CONTEXT_SIZES],
   minContextSize: PREFILL_MIN_CONTEXT_SIZE,
+  /** Ceiling when the model's context is unknown; a known context is the real ceiling. */
   maxContextSize: PREFILL_MAX_CONTEXT_SIZE,
 };

@@ -7,7 +7,7 @@ import { spawn, execFile } from "node:child_process";
 import { validateDir, validateScriptName, normalizeLauncherInput, slugify } from "../validate.js";
 import { LineSplitter, LauncherManager, stripAnsi } from "../LauncherManager.js";
 import { LauncherStore } from "../LauncherStore.js";
-import { buildStartCommand } from "../commands.js";
+import { buildStartCommand, LOG_MAX_BYTES } from "../commands.js";
 
 function tmpDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -66,10 +66,40 @@ test("LauncherStore persists, de-duplicates ids, updates and tolerates a corrupt
   assert.deepEqual(new LauncherStore({ file }).list("spark1"), []);
 });
 
+test("LauncherStore.reorder follows the given ids, keeps unnamed models and survives a reload", () => {
+  const file = path.join(tmpDir("sd-store-order-"), "l.json");
+  const store = new LauncherStore({ file });
+  const [a, b, c] = ["A", "B", "C"].map((name) => store.add("spark1", { name, dir: `/opt/${name}` }).launcher.id);
+  store.add("spark2", { name: "Other", dir: "/opt/other" });
+  const ids = (sparkId = "spark1") => store.list(sparkId).map((l) => l.id);
+
+  assert.deepEqual(store.reorder("spark1", [c, a, b]).map((l) => l.id), [c, a, b]);
+  assert.deepEqual(new LauncherStore({ file }).list("spark1").map((l) => l.id), [c, a, b], "saved to disk");
+
+  // A stale or hostile list can neither drop nor duplicate a model.
+  store.reorder("spark1", [b, "nope", b, 7, null]);
+  assert.deepEqual(ids(), [b, c, a], "unknown and repeated ids are ignored; unnamed models follow in their old order");
+  store.reorder("spark1", []);
+  assert.deepEqual(ids(), [b, c, a], "an empty list changes nothing");
+
+  assert.equal(store.list("spark2").length, 1, "other Sparks are untouched");
+  assert.deepEqual(store.reorder("ghost", [a]), [], "a Spark with no models stays empty");
+  assert.equal("ghost" in store.data, false);
+});
+
+test("LauncherStore.reorder does not rewrite the file when the order is unchanged", () => {
+  const file = path.join(tmpDir("sd-store-order-"), "l.json");
+  const store = new LauncherStore({ file });
+  const [a, b] = ["A", "B"].map((name) => store.add("spark1", { name, dir: `/opt/${name}` }).launcher.id);
+  fs.utimesSync(file, new Date(0), new Date(0));
+  store.reorder("spark1", [a, b]);
+  assert.equal(fs.statSync(file).mtimeMs, 0);
+});
+
 /** A manager that runs the generated programs with real bash against a throwaway $HOME. */
-function realManager(home) {
+function realManager(home, extraEnv = {}) {
   const events = [];
-  const env = { ...process.env, HOME: home };
+  const env = { ...process.env, HOME: home, ...extraEnv };
   const store = new LauncherStore({ file: path.join(home, "launchers.json") });
   const mgr = new LauncherManager({
     store,
@@ -125,6 +155,57 @@ test("start streams the script output and reports exit 0 without leaking the exi
   // `since` returns only newer lines
   const last = read.lines.at(-1).seq;
   assert.deepEqual(mgr.readJob("s1", started.job.id, last).lines, []);
+});
+
+test("completion drains a delayed follower, including the final unterminated line", async () => {
+  const home = tmpDir("sd-home-");
+  try {
+    const bin = path.join(home, "bin");
+    writeScript(bin, "tail", 'sleep 2\nexec /usr/bin/tail "$@"');
+    const llm = path.join(home, "llm");
+    writeScript(llm, "start.sh", "printf 'ready\\nfinal π'; exit 7");
+    const { mgr } = realManager(home, { PATH: `${bin}:${process.env.PATH}` });
+    const launcher = mgr.store.add("s1", { name: "Demo", dir: llm }).launcher;
+    const { job } = mgr.startJob(spark, launcher, "start");
+    await until(() => mgr.latestJob("s1").status !== "running");
+    const read = mgr.readJob("s1", job.id, 0);
+    assert.equal(read.job.status, "failed");
+    assert.equal(read.job.exitCode, 7);
+    assert.deepEqual(read.lines.slice(1).map((line) => line.text), ["ready", "final π"]);
+    assert.match(
+      fs.readFileSync(path.join(home, ".cache/sparkdash/llm", `${launcher.id}.log`), "utf8"),
+      /ready\nfinal π$/,
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("start works when tail has no --pid option (BSD/macOS tail)", async () => {
+  const home = tmpDir("sd-home-");
+  try {
+    const bin = path.join(home, "bin");
+    writeScript(
+      bin,
+      "tail",
+      'for a in "$@"; do case "$a" in --pid*) echo "tail: illegal option -- -" >&2; exit 1 ;; esac; done\nexec /usr/bin/tail "$@"',
+    );
+    const llm = path.join(home, "llm");
+    writeScript(llm, "start.sh", "echo loading; sleep 1; printf 'ready\\nfinal'; exit 5");
+    const { mgr } = realManager(home, { PATH: `${bin}:${process.env.PATH}` });
+    const launcher = mgr.store.add("s1", { name: "Demo", dir: llm }).launcher;
+    const { job } = mgr.startJob(spark, launcher, "start");
+    await until(() => mgr.latestJob("s1").status !== "running");
+    const read = mgr.readJob("s1", job.id, 0);
+    assert.equal(read.job.status, "failed");
+    assert.equal(read.job.exitCode, 5);
+    const texts = read.lines.map((line) => line.text);
+    assert.ok(texts.includes("loading"), texts.join("|"));
+    assert.ok(texts.includes("ready"), texts.join("|"));
+    assert.ok(!texts.some((t) => t.includes("__SDEXIT__")));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("a failing start script is reported with its exit code", async () => {
@@ -438,4 +519,88 @@ test("the log is truncated at start", async () => {
   const texts = mgr.readJob("s1", job.id, 0).lines.map((l) => l.text);
   assert.ok(!texts.includes("old stuff"));
   assert.ok(texts.includes("fresh"));
+});
+
+/** The start time of a live pid, read the way its platform reports it (independent of commands.js). */
+function startTimeOf(pid) {
+  if (process.platform === "linux") {
+    return fs.readFileSync(`/proc/${pid}/stat`, "utf8").replace(/^.*\) /, "").split(" ")[19];
+  }
+  return new Promise((resolve, reject) =>
+    execFile("ps", ["-o", "lstart=", "-p", String(pid)], { env: { ...process.env, LC_ALL: "C" } }, (err, out) => (err ? reject(err) : resolve(out.trim())))
+  );
+}
+
+test("the pid file records the real start time of the launched script, so a reused pid cannot pass for it", async () => {
+  const home = tmpDir("sd-home-");
+  const llm = path.join(home, "llm");
+  writeScript(llm, "start.sh", 'echo "serving"; sleep 20');
+  // A session in another language must not change what is recorded: ps prints dates in the session's locale.
+  const { mgr } = realManager(home, { LC_ALL: "de_DE.UTF-8" });
+  const launcher = mgr.store.add("s1", { name: "Demo", dir: llm }).launcher;
+  const { job } = mgr.startJob(spark, launcher, "start");
+  await until(() => mgr.readJob("s1", job.id, 0).lines.some((l) => l.text === "serving"));
+  const pid = readPid(home, launcher);
+  const recorded = fs.readFileSync(path.join(home, ".cache/sparkdash/llm", `${launcher.id}.pid`), "utf8").trim();
+  assert.equal(recorded, `${pid} ${await startTimeOf(pid)}`);
+  mgr.cancel("s1");
+  await until(() => mgr.latestJob("s1").status !== "running");
+  process.kill(-pid, "SIGTERM");
+  await until(async () => (await mgr.statuses(spark, [launcher]))[launcher.id] === "stopped");
+});
+
+test("the log of a running script is cut back once it passes its size cap", { timeout: 60_000 }, async () => {
+  const home = tmpDir("sd-home-");
+  const llm = path.join(home, "llm");
+  // 1 MiB over the cap in one burst, then stay alive so the janitor (it checks every 15 s) gets a turn.
+  writeScript(llm, "start.sh", `yes "${"x".repeat(1000)}" | head -c ${LOG_MAX_BYTES + 1024 * 1024}; echo; echo big; sleep 40`);
+  const { mgr } = realManager(home);
+  const launcher = mgr.store.add("s1", { name: "Demo", dir: llm }).launcher;
+  const { job } = mgr.startJob(spark, launcher, "start");
+  await until(() => mgr.readJob("s1", job.id, 0).lines.some((l) => l.text === "big"), 30_000);
+  const log = path.join(home, ".cache/sparkdash/llm", `${launcher.id}.log`);
+  assert.ok(fs.statSync(log).size > LOG_MAX_BYTES, "burst really exceeded the cap");
+  await until(() => fs.statSync(log).size < LOG_MAX_BYTES, 40_000);
+  const pid = readPid(home, launcher);
+  mgr.cancel("s1");
+  await until(() => mgr.latestJob("s1").status !== "running");
+  process.kill(-pid, "SIGTERM");
+});
+
+/** A `stat` that answers the mode and owner questions with fixed values ("unreadable": the query fails), so the safety checks see what a host reports. */
+function statShim(dir, { mode = "755", owner = "$(id -u)" } = {}) {
+  fs.mkdirSync(dir, { recursive: true });
+  const answer = (v) => (v === "unreadable" ? "exit 1" : `echo ${v}`);
+  const body = `case "$*" in
+  *%a*|*%Lp*) ${answer(mode)} ;;
+  *%u*) ${answer(owner)} ;;
+  *) exit 1 ;;
+esac`;
+  fs.writeFileSync(path.join(dir, "stat"), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+}
+
+test("start and stop refuse when the host cannot report a script's mode or owner, or reports another owner (the checks fail closed)", async () => {
+  for (const [label, shim, refusal] of [
+    ["mode unreadable, owner fine", { mode: "unreadable" }, "world-writable"],
+    ["owner unreadable, mode fine", { owner: "unreadable" }, "not owned by"],
+    ["both unreadable", { mode: "unreadable", owner: "unreadable" }, "world-writable"],
+    ["owned by another user", { owner: "4242" }, "not owned by"],
+  ]) {
+    const home = tmpDir("sd-home-");
+    const llm = path.join(home, "llm");
+    writeScript(llm, "start.sh", 'echo "should not run"');
+    writeScript(llm, "stop.sh", 'echo "should not run"');
+    const shimDir = path.join(home, "shim");
+    statShim(shimDir, shim);
+    const { mgr } = realManager(home, { PATH: `${shimDir}:${process.env.PATH}` });
+    const launcher = mgr.store.add("s1", { name: "X", dir: llm }).launcher;
+    for (const action of ["start", "stop"]) {
+      const { job } = mgr.startJob(spark, launcher, action);
+      await until(() => mgr.latestJob("s1").status !== "running");
+      const r = mgr.readJob("s1", job.id, 0);
+      assert.equal(r.job.exitCode, 126, `${label}: ${action}`);
+      assert.ok(r.lines.some((l) => l.text.includes(refusal)), `${label}: ${action} refused for the wrong reason: ${r.lines.map((l) => l.text).join("|")}`);
+      assert.ok(!r.lines.some((l) => l.text === "should not run"), `${label}: ${action} ran the script`);
+    }
+  }
 });

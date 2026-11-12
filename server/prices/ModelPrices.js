@@ -191,6 +191,10 @@ export function createModelPricesHandler(opts = {}) {
       res.json({ ...fallback, stale: true });
       return;
     }
+    if (!enabled) {
+      res.json({ models: [], source: LITELLM_PRICES_URL, stale: false });
+      return;
+    }
     res.status(502).json({
       error: enabled
         ? "Could not fetch the model price catalog. Try again shortly."

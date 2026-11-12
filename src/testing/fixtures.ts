@@ -54,6 +54,8 @@ export function makeSpark(id = "spark-1", online = true): SparkSnapshot {
         backend: "vllm",
         modelId: "fixture-model",
         generationTps: 20,
+        perStreamTps: 18.5,
+        perStreamPrefillTps: 2813,
         prefillTps: 200,
       }] : [],
       comfy: null,

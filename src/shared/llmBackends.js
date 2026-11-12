@@ -19,6 +19,9 @@ export const BACKEND_LABELS = Object.freeze({
   radiance: "Radiance",
   strata: "Strata",
   flare: "Flare",
+  locals: "Locals",
+  splash: "Splash",
+  pico: "Pico",
 });
 
 /**

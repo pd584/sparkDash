@@ -1,3 +1,4 @@
+import { i18n } from "../../i18n";
 import { act } from "react";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { RoceDevice, RoceMetrics } from "../../api/types";
@@ -18,6 +19,8 @@ const device = (over: Partial<RoceDevice> = {}): RoceDevice => ({
   speedMbps: 200000,
   rxBps: 1_048_576,
   txBps: 2_097_152,
+  rdmaRxBps: 3_145_728,
+  rdmaTxBps: 4_194_304,
   rxErrors: 0,
   txErrors: 0,
   rxDropped: 3,
@@ -59,8 +62,8 @@ describe("RocePanel", () => {
   });
 
   it("summarises a down link and a quiet fleet", () => {
-    expect(roceSummary([device({ loss: { rising: [], streak: 0 }, state: "DOWN", active: false })]).tone).toBe("bad");
-    expect(roceSummary([device({ loss: { rising: [], streak: 0 } })])).toEqual({ text: "1/1 up · 200 Gb/s · PFC off · no loss", tone: "good" });
+    expect(roceSummary([device({ loss: { rising: [], streak: 0 }, state: "DOWN", active: false })], i18n.getFixedT("en", "hardware")).tone).toBe("bad");
+    expect(roceSummary([device({ loss: { rising: [], streak: 0 } })], i18n.getFixedT("en", "hardware"))).toEqual({ text: "1/1 up · 200 Gb/s · PFC off · no loss", tone: "good" });
   });
 
   it("renders nothing without RDMA devices", () => {
@@ -79,6 +82,8 @@ describe("RocePanel", () => {
     expect(text).toContain("200 Gb/s");
     expect(text).toContain("MTU 9000");
     expect(text).toContain("1.0 MB/s");
+    expect(text).toContain("RDMA ↓ 3.0 MB/s");
+    expect(text).toContain("RDMA ↑ 4.0 MB/s");
     expect(text).toContain("PFC off");
     expect(text).toContain("trust pcp");
     expect(text).toContain("loss rising");
@@ -100,7 +105,14 @@ describe("RocePanel", () => {
   });
 
   it("describes PFC from mlnx_qos", () => {
-    expect(pfcLabel(device({ qos: { trust: "dscp", pfcPriorities: [3], cableLen: 7, dscpMap: null } }))?.text).toBe("PFC on: 3");
-    expect(pfcLabel(device({ qos: null }))).toBeNull();
+    expect(pfcLabel(device({ qos: { trust: "dscp", pfcPriorities: [3], cableLen: 7, dscpMap: null } }), i18n.getFixedT("en", "hardware"))?.text).toBe("PFC on: 3");
+    expect(pfcLabel(device({ qos: null }), i18n.getFixedT("en", "hardware"))).toBeNull();
   });
+});
+
+it("explains which rates come from netdev and which from the RDMA counters, and cumulative pause totals", () => {
+  const { container } = render(<RocePanel roce={metrics([device()])} />);
+  expect(container.textContent).toContain("↓/↑ are the interface's netdev traffic.");
+  expect(container.textContent).toContain("RDMA ↓/↑ come from the port's own port_rcv_data / port_xmit_data counters");
+  expect(container.textContent).toContain("Pause frames are cumulative totals, separate from the current PFC setting.");
 });

@@ -1,18 +1,24 @@
 import type { SparkSnapshot } from "../../api/types";
 import { isWorkerSpark } from "../../api/sparkRole";
+import { measuredGenerationTps } from "../../shared/llmRate";
 
 /** Live decode tok/s of the first reachable LLM on a Spark, or null. */
 export function primaryDecodeTps(spark: SparkSnapshot): number | null {
   const llm = Array.isArray(spark.metrics.llm) ? spark.metrics.llm.find((l) => l.available) : null;
-  return llm ? llm.generationTps : null;
+  return measuredGenerationTps(llm);
+}
+
+export interface RailStatusLabels {
+  offline: string;
+  worker: string;
 }
 
 /** Short label for the rail: tok/s when an LLM is live, otherwise a status word. */
-export function railSubLabel(spark: SparkSnapshot): string {
-  if (!spark.online) return "off";
+export function railSubLabel(spark: SparkSnapshot, labels: RailStatusLabels = { offline: "off", worker: "worker" }): string {
+  if (!spark.online) return labels.offline;
   const tps = primaryDecodeTps(spark);
   if (tps != null) return tps >= 100 ? tps.toFixed(0) : tps.toFixed(1);
-  return isWorkerSpark(spark) ? "worker" : "—";
+  return isWorkerSpark(spark) ? labels.worker : "—";
 }
 
 export function isThrottling(spark: SparkSnapshot): boolean {

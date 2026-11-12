@@ -15,7 +15,7 @@ import { makeHeadResolver, usableHead, type HeadResolver } from "./sparkHead";
  * whether the next allocation fails or the OOM killer runs.
  */
 
-/** GB10 shares one pool between CPU and GPU; a discrete card has its own VRAM. */
+/** GB10 and Apple silicon share one pool between CPU and GPU; a discrete card has its own VRAM. */
 export type MemoryModel = "unified" | "discrete";
 
 export type HeadroomTone = "ok" | "low" | "critical";
@@ -35,8 +35,9 @@ export const HEADROOM_THRESHOLDS_MB: Readonly<
 /** The engine's own KV pool is nearly full at this fill: requests queue or get preempted. */
 export const KV_NEARLY_FULL = 0.9;
 
-export function memoryModelFor(kind: string | null | undefined): MemoryModel {
-  return kind === "host" ? "discrete" : "unified";
+/** A Spark's memory is unified; so is a Mac host's (Apple silicon). Other hosts have a discrete card. */
+export function memoryModelFor(kind: string | null | undefined, platform?: string | null): MemoryModel {
+  return kind === "host" && platform !== "darwin" ? "discrete" : "unified";
 }
 
 /** Classify free memory (MB) against the thresholds for this memory model. */
@@ -67,6 +68,7 @@ export function headroomTextClass(tone: HeadroomTone): string {
 export interface ServingUnitLike {
   id: string;
   kind?: string | null;
+  platform?: string | null;
   online?: boolean | null;
   role?: SparkRole | string | null;
   workerNode?: boolean | null;
@@ -168,7 +170,7 @@ export function vramContextFor(
   /** Pass `makeHeadResolver(fleet)` when building contexts for a whole fleet (avoids rescans). */
   resolveHead?: HeadResolver<ServingUnitLike>,
 ): VramBreakdownContext {
-  const model = memoryModelFor(unit.kind);
+  const model = memoryModelFor(unit.kind, unit.platform);
   return {
     model,
     unified: model === "unified" ? unit.metrics?.unifiedMemory ?? null : null,
@@ -284,9 +286,14 @@ export function computeVramBreakdown(
   segments.push({ key: engine ? "other" : wholeGpuIsModel ? "engine" : "gpu", mb: otherMB });
 
   const ep = engine ? ctx.endpoint ?? null : null;
+  // TensorFold's `kv_cache_usage_ratio` is one stream's share of its own window, not the shared
+  // pool's occupancy, so it is not pool fill: using it here would colour the legend and raise the
+  // "pool nearly full" verdict on a pool that is mostly free. The engine's own cache group
+  // (LlmCachePanel / cache history) carries the pool categories instead.
+  const reportsPoolUsage = ep != null && ep.backend !== "tensorfold";
   const kv: VramKvInfo | null = ep
     ? {
-        usage: finite(ep.kvCacheUsage),
+        usage: reportsPoolUsage ? finite(ep.kvCacheUsage) : null,
         poolGb: finite(ep.kvCacheGb),
         weightsGb: finite(ep.weightsGb),
         backend: backendLabel(ep.backend ?? null),

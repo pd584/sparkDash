@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { fetchGpuClock, fetchGpuClockCommand, resetGpuClock, setGpuClock } from "../api/client";
 import type { GpuClockStatus } from "../api/types";
 
@@ -6,9 +7,9 @@ const MIN_CAP_MHZ = 300;
 
 type Ready = Extract<GpuClockStatus, { supported: true }>;
 
-/** Highest clock the boot service applies, e.g. "0,2200" -> 2200. */
-function serviceMax(status: Ready): number | null {
-  const m = /^\d+,(\d+)$/.exec(status.service.clocks ?? "");
+/** Highest clock a boot hook applies, e.g. "0,2200" -> 2200. */
+function bootMax(status: Ready): number | null {
+  const m = /^\d+,(\d+)$/.exec(status.service.clocks ?? status.cron.clocks ?? "");
   return m ? Number(m[1]) : null;
 }
 
@@ -17,6 +18,7 @@ function serviceMax(status: Ready): number | null {
  * saved connection settings: it is not part of the Save button.
  */
 export function GpuClockSection({ sparkId }: { sparkId: string }) {
+  const { t } = useTranslation("devices");
   const [status, setStatus] = useState<GpuClockStatus | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [maxInput, setMaxInput] = useState("");
@@ -36,9 +38,9 @@ export function GpuClockSection({ sparkId }: { sparkId: string }) {
 
   const syncInputs = (s: GpuClockStatus) => {
     if (!s.supported) return;
-    const cap = s.capMHz ?? serviceMax(s);
+    const cap = s.capMHz ?? bootMax(s);
     setMaxInput(cap != null ? String(cap) : "");
-    setPersist(s.service.installed);
+    setPersist(s.service.installed || s.cron.installed);
   };
 
   const load = useCallback(
@@ -53,7 +55,7 @@ export function GpuClockSection({ sparkId }: { sparkId: string }) {
       } catch (err) {
         if (mine !== latest.current) return;
         // Keep what is on screen after a failed refresh; the message says what went wrong.
-        setLoadError(err instanceof Error ? err.message : "Could not read the GPU clock cap");
+        setLoadError(err instanceof Error ? err.message : "load");
       }
     },
     [sparkId]
@@ -78,9 +80,9 @@ export function GpuClockSection({ sparkId }: { sparkId: string }) {
   if (!status) {
     return (
       <div className="gpu-clock">
-        <span className="field-label">GPU clock cap</span>
+        <span className="field-label">{t("gpu.cap")}</span>
         <p className={`field-hint${loadError ? " is-warn" : ""}`} role="status">
-          {loadError ?? "Reading the unit…"}
+          {loadError === "load" ? t("gpu.loadError") : loadError ?? t("gpu.reading")}
         </p>
       </div>
     );
@@ -88,8 +90,8 @@ export function GpuClockSection({ sparkId }: { sparkId: string }) {
   if (!status.supported) {
     return (
       <div className="gpu-clock">
-        <span className="field-label">GPU clock cap</span>
-        <p className="field-hint">{status.reason || "Not available on this unit."}</p>
+        <span className="field-label">{t("gpu.cap")}</span>
+        <p className="field-hint">{status.reason || t("gpu.unavailable")}</p>
       </div>
     );
   }
@@ -104,19 +106,27 @@ export function GpuClockSection({ sparkId }: { sparkId: string }) {
   const sudoMissing = status.sudo === "no";
   /** A password typed here crosses the network: only over https or from the machine itself. */
   const secure =
-    (typeof window === "undefined" || window.isSecureContext !== false) && status.passwordAllowed !== false;
+    (typeof window === "undefined" || window.isSecureContext !== false || status.plainPasswordAllowed === true) && status.passwordAllowed !== false;
   const needPw = sudoMissing && secure;
   const pwOk = !needPw || sudoPw.length > 0;
   const pwArg = needPw ? sudoPw : undefined;
+  /**
+   * No boot hook is reachable here at all: the checkbox says so instead of refusing on Apply.
+   * Without passwordless sudo the status cannot probe for one, so a typed password decides it on the unit.
+   */
+  const cannotPersist = !sudoMissing && status.persistKind === "none";
 
-  const run = async (action: () => Promise<unknown>, done: string) => {
+  /** How this unit keeps the cap, as the response reported it. */
+  const keptText = (kind: string) =>
+    kind === "cron" ? t("gpu.keptCron") : t("gpu.keptService");
+
+  const run = async (action: () => Promise<string>) => {
     setBusy(true);
     setMessage(null);
     try {
-      await action();
-      setMessage({ ok: true, text: done });
+      setMessage({ ok: true, text: await action() });
     } catch (err) {
-      setMessage({ ok: false, text: err instanceof Error ? err.message : "The unit refused the change" });
+      setMessage({ ok: false, text: err instanceof Error ? err.message : "refused" });
     } finally {
       // A slow answer for the unit you just left must not wipe what you type for this one.
       if (sparkRef.current === sparkId) {
@@ -128,16 +138,23 @@ export function GpuClockSection({ sparkId }: { sparkId: string }) {
   };
 
   const apply = () => {
-    if (persist && !confirm("Install a system service on this unit that re-applies the cap at every boot? It runs as root through sudo.")) return;
-    void run(
-      () => setGpuClock(sparkId, { maxMHz, persist, ...(pwArg ? { sudoPassword: pwArg } : {}) }),
-      persist ? `Capped at ${maxMHz} MHz and kept after reboot.` : `Capped at ${maxMHz} MHz until the next reboot.`
-    );
+    const how = status.persistKind === "cron" ? t("gpu.cronJob") : t("gpu.systemService");
+    if (persist && !confirm(t("gpu.persistConfirm", { how })))
+      return;
+    void run(async () => {
+      const out = await setGpuClock(sparkId, { maxMHz, persist, ...(pwArg ? { sudoPassword: pwArg } : {}) });
+      return persist
+        ? t("gpu.cappedPersistent", { max: maxMHz, kept: keptText(out.persistKind) })
+        : t("gpu.cappedUntilReboot", { max: maxMHz });
+    });
   };
 
   const remove = () => {
-    if (!confirm("Remove the GPU clock cap and its boot service from this unit?")) return;
-    void run(() => resetGpuClock(sparkId, pwArg), "Cap removed.");
+    if (!confirm(t("gpu.removeConfirm"))) return;
+    void run(async () => {
+      await resetGpuClock(sparkId, pwArg);
+      return t("gpu.removed");
+    });
   };
 
   const showCommand = async (kind: "apply" | "reset") => {
@@ -147,12 +164,12 @@ export function GpuClockSection({ sparkId }: { sparkId: string }) {
       const q = kind === "apply" ? ({ action: "apply", maxMHz, persist } as const) : ({ action: "reset" } as const);
       const { command } = await fetchGpuClockCommand(sparkId, q);
       setManual({
-        title: kind === "apply" ? `Cap at ${maxMHz} MHz${persist ? " and keep after reboot" : ""}` : "Remove the cap",
+        title: kind === "apply" ? t("gpu.manualApplyTitle", { max: maxMHz, suffix: persist ? t("gpu.manualPersistent") : "" }) : t("gpu.manualRemoveTitle"),
         command,
       });
     } catch (err) {
       setManual(null);
-      setManualError(err instanceof Error ? err.message : "Could not build the command");
+      setManualError(err instanceof Error ? err.message : "commandError");
     }
   };
 
@@ -170,23 +187,28 @@ export function GpuClockSection({ sparkId }: { sparkId: string }) {
   return (
     <div className="gpu-clock">
       <label className="field-label" htmlFor="gpu-clock-max">
-        GPU clock cap
+        {t("gpu.cap")}
       </label>
       <p className="gpu-clock__now" data-testid="gpu-clock-now">
         {status.capMHz != null ? (
           <>
-            Capped at <b>{status.capMHz} MHz</b>
-            {hwMax != null ? ` (GPU maximum ${hwMax} MHz)` : ""}
+            {t("gpu.cappedAt")} <b>{status.capMHz} MHz</b>
+            {hwMax != null ? t("gpu.maximum", { max: hwMax }) : ""}
           </>
         ) : (
-          <>No cap in effect{hwMax != null ? ` (GPU maximum ${hwMax} MHz)` : ""}</>
+          <>{t("gpu.noCap")}{hwMax != null ? t("gpu.maximum", { max: hwMax }) : ""}</>
         )}
         {status.service.installed
-          ? ` · boot service ${status.service.enabled === "enabled" ? "enabled" : status.service.enabled || "installed"}${
-              status.service.clocks ? ` (${status.service.clocks} MHz)` : ""
-            }`
-          : " · not kept after reboot"}
+          ? t("gpu.bootService", { state: status.service.enabled === "enabled" ? t("gpu.enabled") : status.service.enabled || t("gpu.installed"), clocks: status.service.clocks ? ` (${status.service.clocks} MHz)` : "" })
+          : status.cron.installed
+            ? t("gpu.rebootJob", { clocks: status.cron.clocks ? ` (${status.cron.clocks} MHz)` : "" })
+            : t("gpu.notKept")}
       </p>
+      {status.cron.installed && status.cron.failed ? (
+        <p className="field-hint is-warn" role="alert" data-testid="gpu-clock-boot-failed">
+          {t("gpu.bootFailedBefore")} <code>sudo -n nvidia-smi -lgc</code> {t("gpu.bootFailedAfter")}
+        </p>
+      ) : null}
       <div className="gpu-clock__row">
         <input
           id="gpu-clock-max"
@@ -194,17 +216,17 @@ export function GpuClockSection({ sparkId }: { sparkId: string }) {
           min={MIN_CAP_MHZ}
           max={hwMax ?? undefined}
           inputMode="numeric"
-          placeholder={hwMax != null ? `${MIN_CAP_MHZ}–${hwMax}` : "MHz"}
+          placeholder={hwMax != null ? `${MIN_CAP_MHZ}–${hwMax}` : t("gpu.mhz")}
           value={maxInput}
           onChange={(e) => setMaxInput(e.target.value)}
           disabled={busy}
         />
-        <span className="gpu-clock__unit">MHz max</span>
+        <span className="gpu-clock__unit">{t("gpu.mhzMax")}</span>
         <button type="button" className="btn btn--sm" onClick={apply} disabled={busy || !valid || !pwOk || (sudoMissing && !secure)}>
-          {busy ? "Working…" : "Apply"}
+          {busy ? t("gpu.working") : t("gpu.apply")}
         </button>
         <button type="button" className="btn btn--sm btn--ghost" onClick={remove} disabled={busy || !pwOk || (sudoMissing && !secure)}>
-          Remove limit
+          {t("gpu.removeLimit")}
         </button>
       </div>
       <label className="gpu-clock__check">
@@ -212,14 +234,20 @@ export function GpuClockSection({ sparkId }: { sparkId: string }) {
           type="checkbox"
           checked={persist}
           onChange={(e) => setPersist(e.target.checked)}
-          disabled={busy}
+          disabled={busy || (cannotPersist && !persist)}
         />
-        Keep after reboot (installs a system service)
+        {t("gpu.keepAfterReboot")} (
+        {cannotPersist
+          ? t("gpu.notAvailableUnit")
+          : status.persistKind === "cron"
+            ? t("gpu.cronJob")
+            : t("gpu.systemService")}
+        )
       </label>
       {needPw && (
         <div>
           <label className="field-label" htmlFor="gpu-clock-sudo-pw">
-            sudo password for this unit
+            {t("gpu.sudoPassword")}
           </label>
           <input
             id="gpu-clock-sudo-pw"
@@ -230,63 +258,63 @@ export function GpuClockSection({ sparkId }: { sparkId: string }) {
             value={sudoPw}
             onChange={(e) => setSudoPw(e.target.value)}
             disabled={busy}
-            placeholder="used for this change only"
+            placeholder={t("gpu.passwordPlaceholder")}
           />
           <p className="field-hint">
-            This unit has no passwordless sudo. The password is sent once, over this connection, to run the change, then
-            discarded: it is never stored or logged.
+            {t("gpu.passwordHelp")}
           </p>
         </div>
       )}
       {sudoMissing && !secure && (
         <p className="field-hint is-warn">
-          This connection is not on https or the machine itself, so a sudo password is not typed here (it would cross the
-          network in the clear). Open the dashboard over https or from the Spark itself, or run the change on the Spark with
-          the command below.
+          {t("gpu.insecureBefore")} <code>nvidia-smi -lgc</code> {t("gpu.insecureBetween")} <code>-rgc</code> {t("gpu.insecureAfter")}
         </p>
       )}
       {!sudoMissing && (
         <p className="field-hint">
-          Runs <code>nvidia-smi -lgc 0,MAX</code>{status.sudo === "root" ? " as root on this machine" : " through sudo"}, using the
-          saved connection settings. Applies at once; it is not part of Save.
+          {t("gpu.runsBefore")} <code>nvidia-smi -lgc 0,MAX</code>{status.sudo === "root" ? t("gpu.asRoot") : t("gpu.throughSudo")}{t("gpu.runsAfter")}
         </p>
       )}
+      {cannotPersist ? (
+        <p className="field-hint is-warn">
+          {t("gpu.cannotPersist")}
+        </p>
+      ) : null}
       {maxInput.trim() !== "" && !valid && (
         <p className="field-hint is-warn">
-          Enter a whole number from {MIN_CAP_MHZ}{hwMax != null ? ` to ${hwMax}` : ""}.
+          {t("gpu.range", { min: MIN_CAP_MHZ, max: hwMax != null ? `–${hwMax}` : "" })}
         </p>
       )}
       <details className="gpu-clock__manual" open={(sudoMissing && !secure) || manual != null}>
-        <summary>Run it on the Spark yourself</summary>
+        <summary>{t("gpu.manual")}</summary>
         <p className="field-hint">
-          Paste the command into a terminal on the Spark. It uses plain <code>sudo</code>, so it asks for your password
-          there. It is the same steps the Apply and Remove buttons run.
+          {t("gpu.manualBefore")} <code>sudo</code> {t("gpu.manualAfter")}
         </p>
         <div className="gpu-clock__row">
           <button type="button" className="btn btn--sm" onClick={() => void showCommand("apply")} disabled={!valid}>
-            Show command: apply
+            {t("gpu.showApply")}
           </button>
           <button type="button" className="btn btn--sm btn--ghost" onClick={() => void showCommand("reset")}>
-            Show command: remove
+            {t("gpu.showRemove")}
           </button>
         </div>
-        {manualError && <p className="field-hint is-warn" role="status">{manualError}</p>}
+        {manualError && <p className="field-hint is-warn" role="status">{manualError === "commandError" ? t("gpu.commandError") : manualError}</p>}
         {manual && (
           <>
             <p className="gpu-clock__now">{manual.title}</p>
-            <textarea className="gpu-clock__command" readOnly rows={8} value={manual.command} aria-label="Command to run on the Spark" onFocus={(e) => e.currentTarget.select()} />
+            <textarea className="gpu-clock__command" readOnly rows={8} value={manual.command} aria-label={t("gpu.commandAria")} onFocus={(e) => e.currentTarget.select()} />
             <div className="gpu-clock__row">
               <button type="button" className="btn btn--sm" onClick={() => void copyCommand()}>
-                {copied ? "Copied" : "Copy"}
+                {copied ? t("gpu.copied") : t("gpu.copy")}
               </button>
             </div>
           </>
         )}
       </details>
-      {loadError && <p className="field-hint is-warn" role="status">Could not refresh: {loadError}</p>}
+      {loadError && <p className="field-hint is-warn" role="status">{loadError === "load" ? t("gpu.loadError") : `${t("gpu.refreshError")}: ${loadError}`}</p>}
       {message && (
         <p className={`field-hint ${message.ok ? "is-ok" : "is-warn"}`} role="status">
-          {message.text}
+          {message.text === "refused" ? t("gpu.refused") : message.text}
         </p>
       )}
     </div>

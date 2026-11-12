@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import { strict as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
-import { SystemCollector, MACMON_CMD, parseMacmonSample } from "../SystemCollector.js";
+import { SystemCollector, MACMON_CMD, parseMacmonSample, parseMacGpuMemory, macGpuUsedMB, parseMacNetwork, MAC_NETWORK_CMD } from "../SystemCollector.js";
 import { DARWIN_UPTIME_CMD } from "../../sparks/SparkMonitor.js";
 
 // `macmon pipe -s 1` output captured from a Mac Studio (M3 Ultra, 512 GB, macOS 27), core lists trimmed.
@@ -31,6 +31,7 @@ test("macOS GPU/CPU/RAM come from one macmon sample", async () => {
   assert.equal(calls(), 1, "one SSH round trip shared by all four collectors");
   assert.equal(gpu.vendor, "apple");
   assert.equal(gpu.gpus.length, 1);
+  assert.equal(gpu.gpus[0].name, "Apple GPU");
   assert.equal(gpu.usage, 42);
   assert.equal(gpu.temperature, 36.8);
   assert.equal(gpu.power.systemDraw, 34);
@@ -44,6 +45,41 @@ test("macOS GPU/CPU/RAM come from one macmon sample", async () => {
   assert.equal(um.gpuUsed, 0);
 });
 
+// ioreg's line for the GPU driver's share of unified memory, as MACMON_CMD prints it before macmon's JSON.
+const IOREG_GPU = '"In use system memory"=76662177792';
+
+test("parseMacGpuMemory sums the accelerators' in-use memory and is null without any", () => {
+  assert.equal(parseMacGpuMemory(`${IOREG_GPU}\n${SAMPLE}`), 76662177792);
+  assert.equal(parseMacGpuMemory(`"In use system memory"=1000\n"In use system memory"=24\n${SAMPLE}`), 1024);
+  assert.equal(parseMacGpuMemory(SAMPLE), null);
+  assert.equal(parseMacGpuMemory('"In use system memory (driver)"=5\n"Alloc system memory"=9'), null);
+  assert.equal(parseMacGpuMemory(""), null);
+});
+
+test("macOS splits unified memory into the GPU's share and the rest, from the same SSH call", async () => {
+  const c = mac();
+  const calls = withSample(c, `${IOREG_GPU}\n${SAMPLE}`);
+  const [gpu, ram, um] = await Promise.all([c.collectGpu(), c.collectRam(), c.collectUnifiedMemory()]);
+  assert.equal(calls(), 1, "ioreg rides along with macmon: still one SSH round trip");
+  const gpuMB = Math.round(76662177792 / 1048576);
+  assert.equal(gpu.vram.used, gpuMB);
+  assert.equal(gpu.vram.total, 524288);
+  assert.equal(gpu.vram.available, 524288 - ram.used, "headroom is what the whole system has free");
+  assert.equal(um.gpuUsed, gpuMB);
+  assert.equal(um.cpuUsed, ram.used - gpuMB);
+  assert.equal(um.used, ram.used);
+  assert.equal(um.available, 524288 - ram.used);
+});
+
+test("macOS without ioreg's figure keeps reporting the pool as a whole", async () => {
+  const c = mac();
+  withSample(c);
+  const [gpu, ram, um] = await Promise.all([c.collectGpu(), c.collectRam(), c.collectUnifiedMemory()]);
+  assert.equal(gpu.vram.used, ram.used);
+  assert.equal(um.gpuUsed, 0);
+  assert.equal(um.cpuUsed, ram.used);
+});
+
 test("macOS without macmon degrades to defaults; RAM falls back to sysctl", async () => {
   const c = mac();
   withSample(c, "NO_MACMON");
@@ -54,16 +90,58 @@ test("macOS without macmon degrades to defaults; RAM falls back to sysctl", asyn
   assert.equal((await c.collectCpu()).usage, 0);
 });
 
-test("macOS network collector is skipped instead of failing on /sys/class/net", async () => {
-  const c = mac();
-  c._getRemoteNetwork = async () => { throw new Error("Linux collector must not run on darwin"); };
-  assert.deepEqual(await c.collectNetwork(), c._defaultNetwork());
+const MAC_NETWORK = `Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
+en0       1500  <Link#4>    02:1a:7f:3c:9d:2e    100     0      10000      200     0      20000     0
+en0       1500  192.168.1    192.168.1.10         100     0      10000      200     0      20000     0
+lo0       16384 <Link#1>                          900     0     900000      900     0     900000     0
+utun3     1500  <Link#22>                          10      0       1000       10     0       1000     0
+en1       1500  <Link#5>                                0     0          0        0     0          0     0
+---IFCONFIG---
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tether 02:1a:7f:3c:9d:2e
+\tinet 192.168.1.10 netmask 0xffffff00 broadcast 192.168.1.255
+\tmedia: autoselect (1000baseT <full-duplex>)
+\tstatus: active
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+---ROUTE---
+   route to: default
+destination: default
+       mask: default
+    gateway: 192.168.1.1
+  interface: en0
+`;
+
+test("macOS network keeps physical en0, drops loopback/tunnels/dormant, and deltas counters", () => {
+  const stats = new Map();
+  const first = parseMacNetwork(MAC_NETWORK, stats, 1000);
+  assert.equal(first.primaryInterface, "en0");
+  assert.equal(first.linkSpeedMbps, 1000);
+  assert.equal(first.wolMac, "02:1a:7f:3c:9d:2e");
+  assert.deepEqual(first.interfaces.map((i) => i.name), ["en0"]);
+  assert.equal(first.interfaces[0].ip, "192.168.1.10");
+  assert.equal(first.interfaces[0].operstate, "up");
+  assert.equal(first.interfaces[0].rxSpeed, 0);
+
+  const second = parseMacNetwork(MAC_NETWORK.replace("10000", "16000").replace("20000", "26000"), stats, 2000);
+  assert.equal(second.interfaces[0].rxSpeed, 6000);
+  assert.equal(second.interfaces[0].txSpeed, 6000);
+});
+
+test("macOS network counter reset reports 0, not a negative rate", () => {
+  const stats = new Map();
+  parseMacNetwork(MAC_NETWORK, stats, 1000);
+  const reset = parseMacNetwork(MAC_NETWORK.replace("10000", "10").replace("20000", "20"), stats, 2000);
+  assert.equal(reset.interfaces[0].rxSpeed, 0);
+  assert.equal(reset.interfaces[0].txSpeed, 0);
 });
 
 test("MACMON_CMD and DARWIN_UPTIME_CMD are valid POSIX sh", () => {
   for (const cmd of [MACMON_CMD, DARWIN_UPTIME_CMD]) execFileSync("sh", ["-n", "-c", cmd]);
   assert.match(MACMON_CMD, /opt\/homebrew\/bin\/macmon/);
   assert.match(MACMON_CMD, /HOME\/\.cargo\/bin\/macmon/);
+  assert.match(MACMON_CMD, /--soc-info/);
+  assert.match(MACMON_CMD, /ioreg -r -d 1 -w 0 -c IOAccelerator/);
 });
 
 test("DARWIN_UPTIME_CMD parses kern.boottime", () => {
@@ -85,4 +163,57 @@ test("a Mac without macmon costs one SSH call a minute, not one per poll", async
   }
   assert.equal(calls(), 1);
   assert.equal(logged.filter((l) => /macmon/.test(l)).length, 1);
+});
+
+test("macmon SoC info names the actual chip", async () => {
+  const c = mac();
+  withSample(c, JSON.stringify({
+    soc: { chip_name: "Apple M3", mac_model: "Mac15,3", memory_gb: 24, gpu_cores: 10 },
+    cpu_active_ratio: 0.256,
+    gpu_active_ratio: 0.42,
+    temp: { cpu_temp_avg: 45, gpu_temp_avg: 40 },
+    memory: { ram_total: 51539607552, ram_usage: 21474836480 },
+    cpu_power: 1.2,
+    gpu_power: 0.4,
+    sys_power: 12.5,
+  }));
+  const gpu = await c.collectGpu();
+  assert.equal(gpu.gpus[0].name, "Apple M3");
+});
+
+test("macOS network keeps counters when the optional IPv4 default route is absent", () => {
+  const [counters, rest] = MAC_NETWORK.split("---IFCONFIG---");
+  const [config] = rest.split("---ROUTE---");
+  const output = execFileSync("sh", ["-c", `netstat() { cat <<'NETSTAT'
+${counters}
+NETSTAT
+}
+ifconfig() { cat <<'IFCONFIG'
+${config}
+IFCONFIG
+}
+route() { return 1; }
+${MAC_NETWORK_CMD}`], { encoding: "utf8" });
+  const result = parseMacNetwork(output);
+  assert.equal(result.primaryInterface, "en0");
+  assert.equal(result.interfaces[0].ip, "192.168.1.10");
+});
+
+test("an implausible GPU share leaves the unified pool unsplit, rather than claiming cpuUsed 0", () => {
+  const ramUsedMB = 185_000;
+  // The ordinary case: a share below the pool's use is taken as measured.
+  assert.equal(macGpuUsedMB({ gpuInUseBytes: 71_400 * 1048576 }, ramUsedMB), 71_400);
+  assert.equal(macGpuUsedMB({ gpuInUseBytes: ramUsedMB * 1048576 }, ramUsedMB), ramUsedMB);
+
+  // Above the whole pool's use the figure is not a GPU share (a duplicate accelerator entry, or
+  // the counter not meaning what we read it as). Capping it would make the caller publish
+  // cpuUsed: 0 — a measured claim that the CPU side holds nothing.
+  assert.equal(macGpuUsedMB({ gpuInUseBytes: (ramUsedMB + 1) * 1048576 }, ramUsedMB), null);
+  assert.equal(macGpuUsedMB({ gpuInUseBytes: 400_000 * 1048576 }, ramUsedMB), null);
+
+  // No figure at all, or no usable pool figure to judge it against, is also unknown.
+  assert.equal(macGpuUsedMB({}, ramUsedMB), null);
+  assert.equal(macGpuUsedMB({ gpuInUseBytes: null }, ramUsedMB), null);
+  assert.equal(macGpuUsedMB({ gpuInUseBytes: Number.NaN }, ramUsedMB), null);
+  assert.equal(macGpuUsedMB({ gpuInUseBytes: 1048576 }, 0), null);
 });

@@ -81,6 +81,14 @@ describe("Overview panels can be hidden", () => {
     expect(container.textContent).not.toContain("Inference activity");
   });
 
+  it("counts hidden cluster workers in Fleet power", () => {
+    const head = { ...host({ kind: "spark" }), id: "head", role: "head" } as SparkSnapshot;
+    const worker = { ...host({ kind: "spark" }), id: "worker", role: "worker" } as SparkSnapshot;
+    const { container } = render(<OverviewPage sparks={[head, worker]} hideWorkers />);
+    const power = [...container.querySelectorAll(".ov-kpi")].find((k) => k.textContent?.includes("Fleet power"));
+    expect(power?.querySelector(".big-num")?.textContent).toContain("160");
+  });
+
   it("hides single tiles and sizes the row to the rest", () => {
     const { container } = render(<OverviewPage sparks={[host()]} kpis={{ decode: false, memory: false }} />);
     expect(tileLabels(container)).toEqual(["Fleet power", "Online"]);

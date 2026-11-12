@@ -1,15 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ENERGY_ID, OVERVIEW_ID, TEMPS_ID, benchId, benchTypeOf, idToPath, initialActiveId, isPageId, isStaleSparkId, pathToId } from "./constants";
+import { benchId, benchTypeOf, ENERGY_ID, idToPath, initialActiveId, isPageId, isStaleSparkId, KIOSK_ID, OVERVIEW_ID, pathToId, STORAGE_ID, TEMPS_ID } from "./constants";
 
 describe("route helpers", () => {
   it("round-trips ids and paths", () => {
     expect(pathToId("/energy")).toBe(ENERGY_ID);
     expect(pathToId("/temps")).toBe(TEMPS_ID);
     expect(idToPath(TEMPS_ID)).toBe("/temps");
+    expect(pathToId("/storage")).toBe(STORAGE_ID);
+    expect(idToPath(STORAGE_ID)).toBe("/storage");
+    expect(isPageId(STORAGE_ID)).toBe(true);
     expect(pathToId("/spark/a%20b")).toBe("a b");
     expect(idToPath("a b")).toBe("/spark/a%20b");
     expect(pathToId(idToPath(benchId("decode")))).toBe(benchId("decode"));
     expect(pathToId("/showcase/x")).toBeNull();
+    expect(idToPath(KIOSK_ID)).toBe("/kiosk");
+    expect(pathToId("/kiosk/")).toBe(KIOSK_ID);
     expect(pathToId("/nothing-here")).toBe(OVERVIEW_ID);
   });
 

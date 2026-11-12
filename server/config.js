@@ -15,6 +15,15 @@ const SPARKS_SECRETS_PATH =
 /** AES key file (auto-generated if SPARKDASH_SECRETS_KEY unset). */
 const SECRETS_KEY_PATH =
   process.env.SECRETS_KEY_PATH || path.join(ROOT, "config", ".secrets-key");
+/** Storage Manager: the latest disk analysis per unit, so it survives a restart (gitignored). */
+const STORAGE_SCANS_JSON_PATH =
+  process.env.STORAGE_SCANS_JSON_PATH || path.join(ROOT, "config", "storage-scans.json");
+/** Storage Manager: sudo passwords the user chose to remember, encrypted with the secrets key (gitignored). */
+const STORAGE_SUDO_JSON_PATH =
+  process.env.STORAGE_SUDO_JSON_PATH || path.join(ROOT, "config", "storage-sudo.json");
+/** Storage Manager: per-Spark acknowledgements that allow deleting folders as administrator (gitignored). */
+const STORAGE_ACKS_JSON_PATH =
+  process.env.STORAGE_ACKS_JSON_PATH || path.join(ROOT, "config", "storage-acks.json");
 /** Daily LLM tok/s rollups (gitignored). */
 const LLM_DAILY_JSON_PATH =
   process.env.LLM_DAILY_JSON_PATH || path.join(ROOT, "config", "llm-daily.json");
@@ -33,6 +42,9 @@ const METRICS_HISTORY_JSON_PATH =
 /** Alert rule switches, channel settings (no URLs — those are in the secrets store) and the firing set; mode 0600. */
 const ALERTS_JSON_PATH =
   process.env.ALERTS_JSON_PATH || path.join(ROOT, "config", "alerts.json");
+/** Harness helper attaches (URLs and routes; bearer tokens stay in the secrets store). */
+const OCCUPANCY_HELPERS_JSON_PATH =
+  process.env.OCCUPANCY_HELPERS_JSON_PATH || path.join(ROOT, "config", "occupancy-helpers.json");
 /** Last good hosted-model price catalog (Cost compare page offline fallback). */
 const MODEL_PRICES_JSON_PATH =
   process.env.MODEL_PRICES_JSON_PATH || path.join(ROOT, "config", "model-prices.json");
@@ -44,6 +56,28 @@ const MODEL_PRICES_JSON_PATH =
 const MODEL_PRICES_FETCH = ["1", "true"].includes(
   String(process.env.MODEL_PRICES_FETCH || "").toLowerCase()
 );
+
+// ─── Model discovery ("Discover on this Spark") ──────────
+/**
+ * Folders the discovery scan walks on the dashboard's own Spark (find, depth 3)
+ * looking for launchable model folders. Read ONCE at import; the strings are
+ * spliced UNQUOTED into a fixed find template, so they must pass the allowlist
+ * in models/discovery.js (which is why they are config-only, never request input).
+ */
+const MODEL_DISCOVERY_DEFAULT_ROOTS = Object.freeze(["$HOME", "$HOME/llms", "$HOME/models", "$HOME/Qwen*"]);
+/** Extra roots from MODEL_DISCOVERY_ROOTS (colon-separated), appended to the defaults. */
+function parseModelDiscoveryRoots(raw) {
+  return String(raw || "")
+    .split(":")
+    .map((r) => r.trim())
+    .filter(Boolean);
+}
+const MODEL_DISCOVERY_ROOTS = Object.freeze([
+  ...MODEL_DISCOVERY_DEFAULT_ROOTS,
+  ...parseModelDiscoveryRoots(process.env.MODEL_DISCOVERY_ROOTS),
+]);
+/** Per-command cap for the fixed discovery templates on the local host. */
+const MODEL_DISCOVERY_TIMEOUT_MS = parseInt(process.env.MODEL_DISCOVERY_TIMEOUT_MS || "8000", 10);
 
 // ─── LLM / Comfy probe timeouts ──────────────────────────
 const LLM_PROBE_TIMEOUT_MS = 3000;
@@ -78,7 +112,7 @@ const POLL_INTERVAL_LLM = parseInt(process.env.POLL_INTERVAL_LLM || "2000", 10);
 const POLL_INTERVAL_COMFY = parseInt(process.env.POLL_INTERVAL_COMFY || "2000", 10);
 // Tailnet membership changes slowly; each poll is an SSH round-trip.
 const POLL_INTERVAL_TAILSCALE = parseInt(process.env.POLL_INTERVAL_TAILSCALE || "30000", 10);
-// Kernel journal scan for NV_ERR_NO_MEMORY — not on the 2s GPU loop.
+// Incremental kernel error reads after backfill, independent of the GPU poll interval.
 const POLL_INTERVAL_NVERR = parseInt(process.env.POLL_INTERVAL_NVERR || "60000", 10);
 // dmon -c 1 -d 1 blocks ~1s; default 2s avoids stacking with in-flight guards
 const POLL_INTERVAL_BANDWIDTH = parseInt(process.env.POLL_INTERVAL_BANDWIDTH || "2000", 10);
@@ -209,6 +243,9 @@ const HOST_PATHS = {
 };
 
 export {
+  STORAGE_SCANS_JSON_PATH,
+  STORAGE_SUDO_JSON_PATH,
+  STORAGE_ACKS_JSON_PATH,
   SPARKS_JSON_PATH,
   GPU_MEMORY_JSON_PATH,
   SPARKS_SECRETS_PATH,
@@ -219,8 +256,12 @@ export {
   FLEET_ENERGY_MONTHLY_JSON_PATH,
   METRICS_HISTORY_JSON_PATH,
   ALERTS_JSON_PATH,
+  OCCUPANCY_HELPERS_JSON_PATH,
   MODEL_PRICES_JSON_PATH,
   MODEL_PRICES_FETCH,
+  MODEL_DISCOVERY_DEFAULT_ROOTS,
+  MODEL_DISCOVERY_ROOTS,
+  MODEL_DISCOVERY_TIMEOUT_MS,
   LLM_PROBE_TIMEOUT_MS,
   COMFY_PROBE_TIMEOUT_MS,
   TAILSCALE_PROBE_TIMEOUT_MS,
