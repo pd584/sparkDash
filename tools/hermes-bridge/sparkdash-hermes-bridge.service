@@ -1,0 +1,14 @@
+[Unit]
+Description=sparkDash hermes occupancy bridge (state.db -> helper payload)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/prescott/sparkDash/tools/hermes-bridge/server.py
+Restart=on-failure
+RestartSec=5
+Environment=BRIDGE_BIND=10.0.10.105
+Environment=BRIDGE_PORT=8124
+Nice=10
+
+[Install]
+WantedBy=default.target
