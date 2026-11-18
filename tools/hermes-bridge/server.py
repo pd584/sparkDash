@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 STATE_DB = os.environ.get("HERMES_STATE_DB", os.path.expanduser("~/larry-hermes/state.db"))
-BIND = os.environ.get("BRIDGE_BIND", "10.0.10.105")
+BIND = os.environ.get("BRIDGE_BIND", "0.0.0.0")
 PORT = int(os.environ.get("BRIDGE_PORT", "8124"))
 MAX_AGE_DAYS = float(os.environ.get("BRIDGE_MAX_AGE_DAYS", "14"))
 ROW_CAP = int(os.environ.get("BRIDGE_ROW_CAP", "200"))

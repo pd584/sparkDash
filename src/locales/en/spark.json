@@ -264,7 +264,11 @@
       "days_one": "{{count}}d",
       "days_other": "{{count}}d"
     },
-    "tailnet": "Session from {{host}} (tailnet)"
+    "tailnet": "Session from {{host}} (tailnet)",
+    "machinesTitle": "Machines on this lane",
+    "serving": "serving",
+    "machineSessions_one": "{{count}} session",
+    "machineSessions_other": "{{count}} sessions"
   },
   "llmTrend": {
     "title": "tok/s history",

@@ -264,7 +264,11 @@
       "days_one": "{{count}} 天前",
       "days_other": "{{count}} 天前"
     },
-    "tailnet": "来自 {{host}} 的会话（tailnet）"
+    "tailnet": "来自 {{host}} 的会话（tailnet）",
+    "machinesTitle": "使用该通道的机器",
+    "serving": "服务中",
+    "machineSessions_one": "{{count}} 个会话",
+    "machineSessions_other": "{{count}} 个会话"
   },
   "llmTrend": {
     "title": "tok/s 历史",
