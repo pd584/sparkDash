@@ -1,5 +1,7 @@
 import type { ConversationRow, LlmClient } from "../../api/types";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { fetchTailnetPeers, resolveTailnetHost, normalizeTailnetHost, type TailnetPeer } from "../../api/tailnet";
 import { PlusIcon } from "../ui/icons";
 
 const SOURCE_LABEL: Record<string, string> = {
@@ -10,10 +12,17 @@ const SOURCE_LABEL: Record<string, string> = {
   dsh: "DeepSeek Harness",
 };
 
-/** Resolve the session's native-origin host against the tailnet peers map. */
-function tailnetLabel(host: string | undefined, peers?: LlmClient[] | null): string | null {
+/** Resolve a session host to a tailnet name: fleet map first, then the
+ *  live LLM clients for this port, then the raw host itself. */
+function tailnetLabel(
+  host: string | undefined,
+  peers: LlmClient[] | null | undefined,
+  tailnetPeers: TailnetPeer[]
+): string | null {
   if (!host) return null;
-  const want = host.toLowerCase().replace(/^\[|\]$/g, "");
+  const fleet = resolveTailnetHost(host, tailnetPeers);
+  if (fleet) return fleet.name;
+  const want = normalizeTailnetHost(host);
   const hit = (Array.isArray(peers) ? peers : []).find(
     (p) =>
       p.ip === want ||
@@ -108,6 +117,16 @@ function groupConversations(rows: ConversationRow[]) {
 
 export function ConversationList({ conversations, peers, onAddHarness, now = Date.now() }: ConversationListProps) {
   const { t, i18n } = useTranslation("spark");
+  const [tailnetPeers, setTailnetPeers] = useState<TailnetPeer[]>([]);
+  useEffect(() => {
+    let live = true;
+    void fetchTailnetPeers().then((list) => {
+      if (live) setTailnetPeers(list);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
   const groups = groupConversations(conversations);
 
   return (
@@ -139,7 +158,7 @@ export function ConversationList({ conversations, peers, onAddHarness, now = Dat
                 {group.rows.map((row) => {
                   const ctx = contextLabel(row);
                   const language = i18n.resolvedLanguage ?? i18n.language;
-                  const tailnet = tailnetLabel(row.originHost, peers);
+                  const tailnet = tailnetLabel(row.originHost, peers, tailnetPeers);
                   return (
                     <li key={row.id} className={`occupancy-row is-${occupancyTone(row, now)}`} title={row.stale ? t("sessions.staleTitle") : undefined}>
                       <span className="occupancy-dot" aria-hidden="true" />

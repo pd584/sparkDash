@@ -7,6 +7,7 @@ import {
   fetchOccupancyHelpers,
   saveOccupancyHelpers,
 } from "../api/client";
+import { fetchTailnetPeers, resolveTailnetHost, safeUrlHost, type TailnetPeer } from "../api/tailnet";
 import type { OccupancyCheck, OccupancyHelper, OccupancyHelperInput, OccupancyRoute } from "../api/types";
 import { useModalPresence } from "../hooks/useModalPresence";
 import { XIcon } from "./ui/icons";
@@ -148,6 +149,17 @@ function routesFromDraft(routes: RouteDraft[]): OccupancyRoute[] {
 
 export function HarnessWizard({ open, onClose, sparks, sparkId }: HarnessWizardProps) {
   const { t } = useTranslation("devices");
+  const [tailnetPeers, setTailnetPeers] = useState<TailnetPeer[]>([]);
+  useEffect(() => {
+    if (!open) return;
+    let live = true;
+    void fetchTailnetPeers().then((list) => {
+      if (live) setTailnetPeers(list);
+    });
+    return () => {
+      live = false;
+    };
+  }, [open]);
   const steps = [t("harness.steps.harnesses"), t("harness.steps.connection"), t("harness.steps.routes"), t("harness.steps.check"), t("harness.steps.review")];
   const { mounted, visible } = useModalPresence(open);
   const [helpers, setHelpers] = useState<OccupancyHelper[]>([]);
@@ -318,6 +330,14 @@ export function HarnessWizard({ open, onClose, sparks, sparkId }: HarnessWizardP
                 <article key={helper.id}>
                   <div>
                     <strong>{helper.label || helper.id}</strong>
+                    {(() => {
+                      const peer = resolveTailnetHost(safeUrlHost(helper.url), tailnetPeers);
+                      return peer ? (
+                        <span className="occupancy-origin" title={helper.url}>
+                          {peer.name}
+                        </span>
+                      ) : null;
+                    })()}
                     <div className="occupancy-ctx">{helper.enabled ? helper.harnesses.join(", ") : t("harness.disabled")}</div>
                   </div>
                   <button type="button" className="btn btn--sm" onClick={() => { setDraft(draftFromHelper(helper)); setEditing(true); setStep(0); setCheck(null); setError(null); }}>{t("actions.edit")}</button>

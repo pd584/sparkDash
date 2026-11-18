@@ -17,13 +17,24 @@ function sendError(res, err) {
  * Occupancy routes. Callers register this AFTER the dashboard auth middleware
  * so connection checks cannot bypass the configured policy.
  */
-export function registerOccupancyRoutes(app, { poller, listSparks, fetchImpl = fetchHelper, allowlist = helperAllowlist } = {}) {
+export function registerOccupancyRoutes(app, { poller, listSparks, tailnet, fetchImpl = fetchHelper, allowlist = helperAllowlist } = {}) {
   const allowMutation = createRateLimiter(30, 60_000);
   function mutationAllowed(req, res) {
     if (allowMutation(principalKey(req))) return true;
     res.status(429).json({ error: "Too many helper changes" });
     return false;
   }
+  // Fleet tailnet identity map: ip/name/dnsName -> machine, resolved once
+  // through the first spark with working ssh (60 s TTL server-side).
+  app.get("/api/tailnet/peers", async (_req, res) => {
+    try {
+      const state = await tailnet?.refresh();
+      res.json({ peers: state?.peers ?? [], at: state?.at ?? null });
+    } catch (err) {
+      sendError(res, err);
+    }
+  });
+
   app.get("/api/occupancy/helpers", (_req, res) => {
     try {
       res.json({ helpers: publicHelpers() });
