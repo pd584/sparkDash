@@ -238,20 +238,7 @@
     "sampleOffHelp": "该引擎不发布任何实时计数器。在设置中开启“对流采样无指标引擎”，让面板自行测量解码 tok/s。",
     "completedPrefillHelp": "同一窗口内已完成请求的 Token 与预填充耗时增量；并非持续的实时吞吐。",
     "effectiveIncludesCached": "有效速率 · 包含缓存 Token",
-    "completedDecodeRate": "{{rate}} tok/s · 最近完成",
-    "clients": {
-      "help": "实时 tok/s 归属于谁。Serving = 引擎正在生成且该设备的套接字在传输数据。空闲 keep-alive 会被折叠，不作为活动客户端列出。",
-      "title": "Serving",
-      "idle": "空闲",
-      "noLive": "无实时请求",
-      "keepAlive_one": " · {{count}} 个空闲 keep-alive",
-      "keepAlive_other": " · {{count}} 个空闲 keep-alive",
-      "keepAliveSuffix_one": "{{count}} 个空闲 keep-alive",
-      "keepAliveSuffix_other": "{{count}} 个空闲 keep-alive",
-      "badge": "服务中",
-      "conns_one": "{{count}} 连接",
-      "conns_other": "{{count}} 连接"
-    }
+    "completedDecodeRate": "{{rate}} tok/s · 最近完成"
   },
   "sessions": {
     "title": "会话",

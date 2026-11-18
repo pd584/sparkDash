@@ -238,20 +238,7 @@
     "sampleOffHelp": "This engine publishes no live counters. Turn on Settings → Stream-sample engines without gauges to have the dashboard measure decode tok/s itself.",
     "completedPrefillHelp": "Token and prefill-time deltas over requests that finished in the same window; not continuous live throughput.",
     "effectiveIncludesCached": "Effective rate · includes cached tokens",
-    "completedDecodeRate": "{{rate}} tok/s · last completions",
-    "clients": {
-      "help": "Who the live tok/s belongs to. Serving = engine is generating AND that device's sockets are moving bytes. Idle keep-alives are collapsed, not listed as the live client.",
-      "title": "Serving",
-      "idle": "idle",
-      "noLive": "No live request",
-      "keepAlive_one": " · {{count}} idle keep-alive",
-      "keepAlive_other": " · {{count}} idle keep-alives",
-      "keepAliveSuffix_one": "{{count}} idle keep-alive",
-      "keepAliveSuffix_other": "{{count}} idle keep-alives",
-      "badge": "serving",
-      "conns_one": "{{count}} conn",
-      "conns_other": "{{count}} conns"
-    }
+    "completedDecodeRate": "{{rate}} tok/s · last completions"
   },
   "sessions": {
     "title": "Sessions",
