@@ -121,6 +121,12 @@ function toConversation(helper, row, payload, target) {
     stale,
   };
   if (lastUsedAt != null) projected.lastUsedAt = lastUsedAt;
+  // Native origin (host:port the session dialed, proven by the engine's own
+  // endpoint match) — lets the UI show the tailnet machine behind a session
+  // even when no harness entry named it.
+  if (row.originProvenance === "native" && row.origin?.host) {
+    projected.originHost = String(row.origin.host);
+  }
   if (row.agent) projected.agent = row.agent;
   if (row.contextUsed != null) projected.contextUsed = row.contextUsed;
   if (row.contextWindow != null) projected.contextWindow = row.contextWindow;

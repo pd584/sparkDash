@@ -263,7 +263,8 @@
       "hours_other": "{{count}} 小时前",
       "days_one": "{{count}} 天前",
       "days_other": "{{count}} 天前"
-    }
+    },
+    "tailnet": "来自 {{host}} 的会话（tailnet）"
   },
   "llmTrend": {
     "title": "tok/s 历史",

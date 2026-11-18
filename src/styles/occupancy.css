@@ -118,6 +118,19 @@
   color: var(--color-text-strong);
 }
 
+.occupancy-origin {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  font-family: var(--font-tabular, monospace);
+  color: var(--color-text-muted);
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  padding: 0 6px;
+  line-height: 1.5;
+}
+
 .occupancy-ctx:empty { display: none; }
 
 .occupancy-ctx,

@@ -1349,6 +1349,8 @@ export interface ConversationRow {
   routingProvenance?: string;
   stale?: boolean;
   lastUsedAt?: number;
+  /** Tailnet-resolvable host the session dialed from (native origin only). */
+  originHost?: string;
   agent?: string;
   contextUsed?: number | null;
   contextWindow?: number | null;

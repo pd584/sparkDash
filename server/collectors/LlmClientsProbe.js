@@ -319,10 +319,12 @@ export function annotateServing(clients, engine, activeAgesMs) {
   let winners = remoteActive.length > 0 ? remoteActive : [];
   if (winners.length === 0 && active.length > 0) winners = active;
   // ss without -i has no lastsnd: if the engine is busy and there is exactly
-  // one remote IP, that is the live client. Do NOT do this when lastsnd is
-  // present — a single idle keep-alive from igor would light up every poll.
-  const hasTiming = list.some((c) => c.lastSndMs != null || c.lastRcvMs != null);
-  if (winners.length === 0 && !hasTiming && remote.length === 1) winners = remote;
+  // one remote IP, that is the live client. This also covers the hasTiming
+  // case: a busy engine + a silent socket (non-streaming batch, or a chunked
+  // stream caught between flushes) still has nowhere else for the tokens to
+  // go. We only reach here when engineIsBusy already passed, so an idle
+  // keep-alive can never light up — the busy gate owns that exclusion.
+  if (winners.length === 0 && remote.length === 1) winners = remote;
   if (winners.length === 0) {
     // Nobody's socket looks active right now, but a chunked stream may have
     // lit up moments ago: fall back to recently-active non-loopback peers.

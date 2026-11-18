@@ -1022,7 +1022,7 @@ export function LlmPanel({
         </div>
       )}
 
-      <ConversationList conversations={conversations} onAddHarness={onAddHarness} />
+      <ConversationList conversations={conversations} peers={llm?.clients} onAddHarness={onAddHarness} />
 
       <BenchmarkDialog
         open={openBench === "decode"}

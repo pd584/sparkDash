@@ -1,4 +1,4 @@
-import type { ConversationRow } from "../../api/types";
+import type { ConversationRow, LlmClient } from "../../api/types";
 import { useTranslation } from "react-i18next";
 import { PlusIcon } from "../ui/icons";
 
@@ -10,8 +10,24 @@ const SOURCE_LABEL: Record<string, string> = {
   dsh: "DeepSeek Harness",
 };
 
+/** Resolve the session's native-origin host against the tailnet peers map. */
+function tailnetLabel(host: string | undefined, peers?: LlmClient[] | null): string | null {
+  if (!host) return null;
+  const want = host.toLowerCase().replace(/^\[|\]$/g, "");
+  const hit = (Array.isArray(peers) ? peers : []).find(
+    (p) =>
+      p.ip === want ||
+      p.name?.toLowerCase() === want ||
+      p.dnsName?.toLowerCase() === want ||
+      (p.dnsName?.toLowerCase() ?? "").split(".")[0] === want
+  );
+  return hit ? hit.name || hit.dnsName || hit.ip : want;
+}
+
 interface ConversationListProps {
   conversations: ConversationRow[];
+  /** Live LLM client peers for this port — used to name the tailnet machine. */
+  peers?: LlmClient[] | null;
   onAddHarness?: () => void;
   now?: number;
 }
@@ -90,7 +106,7 @@ function groupConversations(rows: ConversationRow[]) {
   return groups;
 }
 
-export function ConversationList({ conversations, onAddHarness, now = Date.now() }: ConversationListProps) {
+export function ConversationList({ conversations, peers, onAddHarness, now = Date.now() }: ConversationListProps) {
   const { t, i18n } = useTranslation("spark");
   const groups = groupConversations(conversations);
 
@@ -123,10 +139,16 @@ export function ConversationList({ conversations, onAddHarness, now = Date.now()
                 {group.rows.map((row) => {
                   const ctx = contextLabel(row);
                   const language = i18n.resolvedLanguage ?? i18n.language;
+                  const tailnet = tailnetLabel(row.originHost, peers);
                   return (
                     <li key={row.id} className={`occupancy-row is-${occupancyTone(row, now)}`} title={row.stale ? t("sessions.staleTitle") : undefined}>
                       <span className="occupancy-dot" aria-hidden="true" />
                       <span className="occupancy-handle" title={row.handle}>{row.handle}</span>
+                      {tailnet ? (
+                        <span className="occupancy-origin" title={t("sessions.tailnet", { host: row.originHost })}>
+                          {tailnet}
+                        </span>
+                      ) : null}
                       <span className="occupancy-ctx" title={ctx ? contextTitle(row, language, t) : undefined}>{ctx}</span>
                       <span className="occupancy-state">
                         {stateLabel(row, now, language, t)}
