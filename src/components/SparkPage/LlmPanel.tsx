@@ -2,7 +2,7 @@ import { benchId } from "../../constants";
 import { BenchIcon } from "../bench/BenchIcon";
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import type { ConversationRow, LlmMetrics, LlmBenchTarget } from "../../api/types";
+import type { ConversationRow, LlmMetrics, LlmBenchTarget, LlmClient } from "../../api/types";
 import { setLlmApiKey, updateLlmPort, updateLlmPorts } from "../../api/client";
 import { TrendLine } from "../ui/TrendLine";
 import { Panel } from "../ui/Panel";
@@ -1004,6 +1004,8 @@ export function LlmPanel({
             </div>
           </div>
 
+          <LlmClientsList clients={llm?.clients} error={llm?.clientsError} />
+
           <LlmLaunchers
             sparkId={sparkId}
             llmPort={llmPort}
@@ -1067,5 +1069,75 @@ export function LlmPanel({
         posture={remoteTarget ? null : llm?.posture ?? null}
       />
     </Panel>
+  );
+}
+
+function LlmClientsList({
+  clients,
+  error,
+}: {
+  clients?: LlmClient[] | null;
+  error?: string | null;
+}) {
+  const { t } = useTranslation("spark");
+  const list = (Array.isArray(clients) ? clients : []).filter(
+    (c) => c.ip !== "127.0.0.1" && c.ip !== "::1"
+  );
+  const serving = list.filter((c) => c.serving);
+  const idle = list.filter((c) => !c.serving);
+  return (
+    <div className="border-t border-border pt-3">
+      <div className="mb-2 flex items-center justify-between">
+        <span
+          className="text-[10px] uppercase tracking-wide text-muted"
+          title={t("llm.clients.help")}
+        >
+          {t("llm.clients.title")}
+        </span>
+        <span className="font-tabular text-[10px] text-muted">
+          {serving.length === 0 ? t("llm.clients.idle") : `${serving.length}`}
+        </span>
+      </div>
+      {error && (
+        <p className="mb-2 rounded-md border border-border bg-surface-elevated px-3 py-2 text-[11px] text-muted">
+          {error}
+        </p>
+      )}
+      {serving.length === 0 && !error ? (
+        <p className="text-xs text-muted">
+          {t("llm.clients.noLive")}
+          {idle.length > 0 ? t("llm.clients.keepAlive", { count: idle.length }) : ""}
+        </p>
+      ) : (
+        <div className="space-y-1.5">
+          {serving.map((c) => {
+            const label = c.name || c.ip;
+            const title = [c.dnsName, c.ip, t("llm.clients.conns", { count: c.connections })]
+              .filter(Boolean)
+              .join(" · ");
+            return (
+              <div
+                key={c.ip}
+                className="flex items-center justify-between gap-2 rounded-md border border-accent/40 bg-accent-soft px-3 py-1.5"
+                title={title}
+              >
+                <div className="min-w-0">
+                  <div className="truncate text-xs text-accent">{label}</div>
+                  {c.name && (
+                    <div className="truncate font-tabular text-[10px] text-muted">{c.ip}</div>
+                  )}
+                </div>
+                <span className="shrink-0 font-tabular text-[10px] text-accent">{t("llm.clients.badge")}</span>
+              </div>
+            );
+          })}
+          {idle.length > 0 && (
+            <p className="text-[10px] text-muted">
+              {t("llm.clients.keepAliveSuffix", { count: idle.length })}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
